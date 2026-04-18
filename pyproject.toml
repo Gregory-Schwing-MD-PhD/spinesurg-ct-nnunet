@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spinesurg-ct-nnunet"
+version = "0.1.0"
+description = "nnU-Net v2 training pipeline for multi-class spine + pelvis CT segmentation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Gregory Schwing", email = "go2432@wayne.edu" }
+]
+keywords = ["medical-imaging", "segmentation", "nnunet", "spine", "pelvis", "ct"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+# These are the deps for HOST-side tooling (tools/, scripts/).
+# nnU-Net itself and its heavy deps live inside the Singularity container.
+dependencies = [
+    "numpy>=1.24",
+    "nibabel>=5.0",
+    "matplotlib>=3.7",
+    "scikit-learn>=1.3",
+    "pandas>=2.0",
+    "huggingface_hub>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage   = "https://github.com/gschwing/spinesurg-ct-nnunet"
+Dataset    = "https://huggingface.co/datasets/gschwing/CTSpinoPelvic1K"
+Issues     = "https://github.com/gschwing/spinesurg-ct-nnunet/issues"
+
+[tool.setuptools]
+packages = ["tools"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "UP"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

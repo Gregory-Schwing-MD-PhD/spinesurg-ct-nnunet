@@ -1,0 +1,32 @@
+# Auto-detect text files, normalize line endings to LF
+* text=auto eol=lf
+
+# Explicit line endings for scripts
+*.sh        text eol=lf
+*.py        text eol=lf
+*.def       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+*.toml      text eol=lf
+*.txt       text eol=lf
+*.cff       text eol=lf
+Makefile    text eol=lf
+
+# Binary files
+*.nii       binary
+*.nii.gz    binary
+*.npz       binary
+*.npy       binary
+*.pkl       binary
+*.pth       binary
+*.sif       binary
+*.simg      binary
+*.png       binary
+*.jpg       binary
+*.pdf       binary
+
+# Language detection for GitHub stats
+docs/*          linguist-documentation
+slurm/*.sh      linguist-language=Shell
+containers/*.def linguist-language=Dockerfile

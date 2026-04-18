@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+message: "If you use this pipeline in academic work, please cite it as below."
+title: "spinesurg-ct-nnunet: nnU-Net training pipeline for multi-class spine + pelvis CT segmentation"
+abstract: >-
+  nnU-Net v2 pipeline for 10-class segmentation of CT scans spanning the
+  lumbar spine (L1-L6 including LSTV), sacrum, and bilateral hips, built on
+  the CTSpinoPelvic1K dataset. Includes stratified 5-fold cross-validation,
+  local-scratch-optimized preprocessing, LSTV oversampling, and a 6-ablation
+  framework.
+authors:
+  - family-names: Schwing
+    given-names: Gregory
+    affiliation: "Wayne State University School of Medicine / Detroit Medical Center"
+    email: go2432@wayne.edu
+    orcid: "https://orcid.org/0000-0000-0000-0000"    # TODO: update
+version: 0.1.0
+date-released: "2026-04-18"
+license: Apache-2.0
+repository-code: "https://github.com/gschwing/spinesurg-ct-nnunet"
+url: "https://github.com/gschwing/spinesurg-ct-nnunet"
+keywords:
+  - medical-imaging
+  - segmentation
+  - nnU-Net
+  - spine
+  - pelvis
+  - CT
+  - LSTV
+  - CTSpinoPelvic1K
+references:
+  - type: software
+    title: "nnU-Net"
+    authors:
+      - family-names: Isensee
+        given-names: Fabian
+    url: "https://github.com/MIC-DKFZ/nnUNet"
+  - type: dataset
+    title: "CTSpinoPelvic1K"
+    authors:
+      - family-names: Schwing
+        given-names: Gregory
+    url: "https://huggingface.co/datasets/gschwing/CTSpinoPelvic1K"
