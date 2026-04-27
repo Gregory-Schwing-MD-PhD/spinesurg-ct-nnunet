@@ -50,6 +50,13 @@
 # right before preprocess runs and rewritten only after final rsync, so
 # partial states stay detectable (marker absent -> partial).
 #
+# LSTV metadata (Apr 2026)
+# ------------------------
+# Step 7 also copies lstv_cases.json from raw/ -> preprocessed/. This is
+# the metadata file that tools/nnunet_wandb_variant.py reads at training
+# time to identify cases needing oversampling (lumbarization +
+# sacralization). Mirrors the splits_final.json copy.
+#
 # Prereqs
 # -------
 # 1. data/splits_5fold.json              (from slurm/generate_splits.sh)
@@ -59,6 +66,18 @@
 # =============================================================================
 
 set -euo pipefail
+
+# ── Singularity runtime dirs ─────────────────────────────────────────────────
+export SINGULARITY_TMPDIR="/tmp/${USER}_job_${SLURM_JOB_ID}"
+export XDG_RUNTIME_DIR="${SINGULARITY_TMPDIR}/runtime"
+export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
+mkdir -p "${SINGULARITY_TMPDIR}" "${XDG_RUNTIME_DIR}" "${NXF_SINGULARITY_CACHEDIR}"
+trap 'rm -rf "${SINGULARITY_TMPDIR}"' EXIT
+export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
+export PATH="${CONDA_PREFIX}/bin:${PATH}"
+unset JAVA_HOME; which singularity
+export NXF_SINGULARITY_HOME_MOUNT=true
+unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # ----- Config ---------------------------------------------------------------
 DATASET_ID="${DATASET_ID:-802}"
@@ -139,6 +158,13 @@ if [[ -f "${COMPLETE_MARKER}" ]] \
     if [[ -f "${NFS_RAW_DS}/splits_final.json" ]]; then
         cp -f "${NFS_RAW_DS}/splits_final.json" "${NFS_PREP_DS}/splits_final.json"
         echo "  refreshed splits_final.json"
+    fi
+    if [[ -f "${NFS_RAW_DS}/lstv_cases.json" ]]; then
+        cp -f "${NFS_RAW_DS}/lstv_cases.json" "${NFS_PREP_DS}/lstv_cases.json"
+        echo "  refreshed lstv_cases.json"
+    else
+        echo "  NOTE: ${NFS_RAW_DS}/lstv_cases.json missing — re-run convert"
+        echo "        with the updated convert_hf_to_nnunet.py to generate it."
     fi
     echo ""
     echo " NEXT: FOLD=0 sbatch slurm/spine_train_fold.sh"
@@ -381,11 +407,30 @@ if [[ "${N_NPZ_NFS}" -eq 0 ]]; then
 fi
 
 # ============================================================================
-# Step 7: copy splits_final.json into preprocessed/ (nnU-Net reads it there)
+# Step 7: copy splits + LSTV metadata into preprocessed/
 # ============================================================================
+# nnU-Net reads splits_final.json from preprocessed/ directly. The trainer's
+# LSTV oversampling mixin (tools/nnunet_wandb_variant.py) prefers
+# preprocessed/lstv_cases.json over raw/lstv_cases.json so it doesn't have
+# to know about the raw path. Both are tiny JSON files; copy is instant.
+echo ""; echo "----- Step 7: copy metadata into preprocessed/ -----"
 if [[ -f "${NFS_RAW_DS}/splits_final.json" ]]; then
     cp -f "${NFS_RAW_DS}/splits_final.json" "${NFS_PREP_DS}/splits_final.json"
     echo "  copied splits_final.json into preprocessed/"
+else
+    echo "  WARN: ${NFS_RAW_DS}/splits_final.json missing; nnU-Net will use" >&2
+    echo "        random fold splits (NOT what you want for K-fold CV)" >&2
+fi
+
+if [[ -f "${NFS_RAW_DS}/lstv_cases.json" ]]; then
+    cp -f "${NFS_RAW_DS}/lstv_cases.json" "${NFS_PREP_DS}/lstv_cases.json"
+    echo "  copied lstv_cases.json into preprocessed/"
+else
+    echo "  NOTE: ${NFS_RAW_DS}/lstv_cases.json missing." >&2
+    echo "        The LSTV oversampling trainer will fall through to manifest" >&2
+    echo "        scan (path C) or L6-voxel scan (path D, lumbarization only)." >&2
+    echo "        Re-run convert with the updated convert_hf_to_nnunet.py" >&2
+    echo "        to generate it." >&2
 fi
 
 # ============================================================================

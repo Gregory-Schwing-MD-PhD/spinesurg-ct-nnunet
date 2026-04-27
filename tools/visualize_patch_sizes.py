@@ -1,236 +1,569 @@
 #!/usr/bin/env python3
 """
-SpineSurg-CT -- patch-size visualizer
-tools/visualize_patch_sizes.py
+visualize_patch_sizes.py — overlay candidate nnU-Net patches on a CT.
 
-Overlays one or more candidate patch sizes on mid-slices of a real CT to
-help you logically pick a GPU memory target. Patch size is the main thing
-that changes with -gpu_memory_target: larger target -> larger patch ->
-more anatomic context per training sample, at the cost of VRAM.
+Anatomical orientation
+----------------------
+Volumes are reoriented to PIR voxel space on load (axis 0 = P, A->P;
+axis 1 = I, S->I; axis 2 = R, L->R). Sagittal slices are transposed
+for head-up display. Anatomic-orientation labels (S/I/A/P/L/R) drop
+in each panel's corners.
 
-Two input modes
+Coordinate system
+-----------------
+Everything inside the figure — image, label overlays, rectangles,
+axis ticks — lives in VOXEL-PIXEL coordinates. Mm labels are placed
+on the axes by relabeling tick positions; we don't use imshow's
+`extent=`. This keeps patch overlays geometrically consistent with
+the underlying anatomy regardless of imshow origin/extent
+interactions.
+
+Slice selection
 ---------------
-1. Read nnU-Net plans.json files (the outputs of `plan_experiment` /
-   `plan_and_preprocess`). Patch size and target spacing are pulled from
-   each plans file's 3d_fullres configuration, so you see EXACTLY what
-   the planner chose for each GPU memory target:
+Slices pass through the sacrum centroid drawn from a paired label
+file. Priority:
+  1. Explicit --label path
+  2. Sibling labels/<stem>_label.nii.gz next to the CT
+  3. Bone-density (HU > 200) centroid in the lower SI half
+  4. Volume center
 
-       python tools/visualize_patch_sizes.py \\
-           --ct      data/hf_export/ct/CASE_001.nii.gz \\
-           --plans   nnunet/preprocessed/Dataset802.../nnUNetResEncUNetPlans_80G.json \\
-           --plans   nnunet/preprocessed/Dataset802.../nnUNetResEncUNetPlans_100G.json \\
-           --plans   nnunet/preprocessed/Dataset802.../nnUNetResEncUNetPlans_140G.json \\
-           --out     patch_size_comparison.png
+Sacrum (label 7) is preferred; falls back to L5 (5), then any
+foreground voxel.
 
-2. Explicit patch sizes (skip the plans files; useful for what-if
-   exploration without running the planner):
+Mask rendering
+--------------
+When a label NIfTI is found, segmentation masks are rendered as
+semi-transparent color overlays on each panel using the
+SpineSurg-CT 10-class color scheme (matches export_hf.py and
+visualize_qc.py). Mask classes present in the slice get a separate
+legend below the figure.
 
-       python tools/visualize_patch_sizes.py \\
-           --ct         data/hf_export/ct/CASE_001.nii.gz \\
-           --patch_spec "80G:112,128,128" \\
-           --patch_spec "100G:128,160,160" \\
-           --patch_spec "140G:160,192,192" \\
-           --out        patch_size_comparison.png
+Overlapping patches
+-------------------
+nnU-Net plans often produce identical patch sizes once the planner
+saturates a memory budget. To keep all candidates visible:
+  - line widths grade thin → thick from smallest to largest patch
+  - identical-extent boxes get a small ~3 px diagonal offset so
+    edges fan out instead of overlapping pixel-perfect
+All candidates use solid lines (no linestyle distinction).
 
-Either way the output is a PNG (or multi-page PDF if you pass .pdf) with
-three mid-slices of your CT, one per axis, with colored boxes showing the
-spatial extent each candidate patch covers, centered on the volume.
+USAGE
+-----
+  python visualize_patch_sizes.py \\
+      --ct    data/hf_export/ct/0001_unknown_pelvic_ct.nii.gz \\
+      --plans nnunet/preprocessed/Dataset802.../nnUNetResEncUNetPlans_60G.json \\
+      --plans nnunet/preprocessed/Dataset802.../nnUNetResEncUNetPlans_100G.json \\
+      --out   patch_size_comparison.png
 
-Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
+  # Manual patches (no planner output needed)
+  python visualize_patch_sizes.py \\
+      --ct case.nii.gz \\
+      --patch_spec "small:96,128,128" \\
+      --patch_spec "large:160,192,192" \\
+      --out manual_patches.png
+
+  # Skip mask overlays even when a label file exists
+  python visualize_patch_sizes.py \\
+      --ct case.nii.gz --no_mask_overlay --plans plans.json --out fig.png
+
+Patch spec format: --patch_spec "<label>:<patch_z>,<patch_y>,<patch_x>"
+where (z, y, x) are voxel counts at the case's NATIVE spacing.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import nibabel as nib
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("patch_viz")
+
+_PALETTE = [
+    "#e41a1c", "#377eb8", "#4daf4a",
+    "#ff7f00", "#984ea3", "#a65628",
+]
+_LINEWIDTHS = [1.6, 2.0, 2.4, 2.8, 3.2]
+
+_HU_MIN, _HU_MAX = -200, 800
+_BONE_HU = 200.0
+_SACRUM_LABEL = 7
+_L5_LABEL     = 5
+
+# 10-class label scheme — matches export_hf.py and visualize_qc.py.
+# Format: class_id -> (display_name, RGBA tuple in [0, 1])
+CLASS_NAMES: Dict[int, str] = {
+    1: "L1", 2: "L2", 3: "L3", 4: "L4", 5: "L5", 6: "L6",
+    7: "sacrum", 8: "left_hip", 9: "right_hip",
+}
+
+# Use the same colormap as visualize_qc.py / export_hf.py for consistency.
+# Alpha is bumped slightly higher than QC since this figure is publication-grade.
+_SEG_COLORS: Dict[int, Tuple[float, float, float, float]] = {
+    1: (0.15, 0.40, 0.80, 0.55),
+    2: (0.25, 0.55, 0.85, 0.55),
+    3: (0.35, 0.65, 0.90, 0.55),
+    4: (0.45, 0.75, 0.92, 0.55),
+    5: (0.10, 0.80, 0.85, 0.55),
+    6: (0.75, 0.85, 0.20, 0.65),   # L6 — slightly opaque since it's the headline class
+    7: (0.85, 0.15, 0.15, 0.55),
+    8: (0.95, 0.50, 0.10, 0.55),
+    9: (0.95, 0.80, 0.05, 0.55),
+}
 
 
 # =============================================================================
-# Plans-file parsing
+# Data classes
 # =============================================================================
 
-def load_plans_file(path: Path, config: str = "3d_fullres") -> Dict:
-    """
-    Returns {label, patch_size (voxels), target_spacing (mm)}.
-    Label is derived from filename (e.g. nnUNetResEncUNetPlans_100G.json -> "100G").
-    """
-    data = json.loads(path.read_text())
-    if "configurations" not in data or config not in data["configurations"]:
-        raise ValueError(
-            f"{path} has no '{config}' configuration. "
-            f"Available: {list(data.get('configurations', {}).keys())}")
-    cfg = data["configurations"][config]
+@dataclass
+class PatchSpec:
+    label:       str
+    patch_voxel: Tuple[int, int, int]   # (z, y, x) at the plan's target spacing
+    spacing_mm:  Tuple[float, float, float]
+    color:       str
+    linewidth:   float = 2.0
 
-    patch = cfg.get("patch_size")
-    if patch is None:
-        raise ValueError(f"{path}/{config} has no patch_size")
+    @property
+    def patch_mm(self) -> Tuple[float, float, float]:
+        return tuple(self.patch_voxel[i] * self.spacing_mm[i] for i in range(3))
+
+    def __str__(self) -> str:
+        pmm = self.patch_mm
+        return (f"{self.label}  patch={list(self.patch_voxel)} vox  "
+                f"= {pmm[0]:.0f}x{pmm[1]:.0f}x{pmm[2]:.0f} mm")
+
+
+# =============================================================================
+# Orientation: PIR canonicalization
+# =============================================================================
+
+def _load_pir(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """Load a NIfTI and reorient to PIR voxel space; return (data, affine)."""
+    import nibabel as nib
+    from nibabel.orientations import (
+        axcodes2ornt, ornt_transform, apply_orientation, inv_ornt_aff,
+    )
+    img      = nib.load(str(path))
+    src_ornt = nib.io_orientation(img.affine)
+    dst_ornt = axcodes2ornt(("P", "I", "R"))
+    xfm      = ornt_transform(src_ornt, dst_ornt)
+    data     = apply_orientation(img.get_fdata(dtype=np.float32), xfm).squeeze()
+    new_aff  = img.affine @ inv_ornt_aff(xfm, img.shape[:3])
+    return data, new_aff
+
+
+def _hu_window(arr: np.ndarray) -> np.ndarray:
+    return np.clip((arr - _HU_MIN) / (_HU_MAX - _HU_MIN), 0.0, 1.0)
+
+
+# =============================================================================
+# Slice picker — uses sibling label NIfTI when available
+# =============================================================================
+
+def _resolve_label_path(ct_path: Path, explicit: Optional[Path]) -> Optional[Path]:
+    if explicit is not None:
+        if explicit.exists():
+            return explicit
+        log.warning("Explicit --label not found: %s (falling back to auto)", explicit)
+    name = ct_path.name
+    if name.endswith("_ct.nii.gz"):
+        stem = name[: -len("_ct.nii.gz")]
+        candidate = ct_path.parent.parent / "labels" / f"{stem}_label.nii.gz"
+        if candidate.exists():
+            return candidate
+    if name.endswith(".nii.gz"):
+        stem = name[: -len(".nii.gz")]
+        if stem.endswith("_ct"):
+            stem = stem[: -len("_ct")]
+            candidate = ct_path.parent.parent / "labels" / f"{stem}_label.nii.gz"
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _centroid_from_label(label: np.ndarray) -> Optional[Tuple[int, int, int]]:
+    for cls in (_SACRUM_LABEL, _L5_LABEL):
+        vox = np.argwhere(label == cls)
+        if len(vox) >= 100:
+            c = vox.mean(axis=0)
+            return (int(round(c[0])), int(round(c[1])), int(round(c[2])))
+    fg = np.argwhere(label > 0)
+    if len(fg) >= 100:
+        c = fg.mean(axis=0)
+        return (int(round(c[0])), int(round(c[1])), int(round(c[2])))
+    return None
+
+
+def _centroid_from_bone_hu(ct: np.ndarray) -> Optional[Tuple[int, int, int]]:
+    si_axis = 1
+    si_mid  = ct.shape[si_axis] // 2
+    slab = [slice(None)] * 3
+    slab[si_axis] = slice(si_mid, None)
+    bone = (ct[tuple(slab)] > _BONE_HU)
+    if bone.sum() < 1000:
+        return None
+    vox = np.argwhere(bone)
+    vox[:, si_axis] += si_mid
+    c = vox.mean(axis=0)
+    return (int(round(c[0])), int(round(c[1])), int(round(c[2])))
+
+
+def load_label_and_pick_centroid(
+        ct: np.ndarray, ct_path: Path, explicit_label: Optional[Path]
+        ) -> Tuple[Optional[np.ndarray], Tuple[int, int, int], str, Optional[Path]]:
+    """
+    Returns (label_array_or_None, centroid_pir, source_description, label_path).
+
+    The label array is returned alongside the centroid so render_figure can
+    overlay it without re-loading. Returned label is in PIR voxel space,
+    int16.
+    """
+    label_path = _resolve_label_path(ct_path, explicit_label)
+    if label_path is not None:
+        try:
+            log.info("Loading label: %s", label_path)
+            label_pir, _ = _load_pir(label_path)
+            label_pir = label_pir.astype(np.int16)
+            cen = _centroid_from_label(label_pir)
+            if cen is not None:
+                src = f"sacrum/L5 ({label_path.name})"
+                log.info("  PIR voxel centroid (P, I, R) = %s  (from label)", cen)
+                return label_pir, cen, src, label_path
+            log.warning("  label has no sacrum/L5/fg voxels; falling through")
+        except Exception as e:
+            log.warning("  label load failed: %s", e)
+
+    cen = _centroid_from_bone_hu(ct)
+    if cen is not None:
+        log.info("  PIR voxel centroid (P, I, R) = %s  (bone HU heuristic)", cen)
+        return None, cen, "bone HU heuristic", None
+
+    cen = (ct.shape[0] // 2, ct.shape[1] // 2, ct.shape[2] // 2)
+    log.info("  PIR voxel centroid (P, I, R) = %s  (volume center fallback)", cen)
+    return None, cen, "volume center (fallback)", None
+
+
+# =============================================================================
+# Plans / patch parsing
+# =============================================================================
+
+def parse_plans_file(plans_path: Path, color: str,
+                      config: str = "3d_fullres") -> Optional[PatchSpec]:
+    data = json.loads(plans_path.read_text())
+    cfg  = data.get("configurations", {}).get(config, {})
+    patch   = cfg.get("patch_size")
     spacing = cfg.get("spacing") or data.get("original_median_spacing_after_transp")
-
-    # Pull GPU memory target label out of filename:
-    #   nnUNetResEncUNetPlans_100G.json -> 100G
-    #   nnUNetPlans.json                 -> nnUNetPlans (no mem info)
-    stem = path.stem
+    if patch is None or spacing is None:
+        log.warning("Skipping %s: no patch_size/spacing in %s", plans_path.name, config)
+        return None
+    stem = plans_path.stem
     label = stem
     for marker in ("Plans_", "plans_"):
         if marker in stem:
             label = stem.split(marker, 1)[1]
             break
-
-    return {
-        "label":          label,
-        "source":         str(path),
-        "patch_size":     [int(x) for x in patch],
-        "target_spacing": [float(x) for x in spacing] if spacing else None,
-    }
-
-
-def parse_patch_spec(spec: str) -> Dict:
-    """
-    Parse "LABEL:x,y,z" into a dict. If ':' missing, label = patch_str.
-    """
-    if ":" in spec:
-        label, dims = spec.split(":", 1)
-    else:
-        label, dims = spec, spec
-    patch = [int(x.strip()) for x in dims.split(",")]
-    if len(patch) != 3:
-        raise ValueError(f"patch_spec '{spec}' must have 3 comma-separated ints")
-    return {
-        "label":          label.strip(),
-        "source":         f"cli:{spec}",
-        "patch_size":     patch,
-        "target_spacing": None,   # unknown, use CT's native spacing for mm display
-    }
-
-
-# =============================================================================
-# Visualization
-# =============================================================================
-
-_PALETTE = [
-    "#e41a1c", "#377eb8", "#4daf4a", "#ff7f00",
-    "#984ea3", "#a65628", "#f781bf", "#999999",
-]
-
-
-def render(
-    ct_path: Path,
-    patch_specs: List[Dict],
-    out_path: Path,
-    title: Optional[str] = None,
-) -> None:
-    img = nib.load(str(ct_path))
-    data = np.asarray(img.get_fdata())
-    ct_zooms = tuple(float(z) for z in img.header.get_zooms()[:3])
-    ct_shape = tuple(int(s) for s in data.shape[:3])
-    ct_mm = tuple(ct_shape[i] * ct_zooms[i] for i in range(3))
-
-    # Clip for display (soft-tissue-ish window)
-    vmin, vmax = -200, 400
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 8.5), constrained_layout=False)
-
-    # For each of 3 axis-views, pick the axes indices visible in the slice
-    # view[i] = (slice_axis, (disp_axis_horiz, disp_axis_vert))
-    views = [
-        ("axis 0 mid-slice", 0, (2, 1)),
-        ("axis 1 mid-slice", 1, (2, 0)),
-        ("axis 2 mid-slice", 2, (1, 0)),
-    ]
-
-    for ax_idx, (view_name, slice_axis, (hax, vax)) in enumerate(views):
-        ax = axes[ax_idx]
-        mid = ct_shape[slice_axis] // 2
-        slicer = [slice(None)] * 3
-        slicer[slice_axis] = mid
-        plane = data[tuple(slicer)]
-
-        # Put horizontal axis on x, vertical on y; need to transpose if slice_axis
-        # indexing leaves us with (axis a, axis b) but we want (hax shown on x, vax on y).
-        # After slicing axis `slice_axis`, plane has shape of the other two axes
-        # in their original order (i.e. for slice_axis=0, plane is (shape[1], shape[2])).
-        remaining_axes = [i for i in range(3) if i != slice_axis]
-        # remaining_axes is in natural order; e.g. slice_axis=0 -> [1,2]
-        # plane[i, j] is (axis remaining_axes[0]=1, axis remaining_axes[1]=2)
-        # We want x to show hax, y to show vax. So figure out the mapping.
-        if remaining_axes[0] == hax:
-            # plane's first axis is horizontal. imshow convention: first axis is Y.
-            # So transpose to put horizontal on X.
-            plane_disp = plane.T
-        else:
-            # plane's first axis is vertical already -- matches imshow Y
-            plane_disp = plane
-
-        extent = (0.0, ct_mm[hax], 0.0, ct_mm[vax])
-        ax.imshow(plane_disp, cmap="gray", vmin=vmin, vmax=vmax,
-                  extent=extent, origin="lower", aspect="equal")
-
-        # Draw patch rectangles, centered on volume center in the hax/vax plane
-        cx = ct_mm[hax] / 2.0
-        cy = ct_mm[vax] / 2.0
-        for i, spec in enumerate(patch_specs):
-            color = _PALETTE[i % len(_PALETTE)]
-            # Use target_spacing if provided (patch in target-space voxels),
-            # otherwise interpret patch as voxels at the CT's native spacing.
-            sp_mm = spec.get("target_spacing") or list(ct_zooms)
-            patch_mm = [spec["patch_size"][k] * sp_mm[k] for k in range(3)]
-            w = patch_mm[hax]
-            h = patch_mm[vax]
-            rect = Rectangle(
-                (cx - w / 2, cy - h / 2), w, h,
-                linewidth=2.2, edgecolor=color, facecolor="none",
-                label=f"{spec['label']}  {patch_mm[hax]:.0f}x{patch_mm[vax]:.0f} mm",
-            )
-            ax.add_patch(rect)
-
-        ax.set_title(f"{view_name}  (slice {mid}/{ct_shape[slice_axis]}, "
-                     f"axis {slice_axis} = {ct_mm[slice_axis]:.0f} mm)")
-        ax.set_xlabel(f"axis {hax}  ({ct_mm[hax]:.0f} mm)")
-        ax.set_ylabel(f"axis {vax}  ({ct_mm[vax]:.0f} mm)")
-
-    # Shared legend + title
-    # Build descriptive labels (patch dims in vox + mm + spacing note)
-    handles, _ = axes[0].get_legend_handles_labels()
-    full_labels = []
-    for i, spec in enumerate(patch_specs):
-        sp_mm = spec.get("target_spacing") or list(ct_zooms)
-        patch_mm = [spec["patch_size"][k] * sp_mm[k] for k in range(3)]
-        sp_note = (f"target {sp_mm[0]:.2f}x{sp_mm[1]:.2f}x{sp_mm[2]:.2f} mm"
-                   if spec.get("target_spacing")
-                   else f"native {ct_zooms[0]:.2f}x{ct_zooms[1]:.2f}x{ct_zooms[2]:.2f} mm")
-        full_labels.append(
-            f"{spec['label']}   patch={spec['patch_size']} vox  "
-            f"= {patch_mm[0]:.0f}x{patch_mm[1]:.0f}x{patch_mm[2]:.0f} mm  ({sp_note})"
-        )
-
-    if title is None:
-        title = (f"Patch-size comparison on {ct_path.name}\n"
-                 f"Volume: {ct_shape[0]}x{ct_shape[1]}x{ct_shape[2]} voxels "
-                 f"@ {ct_zooms[0]:.2f}x{ct_zooms[1]:.2f}x{ct_zooms[2]:.2f} mm "
-                 f"= {ct_mm[0]:.0f}x{ct_mm[1]:.0f}x{ct_mm[2]:.0f} mm FOV")
-
-    # Explicit margins: top for title, bottom for legend + xlabels
-    fig.subplots_adjust(top=0.88, bottom=0.20, left=0.04, right=0.98, wspace=0.22)
-    fig.suptitle(title, fontsize=12, y=0.96)
-    fig.legend(
-        handles, full_labels,
-        loc="lower center", ncol=1, frameon=True,
-        bbox_to_anchor=(0.5, 0.01),
-        fontsize=10,
+    return PatchSpec(
+        label=label,
+        patch_voxel=tuple(int(v) for v in patch),
+        spacing_mm=tuple(float(v) for v in spacing),
+        color=color,
     )
 
+
+def parse_patch_spec(spec: str, color: str,
+                      native_spacing: Tuple[float, float, float]) -> PatchSpec:
+    if ":" not in spec:
+        raise ValueError(f"--patch_spec must be 'label:z,y,x', got: {spec}")
+    label, dims = spec.split(":", 1)
+    parts = [p.strip() for p in dims.split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"--patch_spec dims must be 3 ints, got: {spec}")
+    return PatchSpec(
+        label=label.strip(),
+        patch_voxel=tuple(int(p) for p in parts),
+        spacing_mm=native_spacing,
+        color=color,
+    )
+
+
+def assign_widths_and_offsets(patch_specs: List[PatchSpec]) -> List[Tuple[float, float]]:
+    """
+    Assign linewidth by ascending physical volume so smaller patches are
+    thinnest. Detect identical-extent groups and return a small diagonal
+    offset for each so identical boxes fan out a few pixels.
+
+    Returns list of (offset_x, offset_y) in PIXEL units.
+    """
+    order = sorted(
+        range(len(patch_specs)),
+        key=lambda i: (
+            patch_specs[i].patch_mm[0] *
+            patch_specs[i].patch_mm[1] *
+            patch_specs[i].patch_mm[2],
+            i,
+        )
+    )
+    for rank, idx in enumerate(order):
+        patch_specs[idx].linewidth = _LINEWIDTHS[rank % len(_LINEWIDTHS)]
+
+    offsets = [(0.0, 0.0)] * len(patch_specs)
+    seen_groups: Dict[tuple, List[int]] = {}
+    for i, ps in enumerate(patch_specs):
+        key = tuple(round(x, 3) for x in ps.patch_mm)
+        seen_groups.setdefault(key, []).append(i)
+    for key, indices in seen_groups.items():
+        if len(indices) <= 1:
+            continue
+        for k, i in enumerate(indices):
+            offsets[i] = (k * 4.0, k * 4.0)
+    return offsets
+
+
+# =============================================================================
+# Plotting helpers
+# =============================================================================
+
+def _slice_to_display(arr3d: np.ndarray, view_axis: int, idx: int) -> np.ndarray:
+    """Pull a 2D slice for a given view in display-pixel layout."""
+    s = [slice(None)] * 3
+    s[view_axis] = idx
+    arr2d = arr3d[tuple(s)]
+    if view_axis == 2:
+        arr2d = arr2d.T
+    return arr2d
+
+
+def _display_axes_for_view(view_axis: int) -> Tuple[int, int]:
+    """Return (vertical_voxel_axis, horizontal_voxel_axis) for the displayed image."""
+    if view_axis == 1:   # axial
+        return 0, 2
+    if view_axis == 0:   # coronal
+        return 1, 2
+    if view_axis == 2:   # sagittal (transposed)
+        return 1, 0
+    raise ValueError(view_axis)
+
+
+def _label_to_rgba(label_2d: np.ndarray) -> np.ndarray:
+    """Convert a 2D label slice to an RGBA image suitable for imshow overlay."""
+    h, w = label_2d.shape
+    rgba = np.zeros((h, w, 4), dtype=np.float32)
+    for cls, (r, g, b, a) in _SEG_COLORS.items():
+        mask = (label_2d == cls)
+        if not mask.any():
+            continue
+        rgba[mask, 0] = r
+        rgba[mask, 1] = g
+        rgba[mask, 2] = b
+        rgba[mask, 3] = a
+    return rgba
+
+
+def _set_mm_ticks(ax, axis_pixel_count: int, spacing_along_axis: float,
+                  which: str) -> None:
+    """Place ticks at integer voxel positions and label them in mm."""
+    extent_mm = axis_pixel_count * spacing_along_axis
+    if   extent_mm >= 800: step_mm = 200
+    elif extent_mm >= 400: step_mm = 100
+    elif extent_mm >= 200: step_mm = 50
+    else:                  step_mm = 25
+    tick_mm     = np.arange(0, extent_mm + 1, step_mm)
+    tick_pixels = tick_mm / spacing_along_axis
+    valid = (tick_pixels >= 0) & (tick_pixels <= axis_pixel_count - 1)
+    tick_pixels = tick_pixels[valid]
+    tick_mm     = tick_mm[valid]
+    if which == "x":
+        ax.set_xticks(tick_pixels)
+        ax.set_xticklabels([f"{v:.0f}" for v in tick_mm])
+    else:
+        ax.set_yticks(tick_pixels)
+        ax.set_yticklabels([f"{v:.0f}" for v in tick_mm])
+
+
+# =============================================================================
+# Main figure
+# =============================================================================
+
+def render_figure(ct: np.ndarray, affine: np.ndarray,
+                   patch_specs: List[PatchSpec],
+                   centroid_pir: Tuple[int, int, int],
+                   out_path: Path,
+                   label_pir: Optional[np.ndarray] = None,
+                   ct_filename: str = "",
+                   centroid_source: str = "") -> None:
+    """
+    Three orthogonal panels in PIR voxel space. Each panel:
+      - shows the CT slice in HU window
+      - overlays segmentation labels (if provided) as semi-transparent colors
+      - overlays candidate patch rectangles (solid lines, varying thickness)
+      - draws a yellow crosshair at the slicing centroid
+      - labels the axes in mm via tick relabeling
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle, Patch
+
+    spacing = np.linalg.norm(affine[:3, :3], axis=0)
+    pir_to_patch = {1: 0, 0: 1, 2: 2}
+
+    pixel_offsets = assign_widths_and_offsets(patch_specs)
+
+    p_idx, i_idx, r_idx = centroid_pir
+    views = [
+        ("Axial",    1, i_idx),
+        ("Coronal",  0, p_idx),
+        ("Sagittal", 2, r_idx),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 7), constrained_layout=False)
+
+    # Track which classes are visible somewhere in the figure for the legend
+    visible_classes: set = set()
+
+    for col, (view_name, view_axis, idx) in enumerate(views):
+        ax = axes[col]
+        idx = int(np.clip(idx, 0, ct.shape[view_axis] - 1))
+
+        # Background CT
+        ct_disp = _slice_to_display(ct, view_axis, idx)
+        ax.imshow(_hu_window(ct_disp), cmap="gray",
+                  origin="upper", aspect="equal", interpolation="nearest")
+
+        # Mask overlay (if available)
+        if label_pir is not None:
+            lbl_disp = _slice_to_display(label_pir, view_axis, idx)
+            visible_classes |= {int(c) for c in np.unique(lbl_disp) if c > 0}
+            rgba = _label_to_rgba(lbl_disp)
+            if rgba[..., 3].max() > 0:
+                ax.imshow(rgba, origin="upper", aspect="equal", interpolation="nearest")
+
+        # Determine which PIR voxel axes correspond to display rows/cols
+        v_pir, h_pir = _display_axes_for_view(view_axis)
+        cx_px = centroid_pir[h_pir]
+        cy_px = centroid_pir[v_pir]
+
+        # Patch rectangles (solid lines, varying widths, small offsets for duplicates)
+        for ps, off_px in zip(patch_specs, pixel_offsets):
+            patch_h_mm = ps.patch_mm[pir_to_patch[h_pir]]
+            patch_v_mm = ps.patch_mm[pir_to_patch[v_pir]]
+            patch_h_px = patch_h_mm / spacing[h_pir]
+            patch_v_px = patch_v_mm / spacing[v_pir]
+            x0 = cx_px - patch_h_px / 2 + off_px[0]
+            y0 = cy_px - patch_v_px / 2 + off_px[1]
+            ax.add_patch(Rectangle(
+                (x0, y0), patch_h_px, patch_v_px,
+                linewidth=ps.linewidth, edgecolor=ps.color,
+                linestyle="solid", facecolor="none",
+            ))
+
+        # Crosshair at centroid
+        crosshair_len_px = max(15, int(min(ct_disp.shape) * 0.04))
+        ax.plot([cx_px - crosshair_len_px, cx_px + crosshair_len_px],
+                [cy_px, cy_px], color="yellow", linewidth=1.0, alpha=0.85)
+        ax.plot([cx_px, cx_px],
+                [cy_px - crosshair_len_px, cy_px + crosshair_len_px],
+                color="yellow", linewidth=1.0, alpha=0.85)
+
+        _set_mm_ticks(ax, ct_disp.shape[1], spacing[h_pir], which="x")
+        _set_mm_ticks(ax, ct_disp.shape[0], spacing[v_pir], which="y")
+
+        # Anatomic-orientation labels
+        def _orient_label(x, y, text, ha, va):
+            ax.text(x, y, text, transform=ax.transAxes, color="white",
+                    fontsize=12, fontweight="bold", va=va, ha=ha,
+                    bbox=dict(boxstyle="round,pad=0.18", fc="black", alpha=0.65))
+        if view_name == "Axial":
+            _orient_label(0.50, 0.98, "A", "center", "top")
+            _orient_label(0.50, 0.02, "P", "center", "bottom")
+            _orient_label(0.98, 0.50, "R", "right",  "center")
+            _orient_label(0.02, 0.50, "L", "left",   "center")
+        elif view_name == "Coronal":
+            _orient_label(0.50, 0.98, "S", "center", "top")
+            _orient_label(0.50, 0.02, "I", "center", "bottom")
+            _orient_label(0.98, 0.50, "R", "right",  "center")
+            _orient_label(0.02, 0.50, "L", "left",   "center")
+        else:
+            _orient_label(0.50, 0.98, "S", "center", "top")
+            _orient_label(0.50, 0.02, "I", "center", "bottom")
+            _orient_label(0.98, 0.50, "P", "right",  "center")
+            _orient_label(0.02, 0.50, "A", "left",   "center")
+
+        ax.set_title(view_name, fontsize=14, fontweight="bold")
+        ax.set_xlabel("mm", fontsize=11)
+        if col == 0:
+            ax.set_ylabel("mm", fontsize=11)
+        ax.tick_params(labelsize=10)
+
+    # ── Legends ─────────────────────────────────────────────────────────────
+    # Two stacked legends below the panels:
+    #   1) patch boxes (color-coded line samples)
+    #   2) mask classes (color-coded patches), only if any are visible
+    patch_legend_handles = [
+        Line2D([0], [0], color=ps.color, linewidth=ps.linewidth, linestyle="solid",
+               label=f"{ps.label}  patch=[{ps.patch_voxel[0]},{ps.patch_voxel[1]},{ps.patch_voxel[2]}] vox  "
+                     f"= {ps.patch_mm[0]:.0f}×{ps.patch_mm[1]:.0f}×{ps.patch_mm[2]:.0f} mm  "
+                     f"(target {ps.spacing_mm[0]:.2f}×{ps.spacing_mm[1]:.2f}×{ps.spacing_mm[2]:.2f} mm)")
+        for ps in patch_specs
+    ]
+    leg_patches = fig.legend(
+        handles=patch_legend_handles, loc="lower center",
+        ncol=1, fontsize=11, frameon=True, title="Candidate patches",
+        title_fontsize=11, bbox_to_anchor=(0.5, 0.02),
+    )
+    leg_patches.get_frame().set_linewidth(0.8)
+    leg_patches._legend_box.align = "left"
+
+    if visible_classes:
+        mask_legend_handles = [
+            Patch(facecolor=_SEG_COLORS[c][:3], edgecolor="none",
+                  alpha=_SEG_COLORS[c][3], label=CLASS_NAMES[c])
+            for c in sorted(visible_classes) if c in CLASS_NAMES
+        ]
+        # Add the class legend separately so it doesn't merge with patches
+        leg_classes = fig.legend(
+            handles=mask_legend_handles, loc="lower center",
+            ncol=min(9, len(mask_legend_handles)), fontsize=10, frameon=True,
+            title="Segmentation classes (slice)", title_fontsize=10,
+            bbox_to_anchor=(0.5, -0.06),
+        )
+        leg_classes.get_frame().set_linewidth(0.8)
+        # matplotlib drops earlier legends when you add a new one via fig.legend;
+        # re-add the patch legend explicitly so both render.
+        fig.add_artist(leg_patches)
+
+    # ── Title ───────────────────────────────────────────────────────────────
+    spacing_str = "x".join(f"{s:.2f}" for s in spacing)
+    fov_mm = tuple(ct.shape[i] * spacing[i] for i in range(3))
+    fov_str = "x".join(f"{m:.0f}" for m in fov_mm)
+    title = "Patch-size comparison"
+    if ct_filename:
+        title += f" on {ct_filename}"
+    subtitle = (f"Volume: {ct.shape[0]}×{ct.shape[1]}×{ct.shape[2]} voxels "
+                f"@ {spacing_str} mm = {fov_str} mm FOV (PIR)")
+    if centroid_source:
+        subtitle += f"   |   slice centroid: {centroid_source}"
+    fig.suptitle(f"{title}\n{subtitle}", fontsize=15, fontweight="bold", y=0.99)
+
+    # Reserve enough room at the bottom for both legends if both present
+    bottom_margin = 0.30 if visible_classes else 0.22
+    fig.subplots_adjust(top=0.86, bottom=bottom_margin,
+                         left=0.04, right=0.99, wspace=0.18)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Wrote {out_path}")
+    log.info("Wrote %s", out_path)
 
 
 # =============================================================================
@@ -239,56 +572,78 @@ def render(
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Overlay candidate patch sizes on a CT's mid-slices.",
+        description="Overlay candidate nnU-Net patches on a CT (PIR-oriented).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     ap.add_argument("--ct", required=True, type=Path,
-                    help="Path to a CT NIfTI (.nii.gz) for the background.")
-    ap.add_argument("--plans", action="append", type=Path, default=[],
-                    help="Path to a plans.json (repeatable). Patch size + "
-                         "target spacing taken from 3d_fullres configuration.")
-    ap.add_argument("--patch_spec", action="append", default=[],
-                    help="Explicit 'LABEL:x,y,z' spec in voxels (repeatable). "
-                         "Interpreted at the CT's native voxel spacing unless "
-                         "a plans file says otherwise.")
-    ap.add_argument("--config", default="3d_fullres",
-                    help="Which configuration to read from each plans.json.")
-    ap.add_argument("--out", required=True, type=Path,
-                    help="Output image path (.png or .pdf).")
-    ap.add_argument("--title", default=None,
-                    help="Custom figure title (default: auto-generated).")
+                    help="CT NIfTI (any orientation; reoriented to PIR).")
+    ap.add_argument("--label", default=None, type=Path,
+                    help="Explicit label NIfTI for slice-centroid + mask overlay. "
+                         "If omitted, auto-detects sibling labels/<stem>_label.nii.gz.")
+    ap.add_argument("--no_mask_overlay", action="store_true",
+                    help="Skip rendering label masks even when a label file is found.")
+    ap.add_argument("--plans", action="append", default=[], type=Path,
+                    help="Plans.json file (repeatable).")
+    ap.add_argument("--patch_spec", action="append", default=[], type=str,
+                    help="Manual patch as 'label:z,y,x' (voxels at native spacing). Repeatable.")
+    ap.add_argument("--config", default="3d_fullres", type=str,
+                    help="Configuration key in plans.json (default: 3d_fullres).")
+    ap.add_argument("--out", required=True, type=Path)
     args = ap.parse_args()
 
     if not args.ct.exists():
-        print(f"ERROR: CT not found: {args.ct}", file=sys.stderr)
+        log.error("CT not found: %s", args.ct)
         return 1
     if not args.plans and not args.patch_spec:
-        print("ERROR: give at least one --plans or --patch_spec.", file=sys.stderr)
+        log.error("Provide at least one --plans or --patch_spec")
         return 1
 
-    specs: List[Dict] = []
-    for p in args.plans:
-        if not p.exists():
-            print(f"ERROR: plans file not found: {p}", file=sys.stderr)
+    log.info("Loading CT (PIR-canonicalized): %s", args.ct)
+    ct, affine = _load_pir(args.ct)
+    spacing = np.linalg.norm(affine[:3, :3], axis=0)
+    log.info("  shape=%s  spacing=%s mm", ct.shape, spacing.tolist())
+
+    label_pir, centroid_pir, centroid_source, _ = load_label_and_pick_centroid(
+        ct, args.ct, args.label
+    )
+    if args.no_mask_overlay:
+        log.info("Mask overlay disabled by --no_mask_overlay")
+        label_pir = None
+
+    patch_specs: List[PatchSpec] = []
+    color_iter = iter(_PALETTE)
+    next_color = lambda: next(color_iter, _PALETTE[-1])
+
+    for plans_path in args.plans:
+        ps = parse_plans_file(plans_path, color=next_color(), config=args.config)
+        if ps is not None:
+            patch_specs.append(ps)
+
+    native_spacing = tuple(float(s) for s in spacing)
+    for spec in args.patch_spec:
+        try:
+            ps = parse_patch_spec(spec, color=next_color(),
+                                   native_spacing=native_spacing)
+            patch_specs.append(ps)
+        except ValueError as e:
+            log.error("%s", e)
             return 1
-        specs.append(load_plans_file(p, args.config))
-    for s in args.patch_spec:
-        specs.append(parse_patch_spec(s))
 
-    # De-dup on label (later wins) + preserve insertion order
-    seen = {}
-    for s in specs:
-        seen[s["label"]] = s
-    specs = list(seen.values())
+    if not patch_specs:
+        log.error("No usable patch specs after parsing.")
+        return 1
 
-    print(f"Rendering {len(specs)} patch spec(s) on {args.ct.name}:")
-    for s in specs:
-        sp = s.get("target_spacing")
-        sp_str = f"{sp[0]:.2f}x{sp[1]:.2f}x{sp[2]:.2f}" if sp else "native"
-        print(f"  {s['label']:>8s}  patch={s['patch_size']}  spacing={sp_str}")
+    log.info("Rendering %d patch spec(s) on %s:", len(patch_specs), args.ct.name)
+    for ps in patch_specs:
+        log.info("  %s", str(ps))
 
-    render(args.ct, specs, args.out, title=args.title)
+    render_figure(
+        ct, affine, patch_specs, centroid_pir, args.out,
+        label_pir=label_pir,
+        ct_filename=args.ct.name,
+        centroid_source=centroid_source,
+    )
     return 0
 
 

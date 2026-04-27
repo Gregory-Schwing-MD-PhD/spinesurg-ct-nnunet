@@ -1,45 +1,54 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v2)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v3)
 tools/nnunet_wandb_variant.py
 
-Changes vs v1
+Changes vs v2
 =============
-1. Warning filter: the RuntimeWarning about "invalid value in scalar divide"
-   from nnU-Net's global_dc_per_class is now suppressed at trainer init.
-   Root cause: when a class is absent from the entire validation epoch
-   (TP = FP = FN = 0), 2*TP / (2*TP + FP + FN) = 0/0 = NaN + warning.
-   Benign, but it clutters the log stream. We catch only THAT specific
-   numpy warning, not everything.
+1. LSTV oversampling now covers BOTH lumbarization AND sacralization.
 
-2. W&B init is now retryable with exponential backoff. If the cluster
-   can't reach api.wandb.ai, we fall back to offline mode so the run
-   still logs to disk and can be synced later via `wandb sync`.
-   Controls:
-       WANDB_INIT_MAX_RETRIES   default 3
-       WANDB_INIT_TIMEOUT_SEC   default 120 (increase if timing out)
-       WANDB_ALLOW_OFFLINE      default 1 (set 0 to hard-fail instead)
+   v2 detected LSTV cases by scanning labelsTr/ for L6 voxels. That
+   only catches lumbarization (which has a 6th lumbar labeled L6).
+   Sacralization cases (L5 fused to sacrum) have no L6 voxels in their
+   labels, so v2 silently undersampled them at the natural ~3% rate.
 
-3. NaN-safe dice aggregation. When per-class dice is NaN (class absent
-   from the epoch), we DROP it from the lumbar/pelvic/foreground means
-   rather than treating it as 0.0. This is what you want scientifically:
-   a missing class should not drag the mean down -- your paper-metrics
-   script already does this, the live W&B plot should too.
+   v3 detection precedence (first hit wins):
+     a) lstv_cases.json in <nnUNet_preprocessed>/<dataset_name>/    (preferred)
+     b) lstv_cases.json in <nnUNet_raw>/<dataset_name>/             (fallback)
+     c) Live scan of HF manifests (manifest_train/validation/test.json)
+     d) labelsTr L6-voxel scan (legacy v2 behaviour, lumbarization only)
 
-4. Three new trainer classes:
-       nnUNetTrainerWandB_1000epochs          (1000 ep, default)
-       nnUNetTrainerWandB_1000ep_500iter      (1000 ep, 500 iters/epoch)
-       nnUNetTrainerWandB_1000ep_LSTVOversample
-           (1000 ep, 500 iters/epoch, oversample cases containing L6)
+   lstv_cases.json is produced at convert time by
+   tools/convert_hf_to_nnunet.py. Its schema (v1):
+       {
+         "schema_version": 1,
+         "n_cases": <int>,
+         "subtype_counts": {"lumbarization": N, "sacralization": M},
+         "case_ids": {"<case_id>": "<lstv_label>", ...}
+       }
 
-   The LSTV-oversample variant looks up which cases contain L6 from the
-   labels folder at trainer init and modifies the dataloader to sample
-   those cases at 50% probability during training. This is the right
-   thing to do given L6 appears in only ~5-15% of cases.
+2. Wider dataloader-attribute search. nnU-Net v2.5+ uses 'identifiers'
+   as the attribute name (was 'keys' in earlier versions). v3 tries
+   both, walks several known attribute paths, and logs the traversal
+   so you can see what matched.
 
-   NOTE: the LSTV oversampling is CASE-level (entire case more likely
-   to be drawn), not patch-level. This composes cleanly with nnU-Net's
-   built-in oversample_foreground_percent, which operates within a
-   drawn case's volume.
+3. Post-patch verification. After duplicating keys, v3 reads back the
+   attribute to confirm the new length stuck. Catches silent failures
+   where the framework wraps the attribute in something immutable.
+
+4. Per-subtype logging at startup. Confirms both lumbarization and
+   sacralization are represented in this fold's training split.
+
+5. Edge-case guards. LSTV_OVERSAMPLE_FRAC capped at 0.95 to prevent
+   divide-by-zero AND because 100% LSTV defeats nnU-Net's
+   normal/abnormal mixed exposure.
+
+6. New 500-epoch trainer variants for the ML4H 2025 deadline.
+
+Inherited from v2 (unchanged):
+   - W&B init with retry + offline fallback
+   - benign scalar-divide warning suppression
+   - NaN-safe dice aggregation in W&B logs
+   - SPINESURG_RUN_VAL_EXPORT toggle for perform_actual_validation
 
 Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
 """
@@ -51,9 +60,10 @@ import os
 import random
 import time
 import warnings
-from collections import defaultdict
-from os.path import isfile, join
-from typing import Dict, List, Optional, Set
+from collections import Counter, defaultdict
+from os.path import isfile, isdir, join
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -83,6 +93,14 @@ _ANATOMY_NAMES = [
 _L6_LABEL_ID = 6
 _IGNORE_LABEL = 10
 
+# Configs from convert_hf_to_nnunet.py — used when constructing case_ids
+# from manifest tokens during the live-manifest fallback path.
+_VALID_CONFIGS = ("fused", "spine_only", "pelvic_native")
+
+# Schema version for lstv_cases.json. Must match the writer in
+# convert_hf_to_nnunet.py.
+LSTV_CASES_SCHEMA_VERSION = 1
+
 
 # -----------------------------------------------------------------------------
 # Silence the benign scalar-divide warning from nnU-Net's dice accumulator
@@ -90,34 +108,21 @@ _IGNORE_LABEL = 10
 
 def _install_nnunet_warning_filter() -> None:
     """
-    Suppress ONLY the specific scalar-divide warning that fires when a class
-    has zero presence in a validation epoch. Leaves all other numpy warnings
-    alone so we still see legitimate problems.
+    Suppress ONLY the specific scalar-divide warning that fires when a
+    class has zero presence in a validation epoch. Leaves all other
+    numpy warnings alone so we still see legitimate problems.
     """
     warnings.filterwarnings(
         "ignore",
         message="invalid value encountered in scalar divide",
         category=RuntimeWarning,
     )
-    # Same mechanism triggers via numpy's new error handling path
     np.seterr(invalid="ignore", divide="warn")
 
 
 # -----------------------------------------------------------------------------
-# NaN-safe mean helper
+# Env helpers
 # -----------------------------------------------------------------------------
-
-def _nanmean_list(vals) -> Optional[float]:
-    try:
-        arr = np.asarray([v for v in vals if v is not None], dtype=np.float64)
-        if arr.size == 0:
-            return None
-        if np.all(np.isnan(arr)):
-            return None
-        return float(np.nanmean(arr))
-    except Exception:
-        return None
-
 
 def _env_truthy(name: str, default: bool = False) -> bool:
     val = os.environ.get(name, "").strip().lower()
@@ -134,14 +139,152 @@ def _env_int(name: str, default: int) -> int:
 
 
 # -----------------------------------------------------------------------------
-# LSTV case detection (for oversampling trainer)
+# LSTV case identification
 # -----------------------------------------------------------------------------
 
-def _scan_lstv_case_ids(labels_dir: str) -> Set[str]:
+def _safe_id(token: str) -> str:
+    """Mirror of convert_hf_to_nnunet.py:safe_id() — must stay in sync."""
+    s = str(token)
+    for bad in (".", "/", "\\", " ", ":", "(", ")"):
+        s = s.replace(bad, "_")
+    s = s.strip("_")
+    return s
+
+
+def _read_lstv_cases_json(json_path: Path
+                           ) -> Optional[Tuple[Set[str], Counter]]:
     """
-    Return the set of case IDs (filenames without '.nii.gz') whose GT label
-    volume contains any voxel with label = _L6_LABEL_ID. Used to build a
-    weighted sampler for the LSTV-oversample trainer.
+    Load lstv_cases.json from disk. Returns (case_ids, subtype_counts)
+    or None on any failure (file missing, schema mismatch, parse error).
+    """
+    if not json_path.exists():
+        return None
+    try:
+        data = json.loads(json_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    schema = data.get("schema_version")
+    if schema != LSTV_CASES_SCHEMA_VERSION:
+        return None
+    case_ids_dict = data.get("case_ids") or {}
+    if not isinstance(case_ids_dict, dict):
+        return None
+    case_ids = set(case_ids_dict.keys())
+    subtype_counts = Counter()
+    for cid, subtype in case_ids_dict.items():
+        if isinstance(subtype, str) and subtype:
+            subtype_counts[subtype.lower()] += 1
+    return case_ids, subtype_counts
+
+
+def _candidate_lstv_json_paths(dataset_name: str) -> List[Path]:
+    """
+    Common locations for lstv_cases.json, in priority order. Tries the
+    preprocessed/ directory first since that's where nnU-Net runs from
+    at training time, then falls back to raw/.
+    """
+    cands: List[Path] = []
+    pre = os.environ.get("nnUNet_preprocessed")
+    if pre:
+        cands.append(Path(pre) / dataset_name / "lstv_cases.json")
+    raw = os.environ.get("nnUNet_raw") or os.environ.get("nnUNet_raw_data_base")
+    if raw:
+        cands.append(Path(raw) / dataset_name / "lstv_cases.json")
+    return cands
+
+
+def _candidate_hf_export_dirs() -> List[Path]:
+    """Locations to try for live-manifest fallback path."""
+    cands: List[Path] = []
+    env = os.environ.get("HF_EXPORT_DIR", "").strip()
+    if env:
+        cands.append(Path(env))
+    home = Path.home()
+    cands.append(home / "CTSpinoPelvic1K" / "data" / "hf_export")
+    cands.append(home / "spinesurg-ct-nnunet" / "data" / "hf_export")
+    raw = os.environ.get("nnUNet_raw") or os.environ.get("nnUNet_raw_data_base")
+    if raw:
+        cands.append(Path(raw).parent.parent / "data" / "hf_export")
+        cands.append(Path(raw).parent / "data" / "hf_export")
+    seen: Set[str] = set()
+    uniq: List[Path] = []
+    for c in cands:
+        s = str(c)
+        if s not in seen:
+            seen.add(s)
+            uniq.append(c)
+    return uniq
+
+
+def _read_lstv_records_from_manifest(hf_export_dir: Path
+                                      ) -> Optional[Tuple[Set[str], Counter]]:
+    """
+    Live-manifest fallback. Reads manifest_train.json /
+    manifest_validation.json / manifest_test.json (or single manifest.json)
+    under hf_export_dir, identifies records with lstv_label != "normal",
+    and returns (case_ids, subtype_counts).
+    """
+    if not hf_export_dir.is_dir():
+        return None
+
+    records: List[Dict] = []
+    split_files = [
+        hf_export_dir / "manifest_train.json",
+        hf_export_dir / "manifest_validation.json",
+        hf_export_dir / "manifest_test.json",
+    ]
+    for p in split_files:
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+                if isinstance(data, list):
+                    records.extend(data)
+                elif isinstance(data, dict) and "records" in data:
+                    records.extend(data["records"])
+            except Exception:
+                continue
+
+    if not records:
+        combined = hf_export_dir / "manifest.json"
+        if combined.exists():
+            try:
+                data = json.loads(combined.read_text())
+                if isinstance(data, list):
+                    records = data
+                elif isinstance(data, dict) and "records" in data:
+                    records = data["records"]
+            except Exception:
+                return None
+
+    if not records:
+        return None
+
+    case_ids: Set[str] = set()
+    subtypes: Counter = Counter()
+    for r in records:
+        lstv = str(r.get("lstv_label", "")).strip().lower()
+        if not lstv or lstv == "normal":
+            continue
+        token = r.get("token")
+        config = r.get("config", "fused")
+        if token is None or config not in _VALID_CONFIGS:
+            continue
+        case_id = f"{_safe_id(token)}__{config}"
+        case_ids.add(case_id)
+        subtypes[lstv] += 1
+
+    if not case_ids:
+        return None
+    return case_ids, subtypes
+
+
+def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
+    """
+    Last-resort fallback: scan labelsTr/ for cases containing L6
+    voxels. Catches lumbarization but NOT sacralization. Used only
+    when no lstv_cases.json or manifest is reachable.
     """
     import nibabel as nib
     out: Set[str] = set()
@@ -169,8 +312,6 @@ class _WandBMixin:
     _metric_cache = None
     _intercepted_objects = None
 
-    # ----- primary metric source: progress.json --------------------------
-
     def _progress_json_path(self) -> Optional[str]:
         out = getattr(self, "output_folder", None)
         return join(out, "progress.json") if out else None
@@ -185,8 +326,6 @@ class _WandBMixin:
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
-
-    # ----- log-intercept fallback ----------------------------------------
 
     def _wrap_log_method(self, obj, cache) -> bool:
         try:
@@ -261,8 +400,6 @@ class _WandBMixin:
             return dict(self._metric_cache)
         return {}
 
-    # ----- diagnostic -----------------------------------------------------
-
     def _dump_environment(self) -> None:
         try:
             logger = getattr(self, "logger", None)
@@ -284,8 +421,6 @@ class _WandBMixin:
                 f"(effective = {_env_truthy('SPINESURG_RUN_VAL_EXPORT')})")
         except Exception:
             pass
-
-    # ----- W&B lifecycle (with retry + offline fallback) ------------------
 
     def _init_wandb(self) -> None:
         if self._wandb_run is not None:
@@ -334,7 +469,6 @@ class _WandBMixin:
         init_timeout = _env_int("WANDB_INIT_TIMEOUT_SEC", 120)
         allow_offline = _env_truthy("WANDB_ALLOW_OFFLINE", True)
 
-        # Retry online init with exponential backoff.
         for attempt in range(1, max_retries + 1):
             try:
                 settings = wandb.Settings(init_timeout=init_timeout) if hasattr(wandb, "Settings") else None
@@ -361,7 +495,6 @@ class _WandBMixin:
                     self.print_to_log_file(f"  retrying in {backoff:.1f}s...")
                     time.sleep(backoff)
 
-        # All online retries failed. Try offline if allowed.
         if allow_offline:
             try:
                 self.print_to_log_file("WandB: falling back to OFFLINE mode. "
@@ -407,8 +540,6 @@ class _WandBMixin:
         except Exception:
             pass
         self._wandb_run = None
-
-    # ----- nnU-Net trainer hooks ------------------------------------------
 
     def on_train_start(self):  # type: ignore[override]
         super().on_train_start()
@@ -458,7 +589,6 @@ class _WandBMixin:
                 except Exception:
                     epoch_time = None
 
-            # Per-class dice: anatomy-named keys; NaN is dropped, not zeroed.
             per_class_log: Dict[str, float] = {}
             dice_per_class = last("dice_per_class_or_region")
             lumbar_vals: List[float] = []
@@ -475,7 +605,6 @@ class _WandBMixin:
                         except Exception:
                             continue
                         if np.isnan(vf):
-                            # class absent from epoch -> skip, don't log 0
                             continue
                         per_class_log[f"val/dice/{name}"] = vf
                         fg_vals.append(vf)
@@ -562,8 +691,6 @@ class _WandBMixin:
         except Exception:
             pass
 
-    # ----- validation export toggle ---------------------------------------
-
     def perform_actual_validation(self, save_probabilities: bool = False):  # type: ignore[override]
         if _env_truthy("SPINESURG_RUN_VAL_EXPORT"):
             self.print_to_log_file(
@@ -588,160 +715,275 @@ def _as_float(x):
 
 
 # =============================================================================
-# LSTV oversampling mixin
+# LSTV oversampling mixin (v3)
 # =============================================================================
 
 class _LSTVOversampleMixin:
     """
-    Oversample cases containing L6 (LSTV) at the dataloader level.
+    Oversample cases with lstv_label != "normal" at the dataloader level.
+    Covers BOTH lumbarization and sacralization.
 
-    Strategy
-    --------
-    On train start, scan the preprocessed dataset's label files to
-    identify which case IDs contain L6 voxels. Then replace the default
-    sampler in the training dataloader with a WeightedRandomSampler
-    that draws LSTV cases at probability ~ LSTV_OVERSAMPLE_FRAC (default
-    0.5), meaning half of training batches are guaranteed to contain
-    L6 exposure at the CASE level. Standard nnU-Net foreground
-    oversampling (patch level) operates on top of this.
+    Detection precedence (first hit wins):
+      a) <nnUNet_preprocessed>/<dataset>/lstv_cases.json   (preferred)
+      b) <nnUNet_raw>/<dataset>/lstv_cases.json
+      c) Live HF manifest scan (HF_EXPORT_DIR or auto-detect)
+      d) Legacy L6-voxel scan over labelsTr (lumbarization only)
 
     Env vars
     --------
-        LSTV_OVERSAMPLE_FRAC    fraction of batches containing LSTV cases
-                                (default: 0.5)
-        LSTV_LABELS_DIR         override the auto-detected labelsTr dir
-                                (rare; usually unnecessary)
+        LSTV_OVERSAMPLE_FRAC    target fraction of training keys that
+                                are LSTV cases. Default 0.5; capped at
+                                0.95 to avoid divide-by-zero.
+        HF_EXPORT_DIR           override HF export path for fallback (c).
+        LSTV_LABELS_DIR         override labelsTr path for fallback (d).
+
+    The mixin composes with _WandBMixin via super() chain.
+    MRO: _LSTVOversampleMixin -> _WandBMixin -> nnUNetTrainer
     """
 
     _lstv_case_ids: Optional[Set[str]] = None
+    _lstv_subtype_counts: Optional[Counter] = None
+    _lstv_detection_source: Optional[str] = None
 
-    def _lstv_labels_dir(self) -> Optional[str]:
+    # ---- LSTV case detection ---------------------------------------------
+
+    def _identify_lstv_cases(self) -> Set[str]:
+        """
+        Resolve the set of nnU-Net case_ids that should be oversampled.
+        Caches the result across calls within the same trainer instance.
+        """
+        if self._lstv_case_ids is not None:
+            return self._lstv_case_ids
+
+        try:
+            ds_name = self.plans_manager.dataset_name
+        except Exception:
+            ds_name = None
+
+        # Path A/B: lstv_cases.json from preprocessed/ or raw/
+        if ds_name:
+            for json_path in _candidate_lstv_json_paths(ds_name):
+                self.print_to_log_file(
+                    f"LSTV oversample: checking {json_path}")
+                result = _read_lstv_cases_json(json_path)
+                if result is not None:
+                    ids, subtypes = result
+                    self._lstv_case_ids = ids
+                    self._lstv_subtype_counts = subtypes
+                    self._lstv_detection_source = f"json:{json_path}"
+                    self.print_to_log_file(
+                        f"LSTV oversample: loaded {len(ids)} case_ids from "
+                        f"{json_path.name}. Subtypes: {dict(subtypes)}")
+                    return ids
+
+        # Path C: live HF manifest scan
+        for hf_dir in _candidate_hf_export_dirs():
+            self.print_to_log_file(
+                f"LSTV oversample: checking manifest path {hf_dir}")
+            result = _read_lstv_records_from_manifest(hf_dir)
+            if result is not None:
+                ids, subtypes = result
+                self._lstv_case_ids = ids
+                self._lstv_subtype_counts = subtypes
+                self._lstv_detection_source = f"manifest:{hf_dir}"
+                self.print_to_log_file(
+                    f"LSTV oversample: scanned manifests at {hf_dir}, "
+                    f"found {len(ids)} LSTV case_ids. "
+                    f"Subtypes: {dict(subtypes)}")
+                return ids
+
+        # Path D: legacy L6-voxel scan (lumbarization only)
+        self.print_to_log_file(
+            "LSTV oversample: no lstv_cases.json or manifest found; "
+            "falling back to L6-voxel scan (CAUTION: misses sacralization).")
+        labels_dir = self._lstv_labels_dir_for_legacy_scan()
+        if labels_dir is None:
+            self.print_to_log_file(
+                "LSTV oversample: cannot locate labelsTr either; disabling.")
+            self._lstv_case_ids = set()
+            return self._lstv_case_ids
+
+        t0 = time.time()
+        ids = _scan_lstv_case_ids_by_l6_voxels(labels_dir)
+        self._lstv_case_ids = ids
+        self._lstv_subtype_counts = Counter({"lumbarization_l6scan": len(ids)})
+        self._lstv_detection_source = f"l6scan:{labels_dir}"
+        self.print_to_log_file(
+            f"LSTV oversample: legacy L6 scan found {len(ids)} cases "
+            f"({time.time() - t0:.1f}s). NOTE: sacralization NOT included.")
+        return ids
+
+    def _lstv_labels_dir_for_legacy_scan(self) -> Optional[str]:
         override = os.environ.get("LSTV_LABELS_DIR", "").strip()
         if override:
             return override
-        # nnU-Net raw labelsTr is the canonical source
         raw_root = os.environ.get("nnUNet_raw") or os.environ.get("nnUNet_raw_data_base")
         if raw_root:
             try:
                 ds_name = self.plans_manager.dataset_name
                 cand = join(raw_root, ds_name, "labelsTr")
-                if os.path.isdir(cand):
+                if isdir(cand):
                     return cand
             except Exception:
                 pass
         return None
 
-    def _identify_lstv_cases(self) -> Set[str]:
-        if self._lstv_case_ids is not None:
-            return self._lstv_case_ids
-        labels_dir = self._lstv_labels_dir()
-        if labels_dir is None:
-            self.print_to_log_file(
-                "LSTV oversample: could not locate labelsTr; disabling oversampling.")
-            self._lstv_case_ids = set()
-            return self._lstv_case_ids
-        self.print_to_log_file(f"LSTV oversample: scanning {labels_dir} for L6 cases...")
-        t0 = time.time()
-        ids = _scan_lstv_case_ids(labels_dir)
-        self.print_to_log_file(
-            f"LSTV oversample: found {len(ids)} cases containing L6 "
-            f"({time.time() - t0:.1f}s)")
-        self._lstv_case_ids = ids
-        return ids
+    # ---- Sampler patch ---------------------------------------------------
 
     def _apply_lstv_sampler(self) -> None:
         """
-        Replace the training dataloader's sampler with one that biases
-        toward LSTV cases. This runs on_train_start, AFTER dataloaders
-        have been built by nnU-Net.
+        Patch the training dataloader so LSTV cases are drawn at
+        probability ~ LSTV_OVERSAMPLE_FRAC. Implementation: duplicate
+        LSTV case keys in the dataloader's underlying key list.
         """
         try:
-            from torch.utils.data import WeightedRandomSampler
-        except Exception as exc:
-            self.print_to_log_file(f"LSTV oversample: torch WeightedRandomSampler unavailable: {exc}")
-            return
-
-        frac = float(os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.5"))
-        frac = max(0.0, min(1.0, frac))
+            frac = float(os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.5"))
+        except ValueError:
+            self.print_to_log_file(
+                "LSTV oversample: invalid LSTV_OVERSAMPLE_FRAC; using 0.5")
+            frac = 0.5
+        # Cap below 1.0 to avoid divide-by-zero AND because 100% LSTV
+        # defeats nnU-Net's normal/abnormal mixed exposure.
+        frac = max(0.0, min(0.95, frac))
         if frac <= 0:
             self.print_to_log_file("LSTV oversample: frac=0, no-op.")
             return
 
         lstv_ids = self._identify_lstv_cases()
         if not lstv_ids:
-            self.print_to_log_file("LSTV oversample: no LSTV cases found, no-op.")
+            self.print_to_log_file("LSTV oversample: no LSTV cases identified, no-op.")
             return
 
-        # nnU-Net v2 uses its own batchgenerators-based dataloader, not a
-        # vanilla torch DataLoader. The right hook is to subclass the
-        # trainer's _get_deep_supervision_scales / get_tr_and_val_datasets
-        # and tweak the internal oversampling map. Pragmatic approach:
-        # duplicate LSTV case keys in the training dataset's case list
-        # so they are drawn proportionally more often.
-        try:
-            tr_dataset = getattr(self, "dataloader_train", None)
-            # Different nnU-Net versions expose the list of keys differently;
-            # try the common paths.
-            keys_attr_paths = [
-                ("generator", "_data", "keys"),
-                ("_data", "keys"),
-                ("data_loader", "_data", "keys"),
-            ]
-            keys_list = None
-            keys_owner = None
-            keys_attr = None
-            for path in keys_attr_paths:
-                obj = tr_dataset
-                for p in path[:-1]:
-                    obj = getattr(obj, p, None)
-                    if obj is None:
-                        break
+        tr_dataset = getattr(self, "dataloader_train", None)
+        if tr_dataset is None:
+            self.print_to_log_file(
+                "LSTV oversample: self.dataloader_train is None at "
+                "on_train_start; patching impossible.")
+            return
+
+        # Try every known attribute path for the case-id list across
+        # nnU-Net versions. v2.5+ uses 'identifiers'; earlier versions
+        # used 'keys'. Generator wrapping varies between releases.
+        keys_attr_paths = [
+            ("generator", "_data", "identifiers"),
+            ("generator", "_data", "keys"),
+            ("_data", "identifiers"),
+            ("_data", "keys"),
+            ("data_loader", "_data", "identifiers"),
+            ("data_loader", "_data", "keys"),
+        ]
+        keys_list = None
+        keys_owner = None
+        keys_attr = None
+        traversal_log: List[str] = []
+        for path in keys_attr_paths:
+            obj = tr_dataset
+            ok = True
+            for p in path[:-1]:
+                obj = getattr(obj, p, None)
                 if obj is None:
-                    continue
-                final_attr = path[-1]
-                if hasattr(obj, final_attr):
-                    keys_list = list(getattr(obj, final_attr))
+                    ok = False
+                    break
+            if not ok:
+                continue
+            final_attr = path[-1]
+            if hasattr(obj, final_attr):
+                candidate = getattr(obj, final_attr)
+                if callable(candidate):
+                    try:
+                        candidate = list(candidate())
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        candidate = list(candidate)
+                    except Exception:
+                        continue
+                if candidate and all(isinstance(k, str) for k in candidate):
+                    keys_list = candidate
                     keys_owner = obj
                     keys_attr = final_attr
+                    traversal_log.append(
+                        f"FOUND at {'.'.join(path)} ({len(candidate)} entries)")
                     break
-            if keys_list is None:
-                self.print_to_log_file(
-                    "LSTV oversample: could not locate dataloader key list; "
-                    "no-op. (Framework internals may have changed.)")
-                return
+                else:
+                    traversal_log.append(
+                        f"  {'.'.join(path)} present but empty/non-string")
+            else:
+                traversal_log.append(
+                    f"  {'.'.join(path)} attribute missing")
 
-            original_n = len(keys_list)
-            lstv_in_keys = [k for k in keys_list if k in lstv_ids]
-            if not lstv_in_keys:
-                self.print_to_log_file(
-                    "LSTV oversample: no LSTV cases present in this fold's "
-                    "training split; no-op.")
-                return
-
-            # Compute target duplicates so LSTV fraction ~= frac.
-            # If original LSTV fraction is p, we need to add D duplicates
-            # such that (count_lstv + D) / (N + D) = frac
-            # => D = (frac * N - count_lstv) / (1 - frac)
-            p = len(lstv_in_keys) / original_n
-            if p >= frac:
-                self.print_to_log_file(
-                    f"LSTV oversample: natural frac {p:.3f} >= target {frac:.3f}; no-op.")
-                return
-            needed_total = int(round((frac * original_n - len(lstv_in_keys)) / (1.0 - frac)))
-            needed_total = max(1, needed_total)
-            duplicates = []
-            for i in range(needed_total):
-                duplicates.append(lstv_in_keys[i % len(lstv_in_keys)])
-            new_keys = keys_list + duplicates
-            setattr(keys_owner, keys_attr, new_keys)
-            achieved = (len(lstv_in_keys) + len(duplicates)) / len(new_keys)
+        if keys_list is None:
             self.print_to_log_file(
-                f"LSTV oversample: original N={original_n}  LSTV={len(lstv_in_keys)} "
-                f"({p*100:.1f}%);  added {len(duplicates)} duplicates -> "
-                f"N={len(new_keys)}  LSTV fraction={achieved*100:.1f}% "
-                f"(target {frac*100:.0f}%).")
+                f"LSTV oversample: could not locate dataloader key list. "
+                f"Traversal: {traversal_log}. Framework internals may have "
+                f"changed; oversampling DISABLED for this run.")
+            return
+
+        original_n = len(keys_list)
+        lstv_in_keys = [k for k in keys_list if k in lstv_ids]
+
+        if not lstv_in_keys:
+            self.print_to_log_file(
+                "LSTV oversample: no LSTV cases present in this fold's "
+                "training split; no-op.")
+            return
+
+        p = len(lstv_in_keys) / original_n
+        if p >= frac:
+            self.print_to_log_file(
+                f"LSTV oversample: natural LSTV fraction {p:.3f} >= target "
+                f"{frac:.3f}; no duplication needed.")
+            return
+
+        # Solve for D such that (count + D) / (N + D) = frac
+        #   D = (frac * N - count) / (1 - frac)
+        needed_total = int(round(
+            (frac * original_n - len(lstv_in_keys)) / (1.0 - frac)))
+        needed_total = max(1, needed_total)
+        duplicates = [
+            lstv_in_keys[i % len(lstv_in_keys)] for i in range(needed_total)
+        ]
+        new_keys = keys_list + duplicates
+
+        # Verify the assignment took (some attributes are properties
+        # without setters, or wrap immutable containers).
+        try:
+            setattr(keys_owner, keys_attr, new_keys)
+            verify = list(getattr(keys_owner, keys_attr))
         except Exception as exc:
-            self.print_to_log_file(f"LSTV oversample: failed to patch dataloader: {exc}")
+            self.print_to_log_file(
+                f"LSTV oversample: setattr({keys_attr}) failed: {exc}. "
+                f"Cannot patch dataloader; oversampling DISABLED.")
+            return
+
+        if len(verify) != len(new_keys):
+            self.print_to_log_file(
+                f"LSTV oversample: WARNING — set {len(new_keys)} keys but "
+                f"dataloader reports {len(verify)}. Possible silent dedup; "
+                f"oversampling may be ineffective.")
+
+        achieved = (len(lstv_in_keys) + len(duplicates)) / max(1, len(verify))
+        unique_lstv = len(set(lstv_in_keys))
+        avg_dup_factor = (
+            (len(lstv_in_keys) + len(duplicates)) / max(1, unique_lstv)
+        )
+
+        self.print_to_log_file(
+            f"LSTV oversample: source={self._lstv_detection_source}")
+        self.print_to_log_file(
+            f"LSTV oversample: fold {self.fold} train pool: "
+            f"original_N={original_n}  LSTV={len(lstv_in_keys)} "
+            f"({p*100:.1f}%);  unique_LSTV={unique_lstv};  "
+            f"added {len(duplicates)} duplicates -> "
+            f"new_N={len(verify)}  achieved_LSTV_frac={achieved*100:.1f}% "
+            f"(target {frac*100:.0f}%);  avg_dup_factor={avg_dup_factor:.1f}x")
+        if avg_dup_factor > 25:
+            self.print_to_log_file(
+                f"LSTV oversample: WARNING — each unique LSTV case is "
+                f"duplicated {avg_dup_factor:.0f}x. High overfitting risk. "
+                f"Consider lowering LSTV_OVERSAMPLE_FRAC or accept that "
+                f"LSTV val Dice may not generalize.")
 
     def on_train_start(self):  # type: ignore[override]
         super().on_train_start()  # _WandBMixin runs first via MRO
@@ -759,7 +1001,7 @@ class _LSTVOversampleMixin:
 # =============================================================================
 
 class nnUNetTrainerWandB(_WandBMixin, nnUNetTrainer):
-    """1000 epochs, default nnU-Net settings + W&B."""
+    """Default-length nnU-Net training + W&B."""
     pass
 
 
@@ -771,15 +1013,22 @@ class nnUNetTrainerWandB_100epochs(_WandBMixin, nnUNetTrainer_100epochs):
     pass
 
 
+class nnUNetTrainerWandB_500epochs(_WandBMixin, nnUNetTrainer):
+    """500 epochs (default 250 iter/epoch). Recommended ML4H baseline."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_epochs = 500
+
+
 class nnUNetTrainerWandB_1000epochs(_WandBMixin, nnUNetTrainer):
-    """Explicit 1000-epoch variant (identical to base but named for clarity)."""
+    """Explicit 1000-epoch variant."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_epochs = 1000
 
 
 class nnUNetTrainerWandB_1000ep_500iter(_WandBMixin, nnUNetTrainer):
-    """1000 epochs, 500 iterations/epoch (2x the default coverage per epoch)."""
+    """1000 epochs, 500 iter/epoch (2x default coverage per epoch)."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_epochs = 1000
@@ -787,11 +1036,20 @@ class nnUNetTrainerWandB_1000ep_500iter(_WandBMixin, nnUNetTrainer):
         self.num_val_iterations_per_epoch = 50
 
 
+class nnUNetTrainerWandB_500ep_LSTVOversample(
+    _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
+):
+    """500 epochs + LSTV-case oversampling (covers both subtypes)."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_epochs = 500
+
+
 class nnUNetTrainerWandB_1000ep_LSTVOversample(
     _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
 ):
     """
-    1000 epochs, 500 iter/epoch, LSTV-case oversampling.
+    1000 epochs, 500 iter/epoch, LSTV-case oversampling (both subtypes).
 
     MRO: _LSTVOversampleMixin -> _WandBMixin -> nnUNetTrainer
     Both mixins override on_train_start; _LSTVOversampleMixin calls super()

@@ -3,55 +3,29 @@
 SpineSurg-CT -- HF export -> nnU-Net v2 dataset format
 tools/convert_hf_to_nnunet.py
 
-v5 change: --splits_file (token-level) is the source of truth
-==============================================================
-splits_final.json is now BUILT FROM an upstream, token-level 5-fold CV
-splits file (scripts/generate_5fold_splits.py -> data/splits_5fold.json).
-The HF export's manifest_train/val/test distinction is IGNORED for
-partitioning; all records are pooled, and each record's patient token
-is looked up in the splits file to decide:
-    - imagesTs/labelsTs   if token is in splits.test_tokens
-    - imagesTr/labelsTr   otherwise; fold assignment per splits.folds[*]
-
-This means the splits file is the single source of truth for both
-test holdout AND 5-fold CV. Rerunning the upstream splits generator
-(e.g. after adding new cases to placed_manifest) and then rerunning
-this script propagates cleanly through.
-
-Flags:
-    --splits_file PATH       Required for K-fold mode.
-    --single_fold_splits     Legacy: ignore --splits_file; write 5
-                             identical folds matching the HF train/val
-                             manifest split. Useful if you want fold 0
-                             to equal the HF val set exactly.
-    --regen_splits_only      If dataset already built, only rewrite
-                             splits_final.json from --splits_file.
-
-Fixes carried forward from earlier versions
-===========================================
-1. Cross-manifest case_id collisions. Namespaced {safe_token}__{config},
-   shared seen_ids across train+val manifests.
-2. Partial-annotation support via ignore_label = 10 (nnU-Net v2
-   contiguous-label constraint; NOT 255).
-
-PARTIAL-ANNOTATION SUPPORT
-==========================
-    fused         -> label copied verbatim (all 10 classes valid)
-    spine_only    -> background (0) voxels REWRITTEN to 10 (ignore)
-    pelvic_native -> background (0) voxels REWRITTEN to 10 (ignore)
-
-dataset.json declares "labels": {..., "ignore": 10}. Test set is fused
-only (unless --test_all_configs).
-
-Output layout
--------------
-    nnUNet_raw/Dataset{ID}_{Name}/
-        imagesTr/{case_id}_0000.nii.gz
-        labelsTr/{case_id}.nii.gz
-        imagesTs/{case_id}_0000.nii.gz
-        labelsTs/{case_id}.nii.gz
-        dataset.json
-        splits_final.json
+Fixes (cumulative)
+==================
+1. Cross-manifest case_id collisions. Namespaced {safe_token}__{config}.
+2. Partial-annotation support via ignore_label = 10.
+3. Manifest path-prefix tolerance (v6 schema): strip "ct/"/"labels/".
+4. Symlinks use absolute paths AS-GIVEN (no .resolve()). When this
+   script runs in a container with /data/hf_export bind-mounted from
+   a host directory, .resolve() would embed the container-internal
+   path into symlinks, breaking them for any reader outside the
+   container. Pass a host path -> get a host-readable symlink.
+5. Self-healing idempotency. When the dataset is already built, the
+   script verifies a sample of symlinks resolve. If they're broken in
+   the recognizable "/data/hf_export/..." pattern, it rewrites every
+   broken symlink in-place to point at the host HF export directory.
+   Recovers a previous run that was made before fix #4 without a
+   full rebuild.
+6. lstv_cases.json metadata writer (Apr 2026). After the dataset is
+   built (or re-built via --regen_splits_only), writes a small JSON
+   file listing every case_id whose lstv_label != "normal", along
+   with the subtype. Consumed by tools/nnunet_wandb_variant.py at
+   training time to oversample LSTV cases (both lumbarization AND
+   sacralization, unlike the legacy L6-voxel scan which only finds
+   lumbarization).
 
 Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
 """
@@ -64,7 +38,7 @@ import os
 import shutil
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -89,6 +63,16 @@ PELVIC_CLASSES = {7, 8, 9}
 
 VALID_CONFIGS  = ("fused", "spine_only", "pelvic_native")
 
+# Symlinks written by older versions used Path.resolve() inside a
+# container with /data/hf_export bind-mounted, which embedded the
+# container-internal path into the symlink. We recognize those broken
+# targets by this prefix and rewrite them in-place.
+LEGACY_CONTAINER_HF_PREFIX = "/data/hf_export/"
+
+# Schema version for lstv_cases.json. Bump on format changes so the
+# trainer-side reader can detect incompatibilities.
+LSTV_CASES_SCHEMA_VERSION = 1
+
 
 # =============================================================================
 # Case ID utilities
@@ -105,7 +89,6 @@ def safe_id(token: str) -> str:
 
 
 def make_case_id(token: str, config: str, seen_ids: Set[str]) -> str:
-    """Namespaced {safe_token}__{config}; disambiguate collisions with __dupN."""
     base = f"{safe_id(token)}__{config}"
     if base not in seen_ids:
         seen_ids.add(base)
@@ -124,20 +107,42 @@ def make_case_id(token: str, config: str, seen_ids: Set[str]) -> str:
 
 
 # =============================================================================
+# Path helpers
+# =============================================================================
+
+def _strip_leading_segment(rel: str, segment: str) -> str:
+    """Strip a leading "{segment}/" from `rel` if present."""
+    if not rel:
+        return rel
+    prefix = f"{segment}/"
+    if rel.startswith(prefix):
+        return rel[len(prefix):]
+    bs_prefix = f"{segment}\\"
+    if rel.startswith(bs_prefix):
+        return rel[len(bs_prefix):]
+    return rel
+
+
+# =============================================================================
 # File ops
 # =============================================================================
 
 def link(src: Path, dst: Path, *, allow_overwrite: bool = False) -> None:
+    """
+    Create a symlink at `dst` pointing at `src`. Uses the absolute path
+    of `src` AS-GIVEN -- does NOT call .resolve(). See top-of-file
+    notes (fix #4) for why this matters in a containerized run.
+    """
     if dst.exists() or dst.is_symlink():
         if not allow_overwrite:
             raise FileExistsError(
                 f"Refusing to overwrite existing {dst} (src was {src}).")
         dst.unlink()
-    dst.symlink_to(src.resolve())
+    src_abs = Path(src) if Path(src).is_absolute() else Path(src).absolute()
+    dst.symlink_to(src_abs)
 
 
 def rewrite_label(src_path: Path, dst_path: Path, config: str) -> Dict:
-    """Read label, rewrite background->IGNORE for partial configs, write to dst."""
     if dst_path.exists():
         raise FileExistsError(
             f"Refusing to overwrite existing {dst_path} (src was {src_path}).")
@@ -172,6 +177,157 @@ def rewrite_label(src_path: Path, dst_path: Path, config: str) -> Dict:
     nib.save(out_img, str(dst_path))
 
     return {"before": before, "after": after}
+
+
+# =============================================================================
+# Self-healing repair: legacy container-path symlinks -> host-path symlinks
+# =============================================================================
+
+def _sample_broken_symlinks(ds_dir: Path, n_check: int = 20) -> List[Path]:
+    """Return up to n_check symlinks under ds_dir whose targets don't resolve."""
+    broken: List[Path] = []
+    for sub in ("imagesTr", "imagesTs", "labelsTr", "labelsTs"):
+        d = ds_dir / sub
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            if not p.is_symlink():
+                continue
+            try:
+                if p.resolve(strict=True).exists():
+                    continue
+            except (FileNotFoundError, OSError):
+                pass
+            broken.append(p)
+            if len(broken) >= n_check:
+                return broken
+    return broken
+
+
+def repair_broken_symlinks(ds_dir: Path,
+                            hf_export_dir: Path) -> Tuple[int, int]:
+    """
+    Walk every symlink under ds_dir's image/label directories. Any
+    symlink whose target starts with LEGACY_CONTAINER_HF_PREFIX gets
+    rewritten in-place to point at the corresponding file under
+    `hf_export_dir`. Returns (n_fixed, n_left_broken).
+    """
+    n_fixed = 0
+    n_still_broken = 0
+    n_unrecognized = 0
+    examples_unrecognized: List[str] = []
+    examples_missing: List[Tuple[str, str]] = []
+
+    for sub in ("imagesTr", "imagesTs", "labelsTr", "labelsTs"):
+        d = ds_dir / sub
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            if not p.is_symlink():
+                continue
+            try:
+                if p.resolve(strict=True).exists():
+                    continue
+            except (FileNotFoundError, OSError):
+                pass
+            tgt = os.readlink(p)
+            if not tgt.startswith(LEGACY_CONTAINER_HF_PREFIX):
+                n_unrecognized += 1
+                if len(examples_unrecognized) < 3:
+                    examples_unrecognized.append(f"{p.name} -> {tgt}")
+                continue
+            rel = tgt[len(LEGACY_CONTAINER_HF_PREFIX):]
+            new_tgt = hf_export_dir / rel
+            if not new_tgt.exists():
+                n_still_broken += 1
+                if len(examples_missing) < 3:
+                    examples_missing.append((p.name, str(new_tgt)))
+                continue
+            p.unlink()
+            p.symlink_to(new_tgt.absolute())
+            n_fixed += 1
+
+    if n_fixed:
+        print(f"  repaired {n_fixed} broken symlink(s) "
+              f"(legacy container paths -> host paths under {hf_export_dir})")
+    if n_unrecognized:
+        print(f"  WARN: {n_unrecognized} broken symlink(s) had unrecognized "
+              f"targets and were not auto-repaired.", file=sys.stderr)
+        for ex in examples_unrecognized:
+            print(f"    {ex}", file=sys.stderr)
+    if n_still_broken:
+        print(f"  WARN: {n_still_broken} legacy symlink(s) point at files "
+              f"that don't exist under {hf_export_dir}. The HF export may "
+              f"have changed since the dataset was built.", file=sys.stderr)
+        for name, tgt in examples_missing:
+            print(f"    {name} -> {tgt}", file=sys.stderr)
+    return n_fixed, n_still_broken + n_unrecognized
+
+
+# =============================================================================
+# LSTV cases JSON writer (consumed by nnunet_wandb_variant.py at training)
+# =============================================================================
+
+def write_lstv_cases_json(ds_dir: Path,
+                           records: List[Dict],
+                           also_write_to: Optional[Path] = None) -> Dict:
+    """
+    Write lstv_cases.json into ds_dir based on the provided record list.
+
+    Each record is a dict produced by parse_manifest() with these keys:
+        case_id, token, config, lstv_label, ...
+
+    Output JSON schema (v1):
+        {
+          "schema_version": 1,
+          "n_cases": <int>,
+          "subtype_counts": {"lumbarization": N, "sacralization": M, ...},
+          "case_ids": { "<case_id>": "<lstv_label>", ... }
+        }
+
+    The trainer-side oversampling mixin reads this file to identify
+    LSTV cases without rescanning the HF manifests. Covers both
+    lumbarization AND sacralization (the legacy L6-voxel scan only
+    found lumbarization, since sacralization cases have no L6 voxels
+    in their labels).
+
+    If `also_write_to` is given, a copy is also written there. Used to
+    drop the file into the preprocessed/ directory at training time so
+    the trainer can find it without env-var configuration.
+
+    Returns the data dict that was written.
+    """
+    case_ids: Dict[str, str] = {}
+    subtypes: Counter = Counter()
+    for r in records:
+        lstv = str(r.get("lstv_label", "")).strip().lower()
+        if not lstv or lstv == "normal":
+            continue
+        cid = r.get("case_id")
+        if not cid:
+            continue
+        case_ids[cid] = lstv
+        subtypes[lstv] += 1
+
+    data = {
+        "schema_version": LSTV_CASES_SCHEMA_VERSION,
+        "n_cases":        len(case_ids),
+        "subtype_counts": dict(subtypes),
+        "case_ids":       case_ids,
+    }
+
+    out_path = ds_dir / "lstv_cases.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+    print(f"  wrote {out_path}  "
+          f"(n_lstv={data['n_cases']}, subtypes={data['subtype_counts']})")
+
+    if also_write_to is not None:
+        also_write_to.parent.mkdir(parents=True, exist_ok=True)
+        also_write_to.write_text(json.dumps(data, indent=2, sort_keys=True))
+        print(f"  wrote {also_write_to}")
+
+    return data
 
 
 # =============================================================================
@@ -216,6 +372,7 @@ def parse_manifest(
 
     out: List[Dict] = []
     skipped_cfg = skipped_missing = 0
+    sample_missing: List[str] = []
 
     for r in raw:
         config = r.get("config", "fused")
@@ -225,13 +382,21 @@ def parse_manifest(
             skipped_cfg += 1
             continue
 
-        ct  = ct_dir  / r.get("ct_file",    "")
-        lbl = lbl_dir / r.get("label_file", "")
+        ct_rel  = _strip_leading_segment(r.get("ct_file",    ""), "ct")
+        lbl_rel = _strip_leading_segment(r.get("label_file", ""), "labels")
+
+        ct  = ct_dir  / ct_rel
+        lbl = lbl_dir / lbl_rel
         if not ct.exists() or not lbl.exists():
             skipped_missing += 1
+            if len(sample_missing) < 3:
+                sample_missing.append(
+                    f"ct={ct} (exists={ct.exists()})  "
+                    f"lbl={lbl} (exists={lbl.exists()})"
+                )
             continue
 
-        token = r.get("token") or Path(r["ct_file"]).stem.replace(".nii", "")
+        token = r.get("token") or Path(ct_rel).stem.replace(".nii", "")
         cid = make_case_id(token, config, seen_ids)
 
         out.append({
@@ -246,21 +411,22 @@ def parse_manifest(
 
     print(f"  {manifest_path.name}: {len(out)} kept  "
           f"(skipped: cfg={skipped_cfg} missing={skipped_missing})")
+    if skipped_missing > 0 and sample_missing:
+        print(f"  first {len(sample_missing)} missing example(s):", file=sys.stderr)
+        for s in sample_missing:
+            print(f"    {s}", file=sys.stderr)
     return out
 
 
 # =============================================================================
-# Splits file loading (NEW)
+# Splits file loading
 # =============================================================================
 
 class SplitsLookup:
-    """Token -> routing + fold assignment, from upstream splits_5fold.json."""
-
     def __init__(self, splits_data: Dict):
         self.data = splits_data
         self.n_folds = int(splits_data["n_folds"])
         self.test_tokens: Set[str] = set(str(t) for t in splits_data["test_tokens"])
-        # token -> val fold index (0..n_folds-1), for non-test tokens only
         self.token_to_val_fold: Dict[str, int] = {}
         for i, f in enumerate(splits_data["folds"]):
             for t in f.get("val_tokens", []):
@@ -268,10 +434,8 @@ class SplitsLookup:
                 if ts in self.token_to_val_fold:
                     raise RuntimeError(
                         f"Token {ts!r} appears in multiple fold val sets "
-                        f"(folds {self.token_to_val_fold[ts]} and {i}). "
-                        f"Splits file is malformed.")
+                        f"(folds {self.token_to_val_fold[ts]} and {i}).")
                 self.token_to_val_fold[ts] = i
-        # Per-token info (schema v3+). May be empty for older splits files.
         self.token_info: Dict[str, Dict] = {
             str(k): v for k, v in (splits_data.get("token_info") or {}).items()
         }
@@ -280,16 +444,12 @@ class SplitsLookup:
         return str(token) in self.test_tokens
 
     def val_fold_for(self, token: str) -> Optional[int]:
-        """Fold index whose VAL set contains this token, or None if token
-        isn't in any fold's val set (shouldn't happen for real tokens)."""
         return self.token_to_val_fold.get(str(token))
 
     def known_tokens(self) -> Set[str]:
         return set(self.test_tokens) | set(self.token_to_val_fold.keys())
 
     def match_type_for(self, token: str) -> Optional[str]:
-        """match_type from placed_manifest.json, via token_info. None if
-        the splits file is schema v2 (no token_info) or the token is unknown."""
         info = self.token_info.get(str(token))
         if not info:
             return None
@@ -303,13 +463,12 @@ class SplitsLookup:
 def load_splits_file(path: Path) -> SplitsLookup:
     if not path.exists():
         raise FileNotFoundError(
-            f"--splits_file {path} not found. Run sbatch slurm/generate_splits.sh first.")
+            f"--splits_file {path} not found.")
     data = json.loads(path.read_text())
     schema = data.get("schema_version", 0)
     if schema < 2:
         raise ValueError(
-            f"{path} has schema_version={schema}; need >= 2. "
-            f"Regenerate with scripts/generate_5fold_splits.py.")
+            f"{path} has schema_version={schema}; need >= 2.")
     if "folds" not in data or not data["folds"]:
         raise ValueError(f"{path} has no folds.")
     if "test_tokens" not in data:
@@ -325,17 +484,7 @@ def write_splits_final_from_lookup(
         ds_dir: Path,
         train_recs: List[Dict],
         lookup: SplitsLookup) -> None:
-    """
-    Build nnU-Net's splits_final.json from an upstream token-level splits
-    file. All train_recs are in the training pool (imagesTr); each is
-    assigned to exactly one fold's val set based on its token. Records
-    whose token isn't in the splits file's train/val pool are placed in
-    ALL folds' train sets (never val) -- this is the safe behavior for
-    pseudo cases or for tokens missing from the upstream splits.
-    """
     n_folds = lookup.n_folds
-    # case_ids grouped by their val-fold assignment, plus a "no fold val"
-    # bucket for pseudo / unmapped cases.
     val_ids_per_fold: List[List[str]] = [[] for _ in range(n_folds)]
     no_val_ids: List[str] = []
     for r in train_recs:
@@ -348,8 +497,7 @@ def write_splits_final_from_lookup(
 
     if no_val_ids:
         print(f"  NOTE: {len(no_val_ids)} training case(s) have tokens "
-              f"not in the splits file's trainval pool. "
-              f"They will appear in every fold's TRAIN set and no fold's VAL set.")
+              f"not in the splits file's trainval pool.")
 
     all_train_ids = [r["case_id"] for r in train_recs]
     all_train_set = set(all_train_ids)
@@ -360,7 +508,6 @@ def write_splits_final_from_lookup(
         train_ids = sorted(all_train_set - set(val_ids))
         splits.append({"train": train_ids, "val": val_ids})
 
-    # Sanity: val sets are disjoint, their union is the mapped pool
     all_val_union: Set[str] = set()
     for i, f in enumerate(splits):
         s = set(f["val"])
@@ -380,7 +527,6 @@ def write_splits_final_single_fold(
         ds_dir: Path,
         train_ids: List[str],
         val_ids: List[str]) -> None:
-    """Legacy behavior: 5 identical folds = HF train/val split."""
     fold = {"train": sorted(train_ids), "val": sorted(val_ids)}
     splits = [fold for _ in range(5)]
     out = ds_dir / "splits_final.json"
@@ -389,10 +535,6 @@ def write_splits_final_single_fold(
 
 
 def splits_final_looks_kfold(ds_dir: Path) -> bool:
-    """
-    Returns True iff splits_final.json has distinct val sets across folds
-    (the K-fold shape). Used to decide auto-regen behavior.
-    """
     p = ds_dir / "splits_final.json"
     if not p.exists():
         return False
@@ -416,8 +558,7 @@ def splits_final_looks_kfold(ds_dir: Path) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Convert SpineSurg-CT HF export -> nnU-Net v2 dataset "
-                    "with upstream-driven 5-fold CV splits.",
+        description="Convert SpineSurg-CT HF export -> nnU-Net v2 dataset.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--hf_export_dir",   required=True, type=Path)
@@ -425,48 +566,28 @@ def main() -> int:
     ap.add_argument("--dataset_id",      type=int, default=802)
     ap.add_argument("--dataset_name",    default="SpineSurgCTFull")
 
-    ap.add_argument("--splits_file", type=Path, default=None,
-                    help="Path to upstream splits_5fold.json. Required unless "
-                         "--single_fold_splits is set.")
-    ap.add_argument("--single_fold_splits", action="store_true", default=False,
-                    help="Ignore --splits_file and write 5 identical folds "
-                         "matching the HF train/val manifest split.")
-    ap.add_argument("--regen_splits_only", action="store_true", default=False,
-                    help="Skip file rebuild; only (re)write splits_final.json "
-                         "from --splits_file (dataset must already exist).")
+    ap.add_argument("--splits_file", type=Path, default=None)
+    ap.add_argument("--single_fold_splits", action="store_true", default=False)
+    ap.add_argument("--regen_splits_only", action="store_true", default=False)
 
-    ap.add_argument("--include_train_match_types", default=None,
-                    help="ABLATION: comma-separated list of match_types "
-                         "(from placed_manifest.json) to INCLUDE in the "
-                         "training pool. E.g. 'fused' for fused-only "
-                         "training. Test set is UNAFFECTED so metrics remain "
-                         "comparable across ablations. Requires splits_file "
-                         "with schema v3 (has token_info).")
-    ap.add_argument("--test_match_types", default=None,
-                    help="ABLATION: comma-separated list of match_types to "
-                         "include in the test set (filters splits.test_tokens). "
-                         "Default: all test tokens included. Use 'fused' to "
-                         "restrict test to gold-standard fused cases only.")
+    ap.add_argument("--include_train_match_types", default=None)
+    ap.add_argument("--test_match_types", default=None)
 
-    ap.add_argument("--train_fused_only", action="store_true", default=False,
-                    help="Train only on fused cases (legacy).")
-    ap.add_argument("--test_all_configs", action="store_true", default=False,
-                    help="Include partial configs in test (not recommended).")
+    ap.add_argument("--train_fused_only", action="store_true", default=False)
+    ap.add_argument("--test_all_configs", action="store_true", default=False)
 
     ap.add_argument("--exclude_pseudo",  action="store_true", default=True)
     ap.add_argument("--include_pseudo",  dest="exclude_pseudo", action="store_false")
 
-    ap.add_argument("--debug_n", type=int, default=0,
-                    help="If >0, keep only this many cases PER MANIFEST.")
+    ap.add_argument("--debug_n", type=int, default=0)
 
     args = ap.parse_args()
 
     if not args.single_fold_splits and args.splits_file is None:
-        print("ERROR: --splits_file is required unless --single_fold_splits is set.\n"
-              "       Run sbatch slurm/generate_splits.sh first.", file=sys.stderr)
+        print("ERROR: --splits_file is required unless --single_fold_splits is set.",
+              file=sys.stderr)
         return 1
 
-    # ----- load splits file (if in K-fold mode) -----
     lookup: Optional[SplitsLookup] = None
     if not args.single_fold_splits:
         print(f"Loading splits from {args.splits_file}")
@@ -475,24 +596,22 @@ def main() -> int:
               f"test_tokens={len(lookup.test_tokens)}  "
               f"trainval_tokens={len(lookup.token_to_val_fold)}")
 
-    # ----- paths -----
     ct_dir  = args.hf_export_dir / "ct"
     lbl_dir = args.hf_export_dir / "labels"
     if not ct_dir.is_dir() or not lbl_dir.is_dir():
         print(f"ERROR: missing {ct_dir} or {lbl_dir}", file=sys.stderr)
         return 1
 
-    ds_dir    = args.nnunet_raw_dir / f"Dataset{args.dataset_id:03d}_{args.dataset_name}"
+    ds_dir = args.nnunet_raw_dir / f"Dataset{args.dataset_id:03d}_{args.dataset_name}"
 
     # =========================================================================
-    # --regen_splits_only branch: rewrite splits_final.json and exit
+    # --regen_splits_only branch
     # =========================================================================
     if args.regen_splits_only:
         if not (ds_dir / "dataset.json").exists():
             print(f"ERROR: --regen_splits_only but dataset not built "
                   f"({ds_dir}/dataset.json missing).", file=sys.stderr)
             return 1
-        # We need train_recs to rewrite splits. Re-parse manifests.
         print(f"\n--regen_splits_only: re-parsing manifests to rewrite splits")
         train_val_seen: Set[str] = set()
         tr = parse_manifest(
@@ -501,25 +620,31 @@ def main() -> int:
         vl = parse_manifest(
             args.hf_export_dir / "manifest_validation.json",
             ct_dir, lbl_dir, args.train_fused_only, train_val_seen, args.debug_n)
-        # Test set is separate in splits_final.json writing, so we don't
-        # include test_recs in train_recs.
+        ts = parse_manifest(
+            args.hf_export_dir / "manifest_test.json",
+            ct_dir, lbl_dir,
+            fused_only=not args.test_all_configs,
+            seen_ids=set(),  # test pool is independent of train/val seen set
+            debug_n=args.debug_n)
         if args.exclude_pseudo:
             tr = [r for r in tr if not r["is_pseudo"]]
             vl = [r for r in vl if not r["is_pseudo"]]
+            ts = [r for r in ts if not r["is_pseudo"]]
         if args.single_fold_splits:
             write_splits_final_single_fold(
                 ds_dir, [r["case_id"] for r in tr], [r["case_id"] for r in vl])
         else:
             assert lookup is not None
-            # In K-fold mode, the HF train/val distinction is irrelevant.
-            # Pool them, filter out test tokens (those shouldn't be in
-            # train+val manifests anyway, but be defensive), and use
-            # splits file to partition.
             combined = [r for r in tr + vl if not lookup.is_test(r["token"])]
             removed  = len(tr) + len(vl) - len(combined)
             if removed:
                 print(f"  removed {removed} records whose token is in test set")
             write_splits_final_from_lookup(ds_dir, combined, lookup)
+
+        # Refresh lstv_cases.json over the entire (train+val+test) record set
+        all_recs = tr + vl + ts
+        write_lstv_cases_json(ds_dir, all_recs)
+
         print("Done (splits only).")
         return 0
 
@@ -558,19 +683,16 @@ def main() -> int:
         print("ERROR: no train+val records after filtering.", file=sys.stderr)
         return 1
 
-    # ----- If in K-fold mode, RE-ROUTE records via the splits file ----------
-    # HF's train/val/test partitioning is superseded: splits file decides.
+    # K-fold re-routing
     if lookup is not None:
         pool = train_recs + val_recs + test_recs
         pool_train = [r for r in pool if not lookup.is_test(r["token"])]
         pool_test  = [r for r in pool if     lookup.is_test(r["token"])]
 
-        # ------ Ablation: filter training pool by match_type --------------
         if args.include_train_match_types:
             if not lookup.has_token_info():
-                print("ERROR: --include_train_match_types requires splits file "
-                      "with token_info (schema v3+). Regenerate with "
-                      "scripts/generate_5fold_splits.py.", file=sys.stderr)
+                print("ERROR: --include_train_match_types requires schema v3+.",
+                      file=sys.stderr)
                 return 1
             allowed = {mt.strip().lower()
                        for mt in args.include_train_match_types.split(",")
@@ -582,7 +704,7 @@ def main() -> int:
                 mt = lookup.match_type_for(r["token"])
                 if mt is None:
                     n_unknown += 1
-                    continue  # unknown match_type -> exclude (safer than guess)
+                    continue
                 if mt in allowed:
                     kept.append(r)
                 else:
@@ -591,15 +713,14 @@ def main() -> int:
             pool_train = kept
             print(f"\n[ABLATION] --include_train_match_types={sorted(allowed)}")
             print(f"  kept    : {len(pool_train)} training records (from {before})")
-            print(f"  excluded by match_type: {dict(excluded_counts)} (total {n_excluded})")
+            print(f"  excluded: {dict(excluded_counts)} (total {n_excluded})")
             if n_unknown:
                 print(f"  excluded (unknown match_type): {n_unknown}")
 
-        # ------ Ablation: filter test set by match_type -------------------
         if args.test_match_types:
             if not lookup.has_token_info():
-                print("ERROR: --test_match_types requires splits file with "
-                      "token_info (schema v3+).", file=sys.stderr)
+                print("ERROR: --test_match_types requires schema v3+.",
+                      file=sys.stderr)
                 return 1
             allowed = {mt.strip().lower()
                        for mt in args.test_match_types.split(",")
@@ -621,29 +742,27 @@ def main() -> int:
             print(f"  kept    : {len(pool_test)} test records (from {before})")
             print(f"  excluded: {dict(excluded_counts_test)} (total {n_excluded_test})")
 
-        # Audit: which HF records have unknown tokens (not in splits file)?
         known = lookup.known_tokens()
         unknown = [r for r in pool_train if r["token"] not in known]
         if unknown:
             print(f"  WARN: {len(unknown)} train-pool records have tokens "
-                  f"not in splits file. They go to imagesTr but appear in "
-                  f"NO fold's val set. Examples: "
+                  f"not in splits file. Examples: "
                   f"{sorted({r['token'] for r in unknown})[:5]}")
-        # Reassign the canonical train/test for the rest of the script
         train_recs = pool_train
-        val_recs   = []               # HF "val" no longer special
+        val_recs   = []
         test_recs  = pool_test
         print(f"\nRe-routed by splits file:")
         print(f"  imagesTr pool : {len(train_recs)}")
         print(f"  imagesTs pool : {len(test_recs)}")
 
-    ds_dir    = args.nnunet_raw_dir / f"Dataset{args.dataset_id:03d}_{args.dataset_name}"
     images_tr = ds_dir / "imagesTr"
     labels_tr = ds_dir / "labelsTr"
     images_ts = ds_dir / "imagesTs"
     labels_ts = ds_dir / "labelsTs"
 
-    # ----- Idempotency: existing dataset dir -----
+    # =========================================================================
+    # Idempotency for an existing dataset directory.
+    # =========================================================================
     if ds_dir.exists():
         has_content = any(ds_dir.iterdir())
         if args.debug_n > 0 and has_content:
@@ -652,37 +771,69 @@ def main() -> int:
         elif has_content:
             marker = ds_dir / "dataset.json"
             if marker.exists():
-                # Dataset already built. Check splits state.
+                # Self-heal symlinks if needed (applies to all states).
+                broken = _sample_broken_symlinks(ds_dir, n_check=20)
+                if broken:
+                    print(f"  NOTE: detected {len(broken)} broken symlink(s) "
+                          f"in sample; attempting in-place repair...")
+                    n_fixed, n_left = repair_broken_symlinks(
+                        ds_dir, args.hf_export_dir)
+                    if n_fixed == 0 and n_left > 0:
+                        print(f"  ERROR: {n_left} broken symlink(s) could not "
+                              f"be auto-repaired. Inspect manually or delete "
+                              f"{ds_dir} and rerun.", file=sys.stderr)
+                        return 1
+                    if n_left > 0:
+                        print(f"  WARN: {n_fixed} repaired, {n_left} still "
+                              f"broken; see warnings above.", file=sys.stderr)
+                    else:
+                        post = _sample_broken_symlinks(ds_dir, n_check=5)
+                        if post:
+                            print(f"  WARN: {len(post)} still-broken symlinks "
+                                  f"after repair pass; investigate manually.",
+                                  file=sys.stderr)
+                        else:
+                            print(f"  symlinks now resolve cleanly.")
+
+                # Splits-shape idempotency.
                 want_kfold = not args.single_fold_splits
                 have_kfold = splits_final_looks_kfold(ds_dir)
                 if want_kfold and not have_kfold:
                     print(f"  NOTE: {ds_dir} populated but splits_final.json "
                           f"is single-fold style. Rewriting splits only.")
                     write_splits_final_from_lookup(ds_dir, train_recs, lookup)
+                    write_lstv_cases_json(ds_dir, train_recs + test_recs)
                     return 0
                 elif not want_kfold and have_kfold:
                     print(f"  NOTE: {ds_dir} populated with K-fold splits "
                           f"but --single_fold_splits requested. Rewriting "
                           f"splits only.")
+                    hf_tr = parse_manifest(
+                        args.hf_export_dir / "manifest_train.json",
+                        ct_dir, lbl_dir, args.train_fused_only,
+                        set(), args.debug_n)
+                    hf_vl = parse_manifest(
+                        args.hf_export_dir / "manifest_validation.json",
+                        ct_dir, lbl_dir, args.train_fused_only,
+                        set(), args.debug_n)
+                    if args.exclude_pseudo:
+                        hf_tr = [r for r in hf_tr if not r["is_pseudo"]]
+                        hf_vl = [r for r in hf_vl if not r["is_pseudo"]]
                     write_splits_final_single_fold(
                         ds_dir,
-                        # reconstitute original train/val ids
-                        [r["case_id"] for r in parse_manifest(
-                            args.hf_export_dir / "manifest_train.json",
-                            ct_dir, lbl_dir, args.train_fused_only,
-                            set(), args.debug_n)
-                         if not r["is_pseudo"] or not args.exclude_pseudo],
-                        [r["case_id"] for r in parse_manifest(
-                            args.hf_export_dir / "manifest_validation.json",
-                            ct_dir, lbl_dir, args.train_fused_only,
-                            set(), args.debug_n)
-                         if not r["is_pseudo"] or not args.exclude_pseudo],
+                        [r["case_id"] for r in hf_tr],
+                        [r["case_id"] for r in hf_vl],
                     )
+                    write_lstv_cases_json(ds_dir, hf_tr + hf_vl + test_recs)
                     return 0
                 else:
+                    # Even if dataset is already built, refresh lstv_cases.json
+                    # to handle re-runs after metadata-only edits.
                     print(f"  NOTE: {ds_dir} already populated with "
                           f"{'K-fold' if have_kfold else 'single-fold'} "
-                          f"splits. No-op.")
+                          f"splits. Refreshing lstv_cases.json only.")
+                    if lookup is not None:
+                        write_lstv_cases_json(ds_dir, train_recs + test_recs)
                     print(f"        Delete {ds_dir} to rebuild, or pass "
                           f"--regen_splits_only to refresh splits.")
                     return 0
@@ -693,8 +844,7 @@ def main() -> int:
     for d in (images_tr, labels_tr, images_ts, labels_ts):
         d.mkdir(parents=True, exist_ok=True)
 
-    # ----- write imagesTr/labelsTr ----------------------------------------
-    combined = train_recs + val_recs   # val_recs is [] in K-fold mode
+    combined = train_recs + val_recs
 
     cfg_counter = {"fused": 0, "spine_only": 0, "pelvic_native": 0}
     n_rewritten = 0
@@ -730,7 +880,6 @@ def main() -> int:
 
     print(f"\nRewrote {n_rewritten} partial-annotation labels in {t_rewrite:.0f}s")
 
-    # ----- post-write verification ----------------------------------------
     n_img_tr = len(list(images_tr.glob("*_0000.nii.gz")))
     n_lbl_tr = len(list(labels_tr.glob("*.nii.gz")))
     if n_img_tr != len(combined) or n_lbl_tr != len(combined):
@@ -739,7 +888,6 @@ def main() -> int:
             f"imagesTr={n_img_tr} labelsTr={n_lbl_tr}")
     print(f"  verified: imagesTr={n_img_tr} labelsTr={n_lbl_tr}")
 
-    # ----- write imagesTs/labelsTs ----------------------------------------
     print(f"\nWriting {len(test_recs)} test cases to {images_ts}")
     for rec in test_recs:
         cid = rec["case_id"]
@@ -756,7 +904,6 @@ def main() -> int:
             f"Test disk state mismatch: test_recs={len(test_recs)} "
             f"imagesTs={n_img_ts} labelsTs={n_lbl_ts}")
 
-    # ----- dataset.json ---------------------------------------------------
     dataset_json = {
         "channel_names":  {"0": "CT"},
         "labels":         CLASS_NAMES,
@@ -771,11 +918,8 @@ def main() -> int:
     }
     (ds_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
 
-    # ----- splits_final.json ---------------------------------------------
     print(f"\nWriting splits_final.json")
     if args.single_fold_splits:
-        # Fallback: use the HF manifest train/val distinction (re-parse to
-        # reconstruct it if we re-routed above).
         tr_seen: Set[str] = set()
         hf_tr = parse_manifest(
             args.hf_export_dir / "manifest_train.json",
@@ -792,7 +936,10 @@ def main() -> int:
         assert lookup is not None
         write_splits_final_from_lookup(ds_dir, train_recs, lookup)
 
-    # ----- summary --------------------------------------------------------
+    # Write LSTV cases metadata for the trainer to consume.
+    print(f"\nWriting lstv_cases.json")
+    write_lstv_cases_json(ds_dir, train_recs + val_recs + test_recs)
+
     print()
     print("=" * 70)
     print(f"Dataset:        {ds_dir}")
@@ -813,7 +960,9 @@ def main() -> int:
     print(f"  nnUNetv2_plan_and_preprocess -d {args.dataset_id} --verify_dataset_integrity")
     print(f"  cp {ds_dir}/splits_final.json \\")
     print(f"     $nnUNet_preprocessed/Dataset{args.dataset_id:03d}_{args.dataset_name}/splits_final.json")
-    print(f"  nnUNetv2_train {args.dataset_id} 3d_fullres 0 -tr nnUNetTrainer_100epochs")
+    print(f"  cp {ds_dir}/lstv_cases.json \\")
+    print(f"     $nnUNet_preprocessed/Dataset{args.dataset_id:03d}_{args.dataset_name}/lstv_cases.json")
+    print(f"  nnUNetv2_train {args.dataset_id} 3d_fullres 0 -tr nnUNetTrainerWandB_500ep_LSTVOversample")
     return 0
 
 
