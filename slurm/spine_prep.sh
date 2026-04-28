@@ -1,68 +1,26 @@
 #!/bin/bash
 #SBATCH --job-name=spine_prep
-#SBATCH -q gpu
+#SBATCH -q primary
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=500G
-#SBATCH --gres=gpu:nvidia_h200:1
-#SBATCH --time=6:00:00
+#SBATCH --mem=200G
+#SBATCH --time=8:00:00
 #SBATCH --output=logs/spine_prep_%j.out
 #SBATCH --error=logs/spine_prep_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=go2432@wayne.edu
 # =============================================================================
-# SpineSurg-CT  --  Stage A: convert + preprocess (local-scratch optimized)
+# SpineSurg-CT  --  Stage A: convert + preprocess (SIMPLE, NFS-only)
 # =============================================================================
-# Why this is fast (and why the old version was 6 hours)
-# ------------------------------------------------------
-# Three things happen in parallel during preprocess that will all hit NFS
-# hard unless you intercept them:
-#   1. 48 workers READING raw CT NIfTIs from NFS -> read contention
-#   2. 48 workers WRITING .npz/.pkl to NFS       -> write contention
-#   3. total preprocessed output (~50 GB) piling up on scratch -> fill risk
+# Convert writes symlinks like
+#     imagesTr/X__fused_0000.nii.gz -> /data/hf_export/ct/X.nii.gz
+# That target is a CONTAINER path; it resolves inside the container via the
+# /data/hf_export bind mount but looks "broken" from the host. Therefore:
+# do NOT run any host-side dangling-symlink cleanup. Earlier versions did,
+# and they wiped the whole dataset on every "resume" run.
 #
-# This script fixes all three:
-#   1. Raw NIfTIs are staged NFS -> local scratch ONCE (sequential read,
-#      symlinks resolved). 48 workers then read from local.
-#   2. Preprocess writes go to local scratch. No NFS write contention.
-#   3. A background daemon every DURABLE_RSYNC_EVERY_SEC (default 600 s)
-#      moves .npz/.pkl files older than 2 min from scratch to NFS using
-#      rsync --remove-source-files. Scratch use stays bounded.
-#
-# Durability
-# ----------
-# After each daemon tick, NFS holds a growing fraction of finished cases.
-# If SLURM kills the job mid-preprocess, the next run stages those back
-# from NFS to local and nnU-Net resumes (skips .npz that already exist).
-# On successful completion, a final rsync + marker atomically finish.
-#
-# Persistence / reuse
-# -------------------
-# Preprocessed state on NFS is per (dataset_id x plans_name). It is shared
-# across ALL 5 folds and across every ablation that uses the same combo.
-# You pay the preprocessing cost exactly once per (dataset, plans) pair.
-#
-# Idempotency
-# -----------
-# Step 0 checks NFS cache; if the marker + plans + .npz are all present,
-# the whole script short-circuits in seconds. Marker is removed only
-# right before preprocess runs and rewritten only after final rsync, so
-# partial states stay detectable (marker absent -> partial).
-#
-# LSTV metadata (Apr 2026)
-# ------------------------
-# Step 7 also copies lstv_cases.json from raw/ -> preprocessed/. This is
-# the metadata file that tools/nnunet_wandb_variant.py reads at training
-# time to identify cases needing oversampling (lumbarization +
-# sacralization). Mirrors the splits_final.json copy.
-#
-# Prereqs
-# -------
-# 1. data/splits_5fold.json              (from slurm/generate_splits.sh)
-# 2. data/hf_export/                     (from slurm/export_hf.sh)
-# 3. (recommended) pre-chosen GPU_MEMORY_TARGET_GB via
-#      slurm/plan_sizes.sh + tools/visualize_patch_sizes.py
+# Threading: 12 workers × 4 BLAS threads = 48 threads, fits RLIMIT_NPROC.
 # =============================================================================
 
 set -euo pipefail
@@ -79,22 +37,15 @@ unset JAVA_HOME; which singularity
 export NXF_SINGULARITY_HOME_MOUNT=true
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
-# ----- Config ---------------------------------------------------------------
+# ── Config ───────────────────────────────────────────────────────────────────
 DATASET_ID="${DATASET_ID:-802}"
 DATASET_NAME="${DATASET_NAME:-SpineSurgCTFull}"
 CONFIG="${CONFIG:-3d_fullres}"
 PLANNER="${PLANNER:-nnUNetPlannerResEncM}"
 GPU_MEMORY_TARGET_GB="${GPU_MEMORY_TARGET_GB:-100}"
-N_PREPROCESS_THREADS="${N_PREPROCESS_THREADS:-48}"
+N_PREPROCESS_THREADS="${N_PREPROCESS_THREADS:-12}"
+BLAS_THREADS="${BLAS_THREADS:-4}"
 SINGLE_FOLD_SPLITS="${SINGLE_FOLD_SPLITS:-0}"
-# How often the background daemon rsyncs+cleans. Smaller = lower peak
-# scratch use + more durability, but more NFS load. 10 min is a good
-# balance for ~1000 cases.
-DURABLE_RSYNC_EVERY_SEC="${DURABLE_RSYNC_EVERY_SEC:-600}"
-# Files must be at least this old (seconds) before the daemon moves them.
-# Protects in-flight writes. Minimum safe value ~60 s.
-DAEMON_MIN_AGE_MIN="${DAEMON_MIN_AGE_MIN:-2}"
-# Ablation filter pass-throughs (rare for normal prep)
 INCLUDE_TRAIN_MATCH_TYPES="${INCLUDE_TRAIN_MATCH_TYPES:-}"
 TEST_MATCH_TYPES="${TEST_MATCH_TYPES:-}"
 
@@ -106,7 +57,7 @@ case "${PLANNER}" in
     *) echo "ERROR: unknown planner ${PLANNER}" >&2; exit 1 ;;
 esac
 
-PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/SpineSurg-CT}"
+PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/spinesurg-ct-nnunet}"
 HF_EXPORT_NFS="${PROJECT_ROOT}/data/hf_export"
 SPLITS_FILE_HOST="${PROJECT_ROOT}/data/splits_5fold.json"
 NNUNET_NFS="${PROJECT_ROOT}/nnunet"
@@ -122,9 +73,7 @@ COMPLETE_MARKER="${NFS_PREP_DS}/.preprocessed_complete_${PLANS}"
 mkdir -p "${NNUNET_NFS}/raw" "${NNUNET_NFS}/preprocessed" "${NNUNET_NFS}/results" \
          "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/tmp"
 
-# ============================================================================
-# Preflight
-# ============================================================================
+# ── Preflight ────────────────────────────────────────────────────────────────
 [[ ! -f "${CONTAINER}"          ]] && { echo "ERROR: container not found: ${CONTAINER}" >&2; exit 1; }
 [[ ! -d "${HF_EXPORT_NFS}/ct"   ]] && { echo "ERROR: ${HF_EXPORT_NFS}/ct missing" >&2; exit 1; }
 [[ ! -f "${WANDB_TRAINER_HOST}" ]] && { echo "ERROR: ${WANDB_TRAINER_HOST} missing" >&2; exit 1; }
@@ -133,15 +82,12 @@ mkdir -p "${NNUNET_NFS}/raw" "${NNUNET_NFS}/preprocessed" "${NNUNET_NFS}/results
 
 if [[ "${SINGLE_FOLD_SPLITS}" != "1" ]]; then
     [[ ! -f "${SPLITS_FILE_HOST}" ]] && {
-        echo "ERROR: ${SPLITS_FILE_HOST} missing. Run slurm/generate_splits.sh first." >&2
-        exit 1; }
+        echo "ERROR: ${SPLITS_FILE_HOST} missing." >&2; exit 1; }
     SP_MTIME=$(stat -c '%y' "${SPLITS_FILE_HOST}" 2>/dev/null || stat -f '%Sm' "${SPLITS_FILE_HOST}")
     echo "  splits_5fold.json mtime: ${SP_MTIME}"
 fi
 
-# ============================================================================
-# Step 0: NFS cache check -- exit in seconds if already complete
-# ============================================================================
+# ── Step 0: NFS cache check (fast exit if already complete) ──────────────────
 if [[ -f "${COMPLETE_MARKER}" ]] \
    && [[ -d "${NFS_PREP_DS}/${CONFIG}" ]] \
    && [[ -f "${NFS_PREP_DS}/dataset_fingerprint.json" ]] \
@@ -153,94 +99,45 @@ if [[ -f "${COMPLETE_MARKER}" ]] \
     echo " NFS cache HIT: ${NFS_PREP_DS}"
     echo "   ${N_NPZ} .npz files, ${SIZE} total"
     echo "   plans  : ${PLANS}"
-    echo "   marker : $(stat -c '%y' "${COMPLETE_MARKER}" 2>/dev/null || stat -f '%Sm' "${COMPLETE_MARKER}")"
     echo "================================================================"
-    if [[ -f "${NFS_RAW_DS}/splits_final.json" ]]; then
-        cp -f "${NFS_RAW_DS}/splits_final.json" "${NFS_PREP_DS}/splits_final.json"
-        echo "  refreshed splits_final.json"
-    fi
-    if [[ -f "${NFS_RAW_DS}/lstv_cases.json" ]]; then
-        cp -f "${NFS_RAW_DS}/lstv_cases.json" "${NFS_PREP_DS}/lstv_cases.json"
-        echo "  refreshed lstv_cases.json"
-    else
-        echo "  NOTE: ${NFS_RAW_DS}/lstv_cases.json missing — re-run convert"
-        echo "        with the updated convert_hf_to_nnunet.py to generate it."
-    fi
-    echo ""
-    echo " NEXT: FOLD=0 sbatch slurm/spine_train_fold.sh"
+    [[ -f "${NFS_RAW_DS}/splits_final.json" ]] && cp -f "${NFS_RAW_DS}/splits_final.json" "${NFS_PREP_DS}/"
+    [[ -f "${NFS_RAW_DS}/lstv_cases.json"   ]] && cp -f "${NFS_RAW_DS}/lstv_cases.json"   "${NFS_PREP_DS}/"
+    echo " NEXT: sbatch slurm/spine_train_array.sh"
     exit 0
 fi
 
-# ============================================================================
-# Local scratch setup
-# ============================================================================
-if [[ -n "${SLURM_TMPDIR:-}" && -d "${SLURM_TMPDIR}" ]]; then
-    LOCAL_SCRATCH="${SLURM_TMPDIR}"
-elif [[ -d "/scratch/${USER}" ]]; then
-    LOCAL_SCRATCH="/scratch/${USER}/job_${SLURM_JOB_ID}"; mkdir -p "${LOCAL_SCRATCH}"
-else
-    LOCAL_SCRATCH="/tmp/${USER}_${SLURM_JOB_ID}"; mkdir -p "${LOCAL_SCRATCH}"
-fi
-
-LOCAL_NNUNET="${LOCAL_SCRATCH}/nnunet"
-LOCAL_RAW_DS="${LOCAL_NNUNET}/raw/${DS_DIR_NAME}"
-LOCAL_PREP_DS="${LOCAL_NNUNET}/preprocessed/${DS_DIR_NAME}"
-mkdir -p "${LOCAL_RAW_DS}" "${LOCAL_PREP_DS}"
-
-SCRATCH_AVAIL_GB=$(df -BG "${LOCAL_SCRATCH}" 2>/dev/null | awk 'NR==2 {gsub("G",""); print $4+0}' || echo 0)
+# >>> NO host-side dangling-symlink cleanup. <<<
+# Convert writes container-path symlinks (/data/hf_export/...). They look
+# "broken" from the host but resolve inside the container via the bind
+# mount. Cleaning them up was the reason resumes kept failing.
 
 echo "================================================================"
-echo " Stage A: convert + preprocess (local-scratch optimized)"
-echo "   Dataset         : ${DS_DIR_NAME}"
-echo "   Plans           : ${PLANS} (target ${GPU_MEMORY_TARGET_GB} GB)"
-echo "   Local scratch   : ${LOCAL_SCRATCH}  (${SCRATCH_AVAIL_GB} GB free)"
-echo "   NFS dest        : ${NFS_PREP_DS}"
-echo "   Splits mode     : $([[ ${SINGLE_FOLD_SPLITS} == 1 ]] && echo 'single-fold (legacy)' || echo '5-fold CV')"
-echo "   Preprocess thr  : ${N_PREPROCESS_THREADS}"
-echo "   Daemon interval : ${DURABLE_RSYNC_EVERY_SEC}s  (rsync+cleanup)"
-echo "   Daemon min age  : ${DAEMON_MIN_AGE_MIN} min   (safety for in-flight)"
-echo "   Started         : $(date)"
+echo " Stage A: convert + preprocess (SIMPLE, NFS-only)"
+echo "   Dataset      : ${DS_DIR_NAME}"
+echo "   Plans        : ${PLANS} (target ${GPU_MEMORY_TARGET_GB} GB)"
+echo "   NFS dest     : ${NFS_PREP_DS}"
+echo "   Splits mode  : $([[ ${SINGLE_FOLD_SPLITS} == 1 ]] && echo 'single-fold' || echo '5-fold CV')"
+echo "   Workers      : ${N_PREPROCESS_THREADS} × ${BLAS_THREADS} BLAS threads = $((N_PREPROCESS_THREADS*BLAS_THREADS)) total"
+echo "   Started      : $(date)"
 echo "================================================================"
 
-# Rough needs: ~50 GB raw + peak ~30 GB transient preprocessed = ~80 GB.
-# Warn but do not exit; user may have a different-sized dataset.
-if [[ "${SCRATCH_AVAIL_GB}" -lt 120 ]]; then
-    echo "  WARN: ${SCRATCH_AVAIL_GB} GB scratch free; this is tight for a 1000-case dataset." >&2
-    echo "        The rsync+cleanup daemon will manage this, but if you see" >&2
-    echo "        ENOSPC errors, reduce DURABLE_RSYNC_EVERY_SEC to 300." >&2
-fi
-
-# ============================================================================
-# Singularity setup
-# ============================================================================
+# ── Singularity setup ────────────────────────────────────────────────────────
 export SINGULARITYENV_TMPDIR="/workspace/tmp"
-# nnU-Net reads raw + writes preprocessed both on LOCAL scratch during preprocess.
-# The convert step uses a CLI argument so it is not affected by these env vars.
-export SINGULARITYENV_nnUNet_raw="/nnunet_local/raw"
-export SINGULARITYENV_nnUNet_preprocessed="/nnunet_local/preprocessed"
+export SINGULARITYENV_nnUNet_raw="/nnunet_nfs/raw"
+export SINGULARITYENV_nnUNet_preprocessed="/nnunet_nfs/preprocessed"
 export SINGULARITYENV_nnUNet_results="/nnunet_nfs/results"
-export SINGULARITY_TMPDIR="/tmp/${USER}_job_${SLURM_JOB_ID}_singularity"
-export XDG_RUNTIME_DIR="${SINGULARITY_TMPDIR}/runtime"
-mkdir -p "${SINGULARITY_TMPDIR}" "${XDG_RUNTIME_DIR}"
 
-# Cleanup trap: stop daemon, remove singularity tmp
-RSYNC_DAEMON_PID=""
-cleanup() {
-    if [[ -n "${RSYNC_DAEMON_PID:-}" ]] && kill -0 "${RSYNC_DAEMON_PID}" 2>/dev/null; then
-        echo "  [trap] stopping rsync+cleanup daemon (pid=${RSYNC_DAEMON_PID})"
-        kill "${RSYNC_DAEMON_PID}" 2>/dev/null || true
-        wait "${RSYNC_DAEMON_PID}" 2>/dev/null || true
-    fi
-    rm -rf "${SINGULARITY_TMPDIR}" || true
-}
-trap cleanup EXIT
+# Cap BLAS threads inside each worker to avoid blowing past RLIMIT_NPROC.
+export SINGULARITYENV_OMP_NUM_THREADS=${BLAS_THREADS}
+export SINGULARITYENV_OPENBLAS_NUM_THREADS=${BLAS_THREADS}
+export SINGULARITYENV_MKL_NUM_THREADS=${BLAS_THREADS}
+export SINGULARITYENV_NUMEXPR_NUM_THREADS=${BLAS_THREADS}
+export SINGULARITYENV_VECLIB_MAXIMUM_THREADS=${BLAS_THREADS}
 
 SING_BINDS=(
-    --nv
     --bind "${PROJECT_ROOT}:/workspace"
     --bind "${HF_EXPORT_NFS}:/data/hf_export"
     --bind "${NNUNET_NFS}:/nnunet_nfs"
-    --bind "${LOCAL_NNUNET}:/nnunet_local"
     --bind "${WANDB_TRAINER_HOST}:${WANDB_TRAINER_CONTAINER}"
     --pwd  /workspace
 )
@@ -248,10 +145,8 @@ if [[ "${SINGLE_FOLD_SPLITS}" != "1" ]]; then
     SING_BINDS+=( --bind "${SPLITS_FILE_HOST}:/workspace/splits_5fold.json:ro" )
 fi
 
-# ============================================================================
-# Step 1: convert (idempotent, writes to NFS -- tiny symlink-based layout)
-# ============================================================================
-echo ""; echo "----- Step 1: convert HF export -> nnU-Net raw (on NFS) -----"
+# ── Step 1: convert HF export -> nnU-Net raw (on NFS) ────────────────────────
+echo ""; echo "----- Step 1: convert HF export -> nnU-Net raw -----"
 if [[ -f "${NFS_RAW_DS}/dataset.json" ]]; then
     echo "  dataset.json present; skipping convert."
 else
@@ -274,97 +169,9 @@ else
         python tools/convert_hf_to_nnunet.py "${CONVERT_ARGS[@]}"
 fi
 
-# ============================================================================
-# Step 2: stage raw NFS -> local scratch (-L resolves symlinks)
-# ============================================================================
-# One big sequential NFS read. Eliminates read contention from 48 workers.
-# -L is critical: the convert script writes symlinks into the HF export.
-# Without -L, every worker would still chase those symlinks back to NFS.
-echo ""; echo "----- Step 2: stage raw NFS -> local scratch -----"
-RAW_STAGE_START=$(date +%s)
-rsync -aWL --no-compress --human-readable \
-    "${NFS_RAW_DS}/" "${LOCAL_RAW_DS}/"
-RAW_STAGE_TIME=$(($(date +%s) - RAW_STAGE_START))
-RAW_STAGE_SIZE=$(du -sh "${LOCAL_RAW_DS}" 2>/dev/null | awk '{print $1}')
-echo "  staged ${RAW_STAGE_SIZE} of raw data in ${RAW_STAGE_TIME}s"
-
-# ============================================================================
-# Step 3: resume from partial NFS preprocessed state (if any)
-# ============================================================================
-# If a previous job wrote some .npz files to NFS before dying, pull them
-# back to local so nnU-Net's skip-if-exists logic picks up where we left off.
-if [[ -d "${NFS_PREP_DS}" ]] && [[ -n "$(ls -A "${NFS_PREP_DS}" 2>/dev/null || true)" ]]; then
-    N_PARTIAL=$({ find "${NFS_PREP_DS}" -name "*.npz" 2>/dev/null || true; } | wc -l)
-    if [[ "${N_PARTIAL}" -gt 0 ]]; then
-        echo ""; echo "----- Step 3: resume from partial NFS state -----"
-        echo "  found ${N_PARTIAL} .npz on NFS; staging to local for resume..."
-        RESUME_START=$(date +%s)
-        rsync -aW --no-compress "${NFS_PREP_DS}/" "${LOCAL_PREP_DS}/"
-        echo "  resumed in $(($(date +%s) - RESUME_START))s"
-    fi
-fi
-
-# ============================================================================
-# Step 4: start background rsync+cleanup daemon
-# ============================================================================
-# Loop: every DURABLE_RSYNC_EVERY_SEC seconds,
-#   1. Build list of .npz/.pkl older than DAEMON_MIN_AGE_MIN minutes.
-#   2. rsync --files-from=LIST --remove-source-files  local -> NFS.
-#      This atomically transfers then deletes from scratch.
-#   3. rsync metadata files (plans, fingerprint, etc.) but do NOT remove them
-#      from local (they're small and nnU-Net may reread them).
-DAEMON_LOG="${PROJECT_ROOT}/logs/rsync_daemon_${SLURM_JOB_ID}.log"
-echo ""; echo "----- Step 4: start rsync+cleanup daemon -----"
-echo "  log: ${DAEMON_LOG}"
-
-(
-    set +e   # do not exit daemon on transient failures
-    while sleep "${DURABLE_RSYNC_EVERY_SEC}"; do
-        TS=$(date '+%Y-%m-%d %H:%M:%S')
-        MOVE_LIST="/tmp/${USER}_move_${SLURM_JOB_ID}_$$.txt"
-
-        # Relative-path list of files safe to move
-        (cd "${LOCAL_PREP_DS}" 2>/dev/null && \
-         find . \( -name "*.npz" -o -name "*.pkl" \) -type f -mmin "+${DAEMON_MIN_AGE_MIN}" \
-        ) > "${MOVE_LIST}" 2>/dev/null
-
-        N_MOVE=$(wc -l < "${MOVE_LIST}" 2>/dev/null | tr -d ' ')
-        N_MOVE="${N_MOVE:-0}"
-
-        if [[ "${N_MOVE}" -gt 0 ]]; then
-            # Atomic move: rsync then remove from source on successful transfer
-            rsync -aW --no-compress \
-                  --files-from="${MOVE_LIST}" \
-                  --remove-source-files \
-                  "${LOCAL_PREP_DS}/" "${NFS_PREP_DS}/" \
-                  >>"${DAEMON_LOG}" 2>&1
-
-            # Prune empty directories left behind on local
-            find "${LOCAL_PREP_DS}" -type d -empty -not -path "${LOCAL_PREP_DS}" -delete 2>/dev/null
-        fi
-
-        # Sync metadata (small; keep on local too)
-        rsync -auW --no-compress \
-              --exclude='*.npz' --exclude='*.pkl' \
-              "${LOCAL_PREP_DS}/" "${NFS_PREP_DS}/" \
-              >>"${DAEMON_LOG}" 2>&1
-
-        N_LOCAL=$({ find "${LOCAL_PREP_DS}" -name "*.npz" 2>/dev/null || true; } | wc -l)
-        N_NFS=$({ find "${NFS_PREP_DS}" -name "*.npz" 2>/dev/null || true; } | wc -l)
-        SCRATCH_FREE=$(df -BG "${LOCAL_SCRATCH}" 2>/dev/null | awk 'NR==2 {gsub("G",""); print $4+0}' || echo "?")
-        echo "${TS}  moved=${N_MOVE}  local_npz=${N_LOCAL}  nfs_npz=${N_NFS}  scratch_free=${SCRATCH_FREE}GB" >>"${DAEMON_LOG}"
-
-        rm -f "${MOVE_LIST}"
-    done
-) &
-RSYNC_DAEMON_PID=$!
-echo "  daemon pid: ${RSYNC_DAEMON_PID}"
-
-# ============================================================================
-# Step 5: preprocess (reads local raw, writes local preprocessed)
-# ============================================================================
-echo ""; echo "----- Step 5: plan + preprocess (local I/O) -----"
-rm -f "${COMPLETE_MARKER}"   # invalidate marker; rewritten after final rsync
+# ── Step 2: plan + preprocess (reads + writes on NFS) ────────────────────────
+echo ""; echo "----- Step 2: plan + preprocess -----"
+rm -f "${COMPLETE_MARKER}"
 
 PREP_START=$(date +%s)
 singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
@@ -379,81 +186,24 @@ singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
 PREP_TIME=$(($(date +%s) - PREP_START))
 echo "  preprocess done in ${PREP_TIME}s"
 
-# ============================================================================
-# Step 6: stop daemon, final rsync + cleanup
-# ============================================================================
-echo ""; echo "----- Step 6: stop daemon + final rsync -----"
-if [[ -n "${RSYNC_DAEMON_PID:-}" ]] && kill -0 "${RSYNC_DAEMON_PID}" 2>/dev/null; then
-    kill "${RSYNC_DAEMON_PID}" 2>/dev/null || true
-    wait "${RSYNC_DAEMON_PID}" 2>/dev/null || true
-    RSYNC_DAEMON_PID=""
-fi
+# ── Step 3: copy splits + LSTV metadata into preprocessed/ ───────────────────
+echo ""; echo "----- Step 3: copy metadata into preprocessed/ -----"
+[[ -f "${NFS_RAW_DS}/splits_final.json" ]] && cp -f "${NFS_RAW_DS}/splits_final.json" "${NFS_PREP_DS}/" && echo "  copied splits_final.json"
+[[ -f "${NFS_RAW_DS}/lstv_cases.json"   ]] && cp -f "${NFS_RAW_DS}/lstv_cases.json"   "${NFS_PREP_DS}/" && echo "  copied lstv_cases.json"
 
-# Final sweep: rsync whatever the daemon didn't get (too-recent files,
-# plans/fingerprint, etc.). --remove-source-files optional here since
-# the job is about to release scratch anyway.
-RSYNC_START=$(date +%s)
-rsync -aW --no-compress --human-readable \
-    "${LOCAL_PREP_DS}/" "${NFS_PREP_DS}/"
-RSYNC_TIME=$(($(date +%s) - RSYNC_START))
-
+# ── Sanity check ─────────────────────────────────────────────────────────────
 N_NPZ_NFS=$({ find "${NFS_PREP_DS}/${CONFIG}" -maxdepth 1 -name "*.npz" 2>/dev/null || true; } | wc -l)
 NFS_SIZE=$(du -sh "${NFS_PREP_DS}" 2>/dev/null | awk '{print $1}')
-echo "  final rsync: ${N_NPZ_NFS} .npz on NFS (${NFS_SIZE}) in ${RSYNC_TIME}s"
+[[ "${N_NPZ_NFS}" -eq 0 ]] && { echo "ERROR: zero .npz files after preprocess." >&2; exit 2; }
 
-if [[ "${N_NPZ_NFS}" -eq 0 ]]; then
-    echo "ERROR: zero .npz files on NFS after preprocess; something failed." >&2
-    exit 2
-fi
-
-# ============================================================================
-# Step 7: copy splits + LSTV metadata into preprocessed/
-# ============================================================================
-# nnU-Net reads splits_final.json from preprocessed/ directly. The trainer's
-# LSTV oversampling mixin (tools/nnunet_wandb_variant.py) prefers
-# preprocessed/lstv_cases.json over raw/lstv_cases.json so it doesn't have
-# to know about the raw path. Both are tiny JSON files; copy is instant.
-echo ""; echo "----- Step 7: copy metadata into preprocessed/ -----"
-if [[ -f "${NFS_RAW_DS}/splits_final.json" ]]; then
-    cp -f "${NFS_RAW_DS}/splits_final.json" "${NFS_PREP_DS}/splits_final.json"
-    echo "  copied splits_final.json into preprocessed/"
-else
-    echo "  WARN: ${NFS_RAW_DS}/splits_final.json missing; nnU-Net will use" >&2
-    echo "        random fold splits (NOT what you want for K-fold CV)" >&2
-fi
-
-if [[ -f "${NFS_RAW_DS}/lstv_cases.json" ]]; then
-    cp -f "${NFS_RAW_DS}/lstv_cases.json" "${NFS_PREP_DS}/lstv_cases.json"
-    echo "  copied lstv_cases.json into preprocessed/"
-else
-    echo "  NOTE: ${NFS_RAW_DS}/lstv_cases.json missing." >&2
-    echo "        The LSTV oversampling trainer will fall through to manifest" >&2
-    echo "        scan (path C) or L6-voxel scan (path D, lumbarization only)." >&2
-    echo "        Re-run convert with the updated convert_hf_to_nnunet.py" >&2
-    echo "        to generate it." >&2
-fi
-
-# ============================================================================
-# Step 8: mark complete (LAST step so partial states stay detectable)
-# ============================================================================
 touch "${COMPLETE_MARKER}"
-echo "  wrote marker: ${COMPLETE_MARKER}"
 
-TOTAL_TIME=$((RAW_STAGE_TIME + PREP_TIME + RSYNC_TIME))
 echo ""
 echo "================================================================"
 echo " Stage A COMPLETE   $(date)"
-echo "   raw staging   : ${RAW_STAGE_TIME}s   (${RAW_STAGE_SIZE})"
-echo "   preprocess    : ${PREP_TIME}s"
-echo "   final rsync   : ${RSYNC_TIME}s"
-echo "   total         : ${TOTAL_TIME}s"
-echo "   preprocessed  : ${NFS_PREP_DS}  (${NFS_SIZE})"
+echo "   preprocess time : ${PREP_TIME}s"
+echo "   .npz files      : ${N_NPZ_NFS}"
+echo "   preprocessed    : ${NFS_PREP_DS}  (${NFS_SIZE})"
 echo ""
-echo " This state is reused across ALL folds and all ablations that"
-echo " share the same (dataset_id, plans_name) combination."
-echo ""
-echo " NEXT:"
-echo "   Single fold  :  FOLD=0 sbatch slurm/spine_train_fold.sh"
-echo "   5-fold CV    :  sbatch slurm/spine_train_array.sh"
-echo "   Ablations    :  sbatch slurm/spine_ablation.sh"
+echo " NEXT:  sbatch slurm/spine_train_array.sh"
 echo "================================================================"
