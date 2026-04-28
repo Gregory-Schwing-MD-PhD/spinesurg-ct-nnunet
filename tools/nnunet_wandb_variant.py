@@ -1,61 +1,45 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v7.2 FINAL)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (FINAL)
 tools/nnunet_wandb_variant.py
 
-This is the production-ready version after extensive profiling and
-debugging. The journey:
-
-  v1-v3: W&B logging + LSTV oversampling
-  v4:    fixed KeyError: 'args' from *args/**kwargs in __init__ overrides
-  v5:    profiler integration + dynamo log suppression
-  v6:    perf tuning (cudnn.benchmark, TF32, compile mode='reduce-overhead',
-         non_blocking H2D) -- but CUDA-graphs mode broke validation, and
-         the Tensor.to monkey-patch broke nn.Module.to(device)
-  v7:    channels_last_3d toggle -- but PyTorch's 3D instance norm forces
-         layout-reshuffling clones that are 4x slower than the cuDNN
-         transposes they replace. Strictly worse on this network.
-  v7.2:  removed both broken monkey-patches. Final config.
-
-What's actually on
-==================
+What's on
+=========
 1. cudnn.benchmark = True
-2. set_float32_matmul_precision('high') for fp32 matmul (norm stats)
+2. set_float32_matmul_precision('high') (TF32 for fp32 matmul; norm stats)
 3. Profiler hooks (opt-in via SPINESURG_PROFILE=1)
 4. channels_last_3d toggle (opt-in via SPINESURG_CHANNELS_LAST=1)
-   -- WARNING: empirically slower on ResEnc UNet + 3D instance norms;
-   left in as a toggle for future model variants
+   -- WARNING: empirically slower on ResEnc UNet + 3D instance norms
 5. LSTV oversampling for both subtypes (sacralization + lumbarization)
 6. W&B init with retry + offline fallback
 7. NaN-safe dice aggregation
 8. SPINESURG_RUN_VAL_EXPORT toggle for perform_actual_validation
-9. SPINESURG_PERF=0 escape hatch to disable all perf tuning
+9. SPINESURG_PERF=0 escape hatch to disable perf tuning
 
 What's NOT on (and why)
 =======================
-- torch.compile mode='reduce-overhead' / CUDA graphs: deep supervision
-  returns a list of tensors, validation re-uses these tensors after
-  forward returns, and CUDA graphs reuse output buffers across calls,
-  causing "tensor overwritten" RuntimeError mid-validation. Default
-  compile mode (used by nnU-Net) works fine.
+- torch.compile mode='reduce-overhead' / CUDA graphs:
+  Deep supervision returns a list of tensors; validation reuses these
+  after forward returns. CUDA graphs reuse output buffers, which gets
+  overwritten by the dataloader's next prefetched batch -> RuntimeError
+  during validation. nnU-Net's default compile (mode='default') works.
 
-- Tensor.to default-non_blocking=True monkey-patch: PyTorch's internal
-  nn.Module._apply -> convert calls t.to(device, dtype, non_blocking)
-  with non_blocking as a positional arg. My patch saw "non_blocking
-  not in kwargs" and added it as a kwarg, producing a duplicate-arg
-  TypeError that killed every training launch.
+- Tensor.to default-non_blocking=True monkey-patch:
+  PyTorch's nn.Module._apply -> convert calls t.to(device, dtype,
+  non_blocking) with non_blocking as a positional arg. The patch
+  detected "non_blocking not in kwargs" and added it as a kwarg,
+  producing a duplicate-arg TypeError that killed every launch.
 
-- channels_last_3d (toggle off by default): see profile evidence in
-  v7 changelog. ~13.5% transpose overhead replaced by ~21% clone +
-  contig + copy overhead from 3D instance norm not having a NHWC
-  kernel path. Net loss.
+- channels_last_3d (toggle off by default):
+  ~13.5% transpose overhead replaced by ~21% clone+contig+copy from
+  3D instance norm not having a NHWC kernel path. Net loss.
 
 Trainer __init__ rules
 ======================
 Every trainer subclass that overrides __init__ MUST declare the FULL
 nnUNetTrainer signature explicitly. nnUNetTrainer.__init__ inspects
-self.__init__'s parameters and looks them up in its own locals(). Using
-*args/**kwargs makes it look up locals()['args'], raising KeyError.
-Required signature:
+self.__init__'s parameters and looks them up in its own locals().
+Using *args/**kwargs makes it look up locals()['args'], raising
+KeyError. Required signature:
     def __init__(self, plans: dict, configuration: str, fold: int,
                  dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
@@ -134,14 +118,11 @@ def _install_nnunet_warning_filter() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Performance tuning (no monkey-patches in v7.2)
+# Performance tuning (no monkey-patches)
 # -----------------------------------------------------------------------------
 
 def _install_perf_tuning() -> None:
-    """
-    cudnn.benchmark + TF32 only. Both safe, both small wins, no
-    monkey-patches. Disabled by SPINESURG_PERF=0.
-    """
+    """cudnn.benchmark + TF32 only. Both safe, both small wins."""
     try:
         torch.backends.cudnn.benchmark = True
     except Exception:
@@ -153,7 +134,7 @@ def _install_perf_tuning() -> None:
 
 
 def _restore_perf_tuning() -> None:
-    """No-op (no monkey-patches to restore in v7.2)."""
+    """No-op (no monkey-patches to restore)."""
     pass
 
 
@@ -449,19 +430,12 @@ class _WandBMixin:
             self.print_to_log_file(f"Perf tuning: install failed: {exc}")
 
     def _restore_perf_tuning_safe(self) -> None:
-        # No-op in v7.2 (no monkey patches to restore)
+        # No-op (no monkey patches to restore)
         pass
 
     # ---- channels_last_3d (opt-in) ---------------------------------------
 
     def _maybe_apply_channels_last(self) -> None:
-        """
-        Convert the network to channels_last_3d memory format.
-
-        WARNING: empirically slower on ResEnc UNet + 3D instance norms.
-        See v7 changelog. Left in for future experiments / different
-        models. Off by default.
-        """
         if not _env_truthy("SPINESURG_CHANNELS_LAST"):
             return
         net = getattr(self, "network", None)
@@ -477,8 +451,7 @@ class _WandBMixin:
                 "Per-batch input conversion in train_step / validation_step.")
             self.print_to_log_file(
                 "channels_last_3d: WARNING -- empirically SLOWER on "
-                "this model due to 3D instance norm forcing layout "
-                "reshuffles. Use only for experimentation.")
+                "this model. Use only for experimentation.")
         except Exception as exc:
             self.print_to_log_file(
                 f"channels_last_3d: conversion failed: {exc}. Disabling.")
