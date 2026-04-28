@@ -1,54 +1,64 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v3)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v7.2 FINAL)
 tools/nnunet_wandb_variant.py
 
-Changes vs v2
-=============
-1. LSTV oversampling now covers BOTH lumbarization AND sacralization.
+This is the production-ready version after extensive profiling and
+debugging. The journey:
 
-   v2 detected LSTV cases by scanning labelsTr/ for L6 voxels. That
-   only catches lumbarization (which has a 6th lumbar labeled L6).
-   Sacralization cases (L5 fused to sacrum) have no L6 voxels in their
-   labels, so v2 silently undersampled them at the natural ~3% rate.
+  v1-v3: W&B logging + LSTV oversampling
+  v4:    fixed KeyError: 'args' from *args/**kwargs in __init__ overrides
+  v5:    profiler integration + dynamo log suppression
+  v6:    perf tuning (cudnn.benchmark, TF32, compile mode='reduce-overhead',
+         non_blocking H2D) -- but CUDA-graphs mode broke validation, and
+         the Tensor.to monkey-patch broke nn.Module.to(device)
+  v7:    channels_last_3d toggle -- but PyTorch's 3D instance norm forces
+         layout-reshuffling clones that are 4x slower than the cuDNN
+         transposes they replace. Strictly worse on this network.
+  v7.2:  removed both broken monkey-patches. Final config.
 
-   v3 detection precedence (first hit wins):
-     a) lstv_cases.json in <nnUNet_preprocessed>/<dataset_name>/    (preferred)
-     b) lstv_cases.json in <nnUNet_raw>/<dataset_name>/             (fallback)
-     c) Live scan of HF manifests (manifest_train/validation/test.json)
-     d) labelsTr L6-voxel scan (legacy v2 behaviour, lumbarization only)
+What's actually on
+==================
+1. cudnn.benchmark = True
+2. set_float32_matmul_precision('high') for fp32 matmul (norm stats)
+3. Profiler hooks (opt-in via SPINESURG_PROFILE=1)
+4. channels_last_3d toggle (opt-in via SPINESURG_CHANNELS_LAST=1)
+   -- WARNING: empirically slower on ResEnc UNet + 3D instance norms;
+   left in as a toggle for future model variants
+5. LSTV oversampling for both subtypes (sacralization + lumbarization)
+6. W&B init with retry + offline fallback
+7. NaN-safe dice aggregation
+8. SPINESURG_RUN_VAL_EXPORT toggle for perform_actual_validation
+9. SPINESURG_PERF=0 escape hatch to disable all perf tuning
 
-   lstv_cases.json is produced at convert time by
-   tools/convert_hf_to_nnunet.py. Its schema (v1):
-       {
-         "schema_version": 1,
-         "n_cases": <int>,
-         "subtype_counts": {"lumbarization": N, "sacralization": M},
-         "case_ids": {"<case_id>": "<lstv_label>", ...}
-       }
+What's NOT on (and why)
+=======================
+- torch.compile mode='reduce-overhead' / CUDA graphs: deep supervision
+  returns a list of tensors, validation re-uses these tensors after
+  forward returns, and CUDA graphs reuse output buffers across calls,
+  causing "tensor overwritten" RuntimeError mid-validation. Default
+  compile mode (used by nnU-Net) works fine.
 
-2. Wider dataloader-attribute search. nnU-Net v2.5+ uses 'identifiers'
-   as the attribute name (was 'keys' in earlier versions). v3 tries
-   both, walks several known attribute paths, and logs the traversal
-   so you can see what matched.
+- Tensor.to default-non_blocking=True monkey-patch: PyTorch's internal
+  nn.Module._apply -> convert calls t.to(device, dtype, non_blocking)
+  with non_blocking as a positional arg. My patch saw "non_blocking
+  not in kwargs" and added it as a kwarg, producing a duplicate-arg
+  TypeError that killed every training launch.
 
-3. Post-patch verification. After duplicating keys, v3 reads back the
-   attribute to confirm the new length stuck. Catches silent failures
-   where the framework wraps the attribute in something immutable.
+- channels_last_3d (toggle off by default): see profile evidence in
+  v7 changelog. ~13.5% transpose overhead replaced by ~21% clone +
+  contig + copy overhead from 3D instance norm not having a NHWC
+  kernel path. Net loss.
 
-4. Per-subtype logging at startup. Confirms both lumbarization and
-   sacralization are represented in this fold's training split.
-
-5. Edge-case guards. LSTV_OVERSAMPLE_FRAC capped at 0.95 to prevent
-   divide-by-zero AND because 100% LSTV defeats nnU-Net's
-   normal/abnormal mixed exposure.
-
-6. New 500-epoch trainer variants for the ML4H 2025 deadline.
-
-Inherited from v2 (unchanged):
-   - W&B init with retry + offline fallback
-   - benign scalar-divide warning suppression
-   - NaN-safe dice aggregation in W&B logs
-   - SPINESURG_RUN_VAL_EXPORT toggle for perform_actual_validation
+Trainer __init__ rules
+======================
+Every trainer subclass that overrides __init__ MUST declare the FULL
+nnUNetTrainer signature explicitly. nnUNetTrainer.__init__ inspects
+self.__init__'s parameters and looks them up in its own locals(). Using
+*args/**kwargs makes it look up locals()['args'], raising KeyError.
+Required signature:
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device('cuda')):
 
 Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
 """
@@ -56,6 +66,7 @@ Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import time
@@ -66,6 +77,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+import torch
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.nnUNetTrainer.variants.training_length.nnUNetTrainer_Xepochs import (
@@ -82,42 +94,67 @@ _METRIC_KEYS = (
     "epoch_start_timestamps", "epoch_end_timestamps",
 )
 
-# nnU-Net's dice_per_class_or_region skips class 0 (background).
-# Index i -> our label (i + 1) in the SpineSurg-CT 10-class map.
 _ANATOMY_NAMES = [
     "L1", "L2", "L3", "L4", "L5", "L6",
     "sacrum", "left_hip", "right_hip",
 ]
 
-# Numeric class IDs for the LSTV case detector (matches SpineSurg-CT label map)
 _L6_LABEL_ID = 6
 _IGNORE_LABEL = 10
-
-# Configs from convert_hf_to_nnunet.py — used when constructing case_ids
-# from manifest tokens during the live-manifest fallback path.
 _VALID_CONFIGS = ("fused", "spine_only", "pelvic_native")
-
-# Schema version for lstv_cases.json. Must match the writer in
-# convert_hf_to_nnunet.py.
 LSTV_CASES_SCHEMA_VERSION = 1
 
 
 # -----------------------------------------------------------------------------
-# Silence the benign scalar-divide warning from nnU-Net's dice accumulator
+# Warning + log suppression
 # -----------------------------------------------------------------------------
 
 def _install_nnunet_warning_filter() -> None:
-    """
-    Suppress ONLY the specific scalar-divide warning that fires when a
-    class has zero presence in a validation epoch. Leaves all other
-    numpy warnings alone so we still see legitimate problems.
-    """
+    """Suppress benign numpy + torch.compile/dynamo/inductor noise."""
     warnings.filterwarnings(
         "ignore",
         message="invalid value encountered in scalar divide",
         category=RuntimeWarning,
     )
     np.seterr(invalid="ignore", divide="warn")
+
+    for logger_name in (
+        "torch.fx.experimental.symbolic_shapes",
+        "torch._dynamo",
+        "torch._dynamo.symbolic_convert",
+        "torch._dynamo.guards",
+        "torch._dynamo.output_graph",
+        "torch._inductor",
+        "torch._inductor.compile_fx",
+        "torch._inductor.scheduler",
+        "torch._inductor.codecache",
+        "torch._functorch",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+
+# -----------------------------------------------------------------------------
+# Performance tuning (no monkey-patches in v7.2)
+# -----------------------------------------------------------------------------
+
+def _install_perf_tuning() -> None:
+    """
+    cudnn.benchmark + TF32 only. Both safe, both small wins, no
+    monkey-patches. Disabled by SPINESURG_PERF=0.
+    """
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
+
+
+def _restore_perf_tuning() -> None:
+    """No-op (no monkey-patches to restore in v7.2)."""
+    pass
 
 
 # -----------------------------------------------------------------------------
@@ -147,16 +184,11 @@ def _safe_id(token: str) -> str:
     s = str(token)
     for bad in (".", "/", "\\", " ", ":", "(", ")"):
         s = s.replace(bad, "_")
-    s = s.strip("_")
-    return s
+    return s.strip("_")
 
 
 def _read_lstv_cases_json(json_path: Path
                            ) -> Optional[Tuple[Set[str], Counter]]:
-    """
-    Load lstv_cases.json from disk. Returns (case_ids, subtype_counts)
-    or None on any failure (file missing, schema mismatch, parse error).
-    """
     if not json_path.exists():
         return None
     try:
@@ -165,8 +197,7 @@ def _read_lstv_cases_json(json_path: Path
         return None
     if not isinstance(data, dict):
         return None
-    schema = data.get("schema_version")
-    if schema != LSTV_CASES_SCHEMA_VERSION:
+    if data.get("schema_version") != LSTV_CASES_SCHEMA_VERSION:
         return None
     case_ids_dict = data.get("case_ids") or {}
     if not isinstance(case_ids_dict, dict):
@@ -180,11 +211,6 @@ def _read_lstv_cases_json(json_path: Path
 
 
 def _candidate_lstv_json_paths(dataset_name: str) -> List[Path]:
-    """
-    Common locations for lstv_cases.json, in priority order. Tries the
-    preprocessed/ directory first since that's where nnU-Net runs from
-    at training time, then falls back to raw/.
-    """
     cands: List[Path] = []
     pre = os.environ.get("nnUNet_preprocessed")
     if pre:
@@ -196,7 +222,6 @@ def _candidate_lstv_json_paths(dataset_name: str) -> List[Path]:
 
 
 def _candidate_hf_export_dirs() -> List[Path]:
-    """Locations to try for live-manifest fallback path."""
     cands: List[Path] = []
     env = os.environ.get("HF_EXPORT_DIR", "").strip()
     if env:
@@ -220,22 +245,12 @@ def _candidate_hf_export_dirs() -> List[Path]:
 
 def _read_lstv_records_from_manifest(hf_export_dir: Path
                                       ) -> Optional[Tuple[Set[str], Counter]]:
-    """
-    Live-manifest fallback. Reads manifest_train.json /
-    manifest_validation.json / manifest_test.json (or single manifest.json)
-    under hf_export_dir, identifies records with lstv_label != "normal",
-    and returns (case_ids, subtype_counts).
-    """
     if not hf_export_dir.is_dir():
         return None
-
     records: List[Dict] = []
-    split_files = [
-        hf_export_dir / "manifest_train.json",
-        hf_export_dir / "manifest_validation.json",
-        hf_export_dir / "manifest_test.json",
-    ]
-    for p in split_files:
+    for p in (hf_export_dir / "manifest_train.json",
+              hf_export_dir / "manifest_validation.json",
+              hf_export_dir / "manifest_test.json"):
         if p.exists():
             try:
                 data = json.loads(p.read_text())
@@ -245,7 +260,6 @@ def _read_lstv_records_from_manifest(hf_export_dir: Path
                     records.extend(data["records"])
             except Exception:
                 continue
-
     if not records:
         combined = hf_export_dir / "manifest.json"
         if combined.exists():
@@ -257,10 +271,8 @@ def _read_lstv_records_from_manifest(hf_export_dir: Path
                     records = data["records"]
             except Exception:
                 return None
-
     if not records:
         return None
-
     case_ids: Set[str] = set()
     subtypes: Counter = Counter()
     for r in records:
@@ -271,27 +283,21 @@ def _read_lstv_records_from_manifest(hf_export_dir: Path
         config = r.get("config", "fused")
         if token is None or config not in _VALID_CONFIGS:
             continue
-        case_id = f"{_safe_id(token)}__{config}"
-        case_ids.add(case_id)
+        case_ids.add(f"{_safe_id(token)}__{config}")
         subtypes[lstv] += 1
-
     if not case_ids:
         return None
     return case_ids, subtypes
 
 
 def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
-    """
-    Last-resort fallback: scan labelsTr/ for cases containing L6
-    voxels. Catches lumbarization but NOT sacralization. Used only
-    when no lstv_cases.json or manifest is reachable.
-    """
     import nibabel as nib
     out: Set[str] = set()
     if not os.path.isdir(labels_dir):
         return out
-    files = [f for f in sorted(os.listdir(labels_dir)) if f.endswith(".nii.gz")]
-    for fn in files:
+    for fn in sorted(os.listdir(labels_dir)):
+        if not fn.endswith(".nii.gz"):
+            continue
         try:
             arr = np.asarray(nib.load(join(labels_dir, fn)).dataobj).astype(np.int16)
             if np.any(arr == _L6_LABEL_ID):
@@ -302,15 +308,18 @@ def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
 
 
 # =============================================================================
-# W&B mixin
+# W&B mixin (with perf-tuning, profiler, channels_last hooks)
 # =============================================================================
 
 class _WandBMixin:
-    """Mixin: wandb + disk-based metric source + val-export toggle."""
-
     _wandb_run = None
     _metric_cache = None
     _intercepted_objects = None
+    _profiler = None
+    _profiler_total_steps = 0
+    _profiler_step_count = 0
+    _perf_tuning_installed = False
+    _channels_last_active = False
 
     def _progress_json_path(self) -> Optional[str]:
         out = getattr(self, "output_folder", None)
@@ -419,8 +428,165 @@ class _WandBMixin:
                 f"WandB diag: SPINESURG_RUN_VAL_EXPORT = "
                 f"{os.environ.get('SPINESURG_RUN_VAL_EXPORT', '<unset>')}  "
                 f"(effective = {_env_truthy('SPINESURG_RUN_VAL_EXPORT')})")
+            self.print_to_log_file(
+                f"WandB diag: nnUNet_compile = "
+                f"{os.environ.get('nnUNet_compile', '<unset>')}")
         except Exception:
             pass
+
+    # ---- Perf tuning -----------------------------------------------------
+
+    def _maybe_install_perf_tuning(self) -> None:
+        if os.environ.get("SPINESURG_PERF", "1").strip().lower() in ("0", "false", "off", "no"):
+            self.print_to_log_file("Perf tuning: DISABLED via SPINESURG_PERF=0")
+            return
+        try:
+            _install_perf_tuning()
+            self._perf_tuning_installed = True
+            self.print_to_log_file(
+                "Perf tuning: ENABLED (cudnn.benchmark, tf32)")
+        except Exception as exc:
+            self.print_to_log_file(f"Perf tuning: install failed: {exc}")
+
+    def _restore_perf_tuning_safe(self) -> None:
+        # No-op in v7.2 (no monkey patches to restore)
+        pass
+
+    # ---- channels_last_3d (opt-in) ---------------------------------------
+
+    def _maybe_apply_channels_last(self) -> None:
+        """
+        Convert the network to channels_last_3d memory format.
+
+        WARNING: empirically slower on ResEnc UNet + 3D instance norms.
+        See v7 changelog. Left in for future experiments / different
+        models. Off by default.
+        """
+        if not _env_truthy("SPINESURG_CHANNELS_LAST"):
+            return
+        net = getattr(self, "network", None)
+        if net is None:
+            self.print_to_log_file(
+                "channels_last_3d: self.network is None; skipping.")
+            return
+        try:
+            net.to(memory_format=torch.channels_last_3d)
+            self._channels_last_active = True
+            self.print_to_log_file(
+                "channels_last_3d: model converted. "
+                "Per-batch input conversion in train_step / validation_step.")
+            self.print_to_log_file(
+                "channels_last_3d: WARNING -- empirically SLOWER on "
+                "this model due to 3D instance norm forcing layout "
+                "reshuffles. Use only for experimentation.")
+        except Exception as exc:
+            self.print_to_log_file(
+                f"channels_last_3d: conversion failed: {exc}. Disabling.")
+            self._channels_last_active = False
+
+    # ---- Profiler --------------------------------------------------------
+
+    def _maybe_install_profiler(self) -> None:
+        if not _env_truthy("SPINESURG_PROFILE"):
+            return
+        try:
+            from torch.profiler import (
+                profile, schedule, tensorboard_trace_handler, ProfilerActivity
+            )
+        except ImportError:
+            self.print_to_log_file("Profile: torch.profiler not available; skipping.")
+            return
+
+        out_dir = join(self.output_folder, "profile")
+        os.makedirs(out_dir, exist_ok=True)
+
+        wait_steps   = _env_int("SPINESURG_PROFILE_WAIT",   5)
+        warmup_steps = _env_int("SPINESURG_PROFILE_WARMUP", 3)
+        active_steps = _env_int("SPINESURG_PROFILE_ACTIVE", 10)
+
+        try:
+            self._profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(
+                    wait=wait_steps, warmup=warmup_steps,
+                    active=active_steps, repeat=1,
+                ),
+                on_trace_ready=tensorboard_trace_handler(out_dir),
+                record_shapes=True,
+                with_stack=False,
+                profile_memory=False,
+            )
+            self._profiler.start()
+            self._profiler_total_steps = wait_steps + warmup_steps + active_steps
+            self._profiler_step_count = 0
+            self.print_to_log_file(
+                f"Profile: ENABLED "
+                f"(wait={wait_steps} warmup={warmup_steps} active={active_steps}, "
+                f"total {self._profiler_total_steps} steps)")
+            self.print_to_log_file(f"Profile: trace dir = {out_dir}")
+        except Exception as exc:
+            self.print_to_log_file(f"Profile: install failed: {exc}")
+            self._profiler = None
+
+    def _stop_profiler(self) -> None:
+        prof = getattr(self, "_profiler", None)
+        if prof is None:
+            return
+        try:
+            self.print_to_log_file("=" * 70)
+            self.print_to_log_file("Profile summary -- top 25 ops by CUDA total time:")
+            self.print_to_log_file(prof.key_averages().table(
+                sort_by="cuda_time_total", row_limit=25))
+            self.print_to_log_file("-" * 70)
+            self.print_to_log_file("Profile summary -- top 25 ops by CPU total time:")
+            self.print_to_log_file(prof.key_averages().table(
+                sort_by="cpu_time_total", row_limit=25))
+            self.print_to_log_file("=" * 70)
+            prof.stop()
+            self.print_to_log_file(
+                "Profile: stopped. Training continues without overhead.")
+        except Exception as exc:
+            self.print_to_log_file(f"Profile: stop failed: {exc}")
+        self._profiler = None
+
+    # ---- train_step / validation_step wrappers --------------------------
+
+    def train_step(self, batch):  # type: ignore[override]
+        if self._channels_last_active and isinstance(batch, dict) and 'data' in batch:
+            try:
+                d = batch['data']
+                if isinstance(d, torch.Tensor) and d.dim() == 5:
+                    batch['data'] = d.contiguous(memory_format=torch.channels_last_3d)
+            except Exception:
+                pass
+
+        result = super().train_step(batch)
+
+        prof = getattr(self, "_profiler", None)
+        if prof is not None:
+            try:
+                prof.step()
+                self._profiler_step_count += 1
+                if self._profiler_step_count >= self._profiler_total_steps:
+                    self._stop_profiler()
+            except Exception as exc:
+                try:
+                    self.print_to_log_file(f"Profile: step failed: {exc}")
+                except Exception:
+                    pass
+        return result
+
+    def validation_step(self, batch):  # type: ignore[override]
+        if self._channels_last_active and isinstance(batch, dict) and 'data' in batch:
+            try:
+                d = batch['data']
+                if isinstance(d, torch.Tensor) and d.dim() == 5:
+                    batch['data'] = d.contiguous(memory_format=torch.channels_last_3d)
+            except Exception:
+                pass
+        return super().validation_step(batch)
+
+    # ---- W&B init / log / finish ----------------------------------------
 
     def _init_wandb(self) -> None:
         if self._wandb_run is not None:
@@ -445,7 +611,12 @@ class _WandBMixin:
 
         config = {"trainer": self.__class__.__name__,
                   "anatomy_mapping": dict(enumerate(_ANATOMY_NAMES)),
-                  "run_val_export": _env_truthy("SPINESURG_RUN_VAL_EXPORT")}
+                  "run_val_export": _env_truthy("SPINESURG_RUN_VAL_EXPORT"),
+                  "profile_enabled": _env_truthy("SPINESURG_PROFILE"),
+                  "channels_last_3d": _env_truthy("SPINESURG_CHANNELS_LAST"),
+                  "compile_enabled": os.environ.get("nnUNet_compile", "<default>"),
+                  "perf_tuning":
+                      os.environ.get("SPINESURG_PERF", "1") != "0"}
         for attr, getter in [
             ("dataset",      lambda: self.plans_manager.dataset_name),
             ("plans",        lambda: self.plans_manager.plans_name),
@@ -497,8 +668,7 @@ class _WandBMixin:
 
         if allow_offline:
             try:
-                self.print_to_log_file("WandB: falling back to OFFLINE mode. "
-                                       "Sync later with `wandb sync <run_dir>`.")
+                self.print_to_log_file("WandB: falling back to OFFLINE mode.")
                 os.environ["WANDB_MODE"] = "offline"
                 self._wandb_run = wandb.init(
                     project=os.environ.get("WANDB_PROJECT", "SpineSurg-CT"),
@@ -509,11 +679,8 @@ class _WandBMixin:
                     config=config,
                     mode="offline",
                 )
-                self.print_to_log_file(
-                    f"WandB: offline run created at "
-                    f"{getattr(self._wandb_run, 'dir', '<unknown>')}")
             except Exception as exc:
-                self.print_to_log_file(f"WandB offline fallback also failed: {exc}")
+                self.print_to_log_file(f"WandB offline fallback failed: {exc}")
                 self._wandb_run = None
         else:
             self.print_to_log_file("WandB: offline fallback disabled; continuing without logging.")
@@ -541,8 +708,16 @@ class _WandBMixin:
             pass
         self._wandb_run = None
 
+    # ---- Lifecycle hooks -------------------------------------------------
+
     def on_train_start(self):  # type: ignore[override]
+        try:
+            self._maybe_install_perf_tuning()
+        except Exception as exc:
+            print(f"[perf] perf-tuning failed: {exc}", flush=True)
+
         super().on_train_start()
+
         try:
             _install_nnunet_warning_filter()
         except Exception:
@@ -555,6 +730,20 @@ class _WandBMixin:
             self._install_log_intercepts()
         except Exception:
             pass
+        try:
+            self._maybe_apply_channels_last()
+        except Exception as exc:
+            try:
+                self.print_to_log_file(f"channels_last_3d: failed: {exc}")
+            except Exception:
+                pass
+        try:
+            self._maybe_install_profiler()
+        except Exception as exc:
+            try:
+                self.print_to_log_file(f"Profile: install failed: {exc}")
+            except Exception:
+                pass
         try:
             self._init_wandb()
         except Exception as exc:
@@ -690,6 +879,14 @@ class _WandBMixin:
             self._finish_wandb()
         except Exception:
             pass
+        try:
+            self._stop_profiler()
+        except Exception:
+            pass
+        try:
+            self._restore_perf_tuning_safe()
+        except Exception:
+            pass
 
     def perform_actual_validation(self, save_probabilities: bool = False):  # type: ignore[override]
         if _env_truthy("SPINESURG_RUN_VAL_EXPORT"):
@@ -715,12 +912,12 @@ def _as_float(x):
 
 
 # =============================================================================
-# LSTV oversampling mixin (v3)
+# LSTV oversampling mixin
 # =============================================================================
 
 class _LSTVOversampleMixin:
     """
-    Oversample cases with lstv_label != "normal" at the dataloader level.
+    Oversample lstv_label != "normal" cases at the dataloader level.
     Covers BOTH lumbarization and sacralization.
 
     Detection precedence (first hit wins):
@@ -729,15 +926,11 @@ class _LSTVOversampleMixin:
       c) Live HF manifest scan (HF_EXPORT_DIR or auto-detect)
       d) Legacy L6-voxel scan over labelsTr (lumbarization only)
 
-    Env vars
-    --------
-        LSTV_OVERSAMPLE_FRAC    target fraction of training keys that
-                                are LSTV cases. Default 0.5; capped at
-                                0.95 to avoid divide-by-zero.
-        HF_EXPORT_DIR           override HF export path for fallback (c).
-        LSTV_LABELS_DIR         override labelsTr path for fallback (d).
+    Env vars:
+        LSTV_OVERSAMPLE_FRAC  target fraction (default 0.5, capped 0.95)
+        HF_EXPORT_DIR         override HF export path
+        LSTV_LABELS_DIR       override labelsTr path
 
-    The mixin composes with _WandBMixin via super() chain.
     MRO: _LSTVOversampleMixin -> _WandBMixin -> nnUNetTrainer
     """
 
@@ -745,22 +938,13 @@ class _LSTVOversampleMixin:
     _lstv_subtype_counts: Optional[Counter] = None
     _lstv_detection_source: Optional[str] = None
 
-    # ---- LSTV case detection ---------------------------------------------
-
     def _identify_lstv_cases(self) -> Set[str]:
-        """
-        Resolve the set of nnU-Net case_ids that should be oversampled.
-        Caches the result across calls within the same trainer instance.
-        """
         if self._lstv_case_ids is not None:
             return self._lstv_case_ids
-
         try:
             ds_name = self.plans_manager.dataset_name
         except Exception:
             ds_name = None
-
-        # Path A/B: lstv_cases.json from preprocessed/ or raw/
         if ds_name:
             for json_path in _candidate_lstv_json_paths(ds_name):
                 self.print_to_log_file(
@@ -775,8 +959,6 @@ class _LSTVOversampleMixin:
                         f"LSTV oversample: loaded {len(ids)} case_ids from "
                         f"{json_path.name}. Subtypes: {dict(subtypes)}")
                     return ids
-
-        # Path C: live HF manifest scan
         for hf_dir in _candidate_hf_export_dirs():
             self.print_to_log_file(
                 f"LSTV oversample: checking manifest path {hf_dir}")
@@ -791,8 +973,6 @@ class _LSTVOversampleMixin:
                     f"found {len(ids)} LSTV case_ids. "
                     f"Subtypes: {dict(subtypes)}")
                 return ids
-
-        # Path D: legacy L6-voxel scan (lumbarization only)
         self.print_to_log_file(
             "LSTV oversample: no lstv_cases.json or manifest found; "
             "falling back to L6-voxel scan (CAUTION: misses sacralization).")
@@ -802,7 +982,6 @@ class _LSTVOversampleMixin:
                 "LSTV oversample: cannot locate labelsTr either; disabling.")
             self._lstv_case_ids = set()
             return self._lstv_case_ids
-
         t0 = time.time()
         ids = _scan_lstv_case_ids_by_l6_voxels(labels_dir)
         self._lstv_case_ids = ids
@@ -828,42 +1007,27 @@ class _LSTVOversampleMixin:
                 pass
         return None
 
-    # ---- Sampler patch ---------------------------------------------------
-
     def _apply_lstv_sampler(self) -> None:
-        """
-        Patch the training dataloader so LSTV cases are drawn at
-        probability ~ LSTV_OVERSAMPLE_FRAC. Implementation: duplicate
-        LSTV case keys in the dataloader's underlying key list.
-        """
         try:
             frac = float(os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.5"))
         except ValueError:
             self.print_to_log_file(
                 "LSTV oversample: invalid LSTV_OVERSAMPLE_FRAC; using 0.5")
             frac = 0.5
-        # Cap below 1.0 to avoid divide-by-zero AND because 100% LSTV
-        # defeats nnU-Net's normal/abnormal mixed exposure.
         frac = max(0.0, min(0.95, frac))
         if frac <= 0:
             self.print_to_log_file("LSTV oversample: frac=0, no-op.")
             return
-
         lstv_ids = self._identify_lstv_cases()
         if not lstv_ids:
             self.print_to_log_file("LSTV oversample: no LSTV cases identified, no-op.")
             return
-
         tr_dataset = getattr(self, "dataloader_train", None)
         if tr_dataset is None:
             self.print_to_log_file(
                 "LSTV oversample: self.dataloader_train is None at "
                 "on_train_start; patching impossible.")
             return
-
-        # Try every known attribute path for the case-id list across
-        # nnU-Net versions. v2.5+ uses 'identifiers'; earlier versions
-        # used 'keys'. Generator wrapping varies between releases.
         keys_attr_paths = [
             ("generator", "_data", "identifiers"),
             ("generator", "_data", "keys"),
@@ -912,32 +1076,25 @@ class _LSTVOversampleMixin:
             else:
                 traversal_log.append(
                     f"  {'.'.join(path)} attribute missing")
-
         if keys_list is None:
             self.print_to_log_file(
                 f"LSTV oversample: could not locate dataloader key list. "
                 f"Traversal: {traversal_log}. Framework internals may have "
                 f"changed; oversampling DISABLED for this run.")
             return
-
         original_n = len(keys_list)
         lstv_in_keys = [k for k in keys_list if k in lstv_ids]
-
         if not lstv_in_keys:
             self.print_to_log_file(
                 "LSTV oversample: no LSTV cases present in this fold's "
                 "training split; no-op.")
             return
-
         p = len(lstv_in_keys) / original_n
         if p >= frac:
             self.print_to_log_file(
                 f"LSTV oversample: natural LSTV fraction {p:.3f} >= target "
                 f"{frac:.3f}; no duplication needed.")
             return
-
-        # Solve for D such that (count + D) / (N + D) = frac
-        #   D = (frac * N - count) / (1 - frac)
         needed_total = int(round(
             (frac * original_n - len(lstv_in_keys)) / (1.0 - frac)))
         needed_total = max(1, needed_total)
@@ -945,9 +1102,6 @@ class _LSTVOversampleMixin:
             lstv_in_keys[i % len(lstv_in_keys)] for i in range(needed_total)
         ]
         new_keys = keys_list + duplicates
-
-        # Verify the assignment took (some attributes are properties
-        # without setters, or wrap immutable containers).
         try:
             setattr(keys_owner, keys_attr, new_keys)
             verify = list(getattr(keys_owner, keys_attr))
@@ -956,19 +1110,15 @@ class _LSTVOversampleMixin:
                 f"LSTV oversample: setattr({keys_attr}) failed: {exc}. "
                 f"Cannot patch dataloader; oversampling DISABLED.")
             return
-
         if len(verify) != len(new_keys):
             self.print_to_log_file(
                 f"LSTV oversample: WARNING — set {len(new_keys)} keys but "
-                f"dataloader reports {len(verify)}. Possible silent dedup; "
-                f"oversampling may be ineffective.")
-
+                f"dataloader reports {len(verify)}.")
         achieved = (len(lstv_in_keys) + len(duplicates)) / max(1, len(verify))
         unique_lstv = len(set(lstv_in_keys))
         avg_dup_factor = (
             (len(lstv_in_keys) + len(duplicates)) / max(1, unique_lstv)
         )
-
         self.print_to_log_file(
             f"LSTV oversample: source={self._lstv_detection_source}")
         self.print_to_log_file(
@@ -981,12 +1131,10 @@ class _LSTVOversampleMixin:
         if avg_dup_factor > 25:
             self.print_to_log_file(
                 f"LSTV oversample: WARNING — each unique LSTV case is "
-                f"duplicated {avg_dup_factor:.0f}x. High overfitting risk. "
-                f"Consider lowering LSTV_OVERSAMPLE_FRAC or accept that "
-                f"LSTV val Dice may not generalize.")
+                f"duplicated {avg_dup_factor:.0f}x. High overfitting risk.")
 
     def on_train_start(self):  # type: ignore[override]
-        super().on_train_start()  # _WandBMixin runs first via MRO
+        super().on_train_start()
         try:
             self._apply_lstv_sampler()
         except Exception as exc:
@@ -999,6 +1147,12 @@ class _LSTVOversampleMixin:
 # =============================================================================
 # Concrete trainer classes
 # =============================================================================
+#
+# IMPORTANT: any trainer subclass that overrides __init__ must declare
+# the FULL nnUNetTrainer signature explicitly. Using *args/**kwargs
+# breaks nnUNetTrainer's inspect-based init kwargs capture.
+# =============================================================================
+
 
 class nnUNetTrainerWandB(_WandBMixin, nnUNetTrainer):
     """Default-length nnU-Net training + W&B."""
@@ -1014,23 +1168,32 @@ class nnUNetTrainerWandB_100epochs(_WandBMixin, nnUNetTrainer_100epochs):
 
 
 class nnUNetTrainerWandB_500epochs(_WandBMixin, nnUNetTrainer):
-    """500 epochs (default 250 iter/epoch). Recommended ML4H baseline."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    """500 epochs (default 250 iter/epoch)."""
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json,
+                         unpack_dataset, device)
         self.num_epochs = 500
 
 
 class nnUNetTrainerWandB_1000epochs(_WandBMixin, nnUNetTrainer):
-    """Explicit 1000-epoch variant."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    """1000 epochs (default 250 iter/epoch)."""
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json,
+                         unpack_dataset, device)
         self.num_epochs = 1000
 
 
 class nnUNetTrainerWandB_1000ep_500iter(_WandBMixin, nnUNetTrainer):
     """1000 epochs, 500 iter/epoch (2x default coverage per epoch)."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json,
+                         unpack_dataset, device)
         self.num_epochs = 1000
         self.num_iterations_per_epoch = 500
         self.num_val_iterations_per_epoch = 50
@@ -1039,24 +1202,26 @@ class nnUNetTrainerWandB_1000ep_500iter(_WandBMixin, nnUNetTrainer):
 class nnUNetTrainerWandB_500ep_LSTVOversample(
     _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
 ):
-    """500 epochs + LSTV-case oversampling (covers both subtypes)."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    """500 epochs + LSTV oversampling. DEFAULT TRAINER for the SpineSurg-CT
+    paper run. 500 ep × 250 iter = 125k training steps."""
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json,
+                         unpack_dataset, device)
         self.num_epochs = 500
 
 
 class nnUNetTrainerWandB_1000ep_LSTVOversample(
     _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
 ):
-    """
-    1000 epochs, 500 iter/epoch, LSTV-case oversampling (both subtypes).
+    """1000 epochs + LSTV oversampling (default 250 iter/epoch).
 
     MRO: _LSTVOversampleMixin -> _WandBMixin -> nnUNetTrainer
-    Both mixins override on_train_start; _LSTVOversampleMixin calls super()
-    so _WandBMixin and the base both run, then LSTV patching happens.
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json,
+                         unpack_dataset, device)
         self.num_epochs = 1000
-        self.num_iterations_per_epoch = 500
-        self.num_val_iterations_per_epoch = 50
