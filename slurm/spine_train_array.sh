@@ -32,7 +32,8 @@
 #   - 24 DA workers (matches cpus-per-task)
 #   - cudnn.benchmark + TF32 (small free wins)
 #   - Default torch.compile (mode='default'; reduce-overhead breaks val)
-#   - LSTV oversampling 50% target (both subtypes)
+#   - LSTV oversampling 25% target (lowered from 50% in v8 to reduce
+#     per-case duplication factor from ~20x to ~9x; lower overfitting risk)
 #   - Per-fold persistent compile cache (survives requeues)
 #   - SKIP-IF-DONE markers for scrub + preunpack
 #
@@ -46,6 +47,16 @@
 #
 # Override trainer:
 #     TRAINER=nnUNetTrainerWandB_1000ep_LSTVOversample sbatch slurm/spine_train_array.sh
+#
+# Override LSTV oversample fraction:
+#     LSTV_OVERSAMPLE_FRAC=0.5 sbatch slurm/spine_train_array.sh
+#
+# Override W&B run-ID tag (e.g. when iterating after a wipe):
+#     WANDB_RUN_TAG=v8_strat25 sbatch slurm/spine_train_array.sh
+#     -> run IDs become Dataset802_..._v8_strat25_f0 ... _f4
+#     If unset, defaults to the SLURM array-job ID (always unique per
+#     submission), so colliding with deleted-but-zombie cloud runs
+#     doesn't happen unless the user pins a tag they've used before.
 #
 # Profile (capture step CPU+CUDA, ~3min profile window):
 #     SPINESURG_PROFILE=1 sbatch --array=0 slurm/spine_train_array.sh
@@ -117,7 +128,28 @@ export SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT:-0}"
 export WANDB_INIT_MAX_RETRIES="${WANDB_INIT_MAX_RETRIES:-5}"
 export WANDB_INIT_TIMEOUT_SEC="${WANDB_INIT_TIMEOUT_SEC:-180}"
 export WANDB_ALLOW_OFFLINE="${WANDB_ALLOW_OFFLINE:-1}"
-export LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC:-0.5}"
+export LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC:-0.25}"
+
+# W&B run ID/name tag.
+#
+# Why a tag exists at all: WANDB_RUN_ID is the cloud-side primary key for a
+# run. A deterministic ID (dataset__trainer__plans__fold) means every rerun
+# RESUMES the same run -- which seems great until you delete a run on the
+# cloud, after which the next launch's `wandb.init(id=..., resume="allow")`
+# can hang for several minutes hitting cloud-side cleanup state. It also
+# means that if the previous run wrote progress.json up to step N, the new
+# run rejects step writes <N as "non-monotonic" until the new training
+# catches up.
+#
+# Solution: append a tag to the run ID. Default tag = SLURM_ARRAY_JOB_ID,
+# which is always unique per submission and shared across all 5 folds in
+# the same array (so the 5 runs are visually grouped in the W&B UI).
+#
+# To use a human-friendly tag (e.g. when re-running after wiping the W&B
+# project), pass WANDB_RUN_TAG explicitly:
+#     WANDB_RUN_TAG=v8_strat25 sbatch slurm/spine_train_array.sh
+WANDB_RUN_TAG="${WANDB_RUN_TAG:-${ARRAY_JOB}}"
+export WANDB_RUN_TAG
 
 # Perf tuning toggle (cudnn.benchmark + TF32 only)
 export SPINESURG_PERF="${SPINESURG_PERF:-1}"
@@ -342,8 +374,11 @@ export SINGULARITYENV_nnUNet_n_proc_DA="${NNUNET_DA_WORKERS}"
 export SINGULARITYENV_SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}"
 export SINGULARITYENV_WANDB_API_KEY="${WANDB_API_KEY}"
 export SINGULARITYENV_WANDB_PROJECT="SpineSurg-CT"
-export SINGULARITYENV_WANDB_RUN_ID="${DS_DIR_NAME}_${TRAINER}_${PLANS}_f${FOLD}"
-export SINGULARITYENV_WANDB_RUN_NAME="${DS_DIR_NAME}_${TRAINER}_${PLANS}_f${FOLD}"
+# W&B run ID/name now incorporate WANDB_RUN_TAG so reruns don't collide
+# with deleted/zombie cloud runs. See the WANDB_RUN_TAG comment block
+# above for the full rationale.
+export SINGULARITYENV_WANDB_RUN_ID="${DS_DIR_NAME}_${TRAINER}_${PLANS}_${WANDB_RUN_TAG}_f${FOLD}"
+export SINGULARITYENV_WANDB_RUN_NAME="${DS_DIR_NAME}_${TRAINER}_${PLANS}_${WANDB_RUN_TAG}_f${FOLD}"
 export SINGULARITYENV_WANDB_INIT_MAX_RETRIES="${WANDB_INIT_MAX_RETRIES}"
 export SINGULARITYENV_WANDB_INIT_TIMEOUT_SEC="${WANDB_INIT_TIMEOUT_SEC}"
 export SINGULARITYENV_WANDB_ALLOW_OFFLINE="${WANDB_ALLOW_OFFLINE}"
@@ -389,6 +424,8 @@ echo "   cpus alloc    : ${SLURM_CPUS_PER_TASK:-?}"
 echo "   trainer       : ${TRAINER}"
 echo "   plans         : ${PLANS}"
 echo "   LSTV frac     : ${LSTV_OVERSAMPLE_FRAC}"
+echo "   wandb run id  : ${SINGULARITYENV_WANDB_RUN_ID}"
+echo "   wandb tag     : ${WANDB_RUN_TAG}"
 echo "   data source   : NFS direct (${NFS_PREP_DATA_DIR})"
 echo "   workers       : preunpack=${PREUNPACK_WORKERS}  da=${NNUNET_DA_WORKERS}  export=${NNUNET_EXPORT_POOL}"
 echo "   compile cache : ${PERSISTENT_CACHE} (${CACHE_FILES} files, ${CACHE_SIZE:-0})"

@@ -1,22 +1,50 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (FINAL)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v8 FINAL)
 tools/nnunet_wandb_variant.py
 
-What's on
-=========
+Changes from v7.2 (FINAL)
+=========================
+1. LSTV_OVERSAMPLE_FRAC default lowered from 0.50 to 0.25.
+   - At 50% target frac with 19 lumbarization + 27 sacralization cases
+     we were duplicating each unique LSTV case ~20x per epoch, which
+     is high overfitting risk on rare classes.
+   - At 25% the duplication factor drops to ~9x, still oversampling
+     enough to give the model meaningful exposure to LSTV anatomy
+     while leaving room for the augmentation pipeline to introduce
+     novel views of each case rather than just memorizing them.
+   - Override at runtime via LSTV_OVERSAMPLE_FRAC=0.50 if needed.
+
+2. Per-LSTV-subgroup validation dice logging.
+   - Splits val cases into 'normal', 'lumbarization', 'sacralization'
+     based on lstv_cases.json subtype tags.
+   - Computes per-class dice on each val case independently, tagged
+     with its subgroup.
+   - Logs to W&B as:
+         val/lstv_subgroup/{subtype}/dice/{class_name}
+         val/lstv_subgroup/{subtype}/n_cases
+         val/lstv_subgroup/{subtype}/mean_lumbar_dice
+         val/lstv_subgroup/{subtype}/mean_pelvis_dice
+   - Also logs L6 dice on lumbarization-only cases as the headline
+     "rare class" metric since this is the paper's key claim.
+   - Existing global dice logging is unchanged; this is additive.
+   - Disable with SPINESURG_LSTV_PER_GROUP_DICE=0 if computation
+     overhead becomes a problem (it shouldn't; per-case dice on
+     val patches is cheap).
+
+What's on (unchanged from v7.2)
+================================
 1. cudnn.benchmark = True
-2. set_float32_matmul_precision('high') (TF32 for fp32 matmul; norm stats)
+2. set_float32_matmul_precision('high') (TF32 for fp32 matmul)
 3. Profiler hooks (opt-in via SPINESURG_PROFILE=1)
-4. channels_last_3d toggle (opt-in via SPINESURG_CHANNELS_LAST=1)
-   -- WARNING: empirically slower on ResEnc UNet + 3D instance norms
+4. channels_last_3d toggle (opt-in; empirically slower)
 5. LSTV oversampling for both subtypes (sacralization + lumbarization)
 6. W&B init with retry + offline fallback
 7. NaN-safe dice aggregation
 8. SPINESURG_RUN_VAL_EXPORT toggle for perform_actual_validation
 9. SPINESURG_PERF=0 escape hatch to disable perf tuning
 
-What's NOT on (and why)
-=======================
+What's NOT on (unchanged from v7.2)
+====================================
 - torch.compile mode='reduce-overhead' / CUDA graphs:
   Deep supervision returns a list of tensors; validation reuses these
   after forward returns. CUDA graphs reuse output buffers, which gets
@@ -83,9 +111,19 @@ _ANATOMY_NAMES = [
     "sacrum", "left_hip", "right_hip",
 ]
 
-_L6_LABEL_ID = 6
-_IGNORE_LABEL = 10
-_VALID_CONFIGS = ("fused", "spine_only", "pelvic_native")
+# Class IDs in the segmentation map (matches CLASS_NAMES in
+# tools/convert_hf_to_nnunet.py). 0 = background, 1-6 = lumbar, 7-9 = pelvis,
+# 10 = ignore.
+_FG_CLASS_IDS    = list(range(1, 10))     # 9 foreground classes
+_LUMBAR_IDS      = list(range(1, 7))      # L1..L6
+_PELVIS_IDS      = list(range(7, 10))     # sacrum, hips
+_L6_LABEL_ID     = 6
+_IGNORE_LABEL    = 10
+_VALID_CONFIGS   = ("fused", "spine_only", "pelvic_native")
+_SUBTYPE_NORMAL  = "normal"
+_SUBTYPE_LUMB    = "lumbarization"
+_SUBTYPE_SACR    = "sacralization"
+_KNOWN_SUBTYPES  = (_SUBTYPE_NORMAL, _SUBTYPE_LUMB, _SUBTYPE_SACR)
 LSTV_CASES_SCHEMA_VERSION = 1
 
 
@@ -169,7 +207,14 @@ def _safe_id(token: str) -> str:
 
 
 def _read_lstv_cases_json(json_path: Path
-                           ) -> Optional[Tuple[Set[str], Counter]]:
+                           ) -> Optional[Tuple[Set[str], Counter, Dict[str, str]]]:
+    """
+    Returns (case_id_set, subtype_counts, case_id_to_subtype_map) or None.
+
+    The third element is needed by the per-subgroup dice logger so each
+    case_id can be classified into 'normal' / 'lumbarization' /
+    'sacralization' on the fly during validation.
+    """
     if not json_path.exists():
         return None
     try:
@@ -185,10 +230,28 @@ def _read_lstv_cases_json(json_path: Path
         return None
     case_ids = set(case_ids_dict.keys())
     subtype_counts = Counter()
+    case_to_subtype: Dict[str, str] = {}
     for cid, subtype in case_ids_dict.items():
-        if isinstance(subtype, str) and subtype:
-            subtype_counts[subtype.lower()] += 1
-    return case_ids, subtype_counts
+        if not isinstance(subtype, str):
+            continue
+        sub = subtype.strip().lower()
+        if not sub:
+            continue
+        # Normalize subtype to the canonical set; partial matches are OK
+        if "lumb" in sub:
+            sub_canon = _SUBTYPE_LUMB
+        elif "sacr" in sub:
+            sub_canon = _SUBTYPE_SACR
+        elif sub == "normal":
+            sub_canon = _SUBTYPE_NORMAL
+        else:
+            # Unknown subtype label — log it but include it as an "lstv"
+            # bucket so it's not lost. Falls into 'normal' for grouping
+            # since we don't know which way to bin it.
+            sub_canon = sub
+        subtype_counts[sub_canon] += 1
+        case_to_subtype[cid] = sub_canon
+    return case_ids, subtype_counts, case_to_subtype
 
 
 def _candidate_lstv_json_paths(dataset_name: str) -> List[Path]:
@@ -225,7 +288,7 @@ def _candidate_hf_export_dirs() -> List[Path]:
 
 
 def _read_lstv_records_from_manifest(hf_export_dir: Path
-                                      ) -> Optional[Tuple[Set[str], Counter]]:
+                                      ) -> Optional[Tuple[Set[str], Counter, Dict[str, str]]]:
     if not hf_export_dir.is_dir():
         return None
     records: List[Dict] = []
@@ -256,6 +319,7 @@ def _read_lstv_records_from_manifest(hf_export_dir: Path
         return None
     case_ids: Set[str] = set()
     subtypes: Counter = Counter()
+    case_to_subtype: Dict[str, str] = {}
     for r in records:
         lstv = str(r.get("lstv_label", "")).strip().lower()
         if not lstv or lstv == "normal":
@@ -264,11 +328,19 @@ def _read_lstv_records_from_manifest(hf_export_dir: Path
         config = r.get("config", "fused")
         if token is None or config not in _VALID_CONFIGS:
             continue
-        case_ids.add(f"{_safe_id(token)}__{config}")
-        subtypes[lstv] += 1
+        cid = f"{_safe_id(token)}__{config}"
+        case_ids.add(cid)
+        if "lumb" in lstv:
+            sub = _SUBTYPE_LUMB
+        elif "sacr" in lstv:
+            sub = _SUBTYPE_SACR
+        else:
+            sub = lstv
+        subtypes[sub] += 1
+        case_to_subtype[cid] = sub
     if not case_ids:
         return None
-    return case_ids, subtypes
+    return case_ids, subtypes, case_to_subtype
 
 
 def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
@@ -289,6 +361,58 @@ def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
 
 
 # =============================================================================
+# Per-case dice (used by the per-subgroup validation logger)
+# =============================================================================
+
+def _per_case_dice_per_class(pred_argmax: torch.Tensor,
+                              gt: torch.Tensor,
+                              ignore_label: int = _IGNORE_LABEL,
+                              num_classes: int = 10
+                              ) -> List[Optional[float]]:
+    """
+    Compute soft-dice for each non-background class on a single case.
+
+    Args:
+        pred_argmax: (D, H, W) int tensor of predicted class IDs
+        gt:          (D, H, W) int tensor of ground truth class IDs
+        ignore_label: voxels with this GT label are excluded from both
+                      numerator and denominator.
+        num_classes: total class count including background and ignore.
+
+    Returns a list of length len(_FG_CLASS_IDS), with None for classes
+    that have no ground truth voxels in this case (avoids polluting the
+    aggregate with cases that don't contain the class).
+    """
+    pred_argmax = pred_argmax.flatten()
+    gt          = gt.flatten()
+
+    valid = gt != ignore_label
+    if not valid.any():
+        return [None] * len(_FG_CLASS_IDS)
+    pred_argmax = pred_argmax[valid]
+    gt          = gt[valid]
+
+    out: List[Optional[float]] = []
+    for cid in _FG_CLASS_IDS:
+        gt_mask   = gt == cid
+        pred_mask = pred_argmax == cid
+        gt_n   = int(gt_mask.sum().item())
+        if gt_n == 0:
+            # GT has no voxels of this class → dice is undefined for
+            # this case. Skip rather than report 0 or 1.
+            out.append(None)
+            continue
+        pred_n = int(pred_mask.sum().item())
+        inter  = int((gt_mask & pred_mask).sum().item())
+        denom  = gt_n + pred_n
+        if denom == 0:
+            out.append(None)
+        else:
+            out.append(2.0 * inter / denom)
+    return out
+
+
+# =============================================================================
 # W&B mixin (with perf-tuning, profiler, channels_last hooks)
 # =============================================================================
 
@@ -301,6 +425,12 @@ class _WandBMixin:
     _profiler_step_count = 0
     _perf_tuning_installed = False
     _channels_last_active = False
+
+    # Per-subgroup dice tracking (populated each val epoch, cleared in
+    # on_epoch_end after logging).
+    _val_subgroup_dice: Dict[str, List[List[Optional[float]]]] = None
+    _val_case_to_subtype: Optional[Dict[str, str]] = None
+    _per_subgroup_logging_enabled: bool = True
 
     def _progress_json_path(self) -> Optional[str]:
         out = getattr(self, "output_folder", None)
@@ -412,6 +542,10 @@ class _WandBMixin:
             self.print_to_log_file(
                 f"WandB diag: nnUNet_compile = "
                 f"{os.environ.get('nnUNet_compile', '<unset>')}")
+            self.print_to_log_file(
+                f"WandB diag: SPINESURG_LSTV_PER_GROUP_DICE = "
+                f"{os.environ.get('SPINESURG_LSTV_PER_GROUP_DICE', '<unset>')}  "
+                f"(effective = {self._per_subgroup_logging_enabled})")
         except Exception:
             pass
 
@@ -522,6 +656,299 @@ class _WandBMixin:
             self.print_to_log_file(f"Profile: stop failed: {exc}")
         self._profiler = None
 
+    # ---- Per-subgroup val dice setup ------------------------------------
+
+    def _maybe_load_subtype_map(self) -> None:
+        """Load lstv_cases.json into self._val_case_to_subtype.
+
+        Returns silently if disabled, file missing, or already loaded.
+        Cases not in the file are treated as 'normal' at validation time.
+        """
+        self._per_subgroup_logging_enabled = _env_truthy(
+            "SPINESURG_LSTV_PER_GROUP_DICE", default=True)
+        if not self._per_subgroup_logging_enabled:
+            self.print_to_log_file(
+                "LSTV per-subgroup dice: DISABLED via "
+                "SPINESURG_LSTV_PER_GROUP_DICE=0")
+            return
+        if self._val_case_to_subtype is not None:
+            return
+        try:
+            ds_name = self.plans_manager.dataset_name
+        except Exception:
+            ds_name = None
+        case_to_sub: Dict[str, str] = {}
+        if ds_name:
+            for json_path in _candidate_lstv_json_paths(ds_name):
+                result = _read_lstv_cases_json(json_path)
+                if result is not None:
+                    _, _, case_to_sub = result
+                    self.print_to_log_file(
+                        f"LSTV per-subgroup dice: loaded subtype map from "
+                        f"{json_path} ({len(case_to_sub)} LSTV cases)")
+                    break
+        if not case_to_sub:
+            for hf_dir in _candidate_hf_export_dirs():
+                result = _read_lstv_records_from_manifest(hf_dir)
+                if result is not None:
+                    _, _, case_to_sub = result
+                    self.print_to_log_file(
+                        f"LSTV per-subgroup dice: loaded subtype map from "
+                        f"manifests at {hf_dir} ({len(case_to_sub)} LSTV cases)")
+                    break
+        self._val_case_to_subtype = case_to_sub
+        if not case_to_sub:
+            self.print_to_log_file(
+                "LSTV per-subgroup dice: no subtype map found; per-subgroup "
+                "logging will run but all cases will fall into 'normal' bucket.")
+
+    def _reset_subgroup_dice_buffer(self) -> None:
+        self._val_subgroup_dice = {
+            _SUBTYPE_NORMAL: [],
+            _SUBTYPE_LUMB:   [],
+            _SUBTYPE_SACR:   [],
+        }
+
+    def _subtype_for_case(self, case_id: str) -> str:
+        """Return the canonical subtype for a case_id ('normal' if unknown)."""
+        if not self._val_case_to_subtype:
+            return _SUBTYPE_NORMAL
+        return self._val_case_to_subtype.get(case_id, _SUBTYPE_NORMAL)
+
+    def _record_per_case_dice(self, batch, output) -> None:
+        """
+        Compute per-case per-class dice for a validation batch and stash
+        into self._val_subgroup_dice[<subtype>].
+
+        Failure-tolerant: any exception just bails on this batch (we
+        don't want to break training because per-subgroup dice failed).
+        """
+        if not self._per_subgroup_logging_enabled:
+            return
+        if self._val_subgroup_dice is None:
+            self._reset_subgroup_dice_buffer()
+        try:
+            # nnU-Net's deep supervision returns a list of tensors;
+            # the first element is the highest-resolution prediction.
+            if isinstance(output, (list, tuple)):
+                pred_logits = output[0]
+            else:
+                pred_logits = output
+            # gt is "target" in nnU-Net; same deep supervision shape.
+            gt = batch.get("target")
+            if isinstance(gt, (list, tuple)):
+                gt = gt[0]
+            # Extract case_ids robustly. Different nnU-Net versions stash
+            # them as 'keys' (list of str), 'identifier' (list of str),
+            # or sometimes a numpy/torch array. Normalize to a flat
+            # list of strings before any truthiness check -- don't use
+            # `or` on these because a multi-element numpy/torch array
+            # raises "truth value ambiguous" when bool()-checked.
+            keys_raw = batch.get("keys")
+            if keys_raw is None:
+                keys_raw = batch.get("identifier")
+            if keys_raw is None:
+                keys_raw = []
+            if isinstance(keys_raw, str):
+                keys = [keys_raw]
+            elif hasattr(keys_raw, "tolist"):
+                # numpy / torch tensor
+                keys = [str(k) for k in keys_raw.tolist()]
+            else:
+                try:
+                    keys = [str(k) for k in keys_raw]
+                except TypeError:
+                    keys = [str(keys_raw)]
+            if pred_logits is None or gt is None or len(keys) == 0:
+                return
+
+            # pred_logits: (B, C, D, H, W); gt: (B, 1, D, H, W) or (B, D, H, W)
+            if pred_logits.dim() != 5:
+                return
+            if gt.dim() == 5 and gt.size(1) == 1:
+                gt = gt[:, 0]
+            elif gt.dim() != 4:
+                return
+
+            with torch.no_grad():
+                pred_argmax = pred_logits.argmax(dim=1)  # (B, D, H, W)
+
+            B = pred_argmax.size(0)
+            if len(keys) != B:
+                # If we can't map case_ids 1:1 to batch dims, bail.
+                return
+
+            for b in range(B):
+                cid = str(keys[b])
+                # nnU-Net sometimes appends "_0000" to case_ids in keys;
+                # strip it for the subtype lookup since lstv_cases.json
+                # stores plain case_ids.
+                cid_lookup = cid[:-5] if cid.endswith("_0000") else cid
+                subtype = self._subtype_for_case(cid_lookup)
+                dice_per_cls = _per_case_dice_per_class(
+                    pred_argmax[b].cpu().to(torch.int16),
+                    gt[b].cpu().to(torch.int16),
+                )
+                bucket = self._val_subgroup_dice.setdefault(subtype, [])
+                bucket.append(dice_per_cls)
+        except Exception as exc:
+            try:
+                self.print_to_log_file(
+                    f"per-subgroup dice: batch failed silently: {exc}")
+            except Exception:
+                pass
+
+    def _aggregate_subgroup_dice(self) -> Dict[str, float]:
+        """
+        Aggregate the buffered per-case per-class dice into W&B-loggable
+        keys. Returns a flat dict suitable for self._log_wandb().
+        """
+        out: Dict[str, float] = {}
+        if not self._per_subgroup_logging_enabled or self._val_subgroup_dice is None:
+            return out
+
+        for subtype, cases in self._val_subgroup_dice.items():
+            n_cases = len(cases)
+            out[f"val/lstv_subgroup/{subtype}/n_cases"] = float(n_cases)
+            if n_cases == 0:
+                continue
+
+            # Per-class mean dice (nan-mean across cases that had this class)
+            per_class_means: Dict[int, float] = {}
+            for ci, cls_id in enumerate(_FG_CLASS_IDS):
+                vals = [c[ci] for c in cases if c[ci] is not None]
+                if not vals:
+                    continue
+                m = float(np.mean(vals))
+                per_class_means[cls_id] = m
+                cname = _ANATOMY_NAMES[ci]
+                out[f"val/lstv_subgroup/{subtype}/dice/{cname}"] = m
+                out[f"val/lstv_subgroup/{subtype}/n_with_class/{cname}"] = float(len(vals))
+
+            # Group-level summary metrics
+            lumbar_means = [per_class_means[c] for c in _LUMBAR_IDS
+                              if c in per_class_means]
+            pelvis_means = [per_class_means[c] for c in _PELVIS_IDS
+                              if c in per_class_means]
+            fg_means = list(per_class_means.values())
+            if lumbar_means:
+                out[f"val/lstv_subgroup/{subtype}/mean_lumbar_dice"] = float(np.mean(lumbar_means))
+            if pelvis_means:
+                out[f"val/lstv_subgroup/{subtype}/mean_pelvis_dice"] = float(np.mean(pelvis_means))
+            if fg_means:
+                out[f"val/lstv_subgroup/{subtype}/mean_fg_dice"] = float(np.mean(fg_means))
+
+        # Headline metric: L6 dice on lumbarization-only val cases.
+        # This is the paper's key claim — TotalSegmentator can't see L6
+        # because it doesn't exist in their training data; we should.
+        lumb_cases = self._val_subgroup_dice.get(_SUBTYPE_LUMB, [])
+        if lumb_cases:
+            try:
+                l6_idx = _FG_CLASS_IDS.index(_L6_LABEL_ID)
+                l6_vals = [c[l6_idx] for c in lumb_cases if c[l6_idx] is not None]
+                if l6_vals:
+                    out["val/headline/L6_dice_on_lumbarization"] = float(np.mean(l6_vals))
+                    out["val/headline/L6_n_lumbarization_cases"] = float(len(l6_vals))
+            except (ValueError, IndexError):
+                pass
+
+        # Overall foreground dice on LSTV (lumb + sacr) vs normal cases —
+        # useful for spotting train/val gap on rare anatomy.
+        lstv_fg_means: List[float] = []
+        for sub in (_SUBTYPE_LUMB, _SUBTYPE_SACR):
+            cases = self._val_subgroup_dice.get(sub, [])
+            for case_dice in cases:
+                vals = [v for v in case_dice if v is not None]
+                if vals:
+                    lstv_fg_means.append(float(np.mean(vals)))
+        if lstv_fg_means:
+            out["val/lstv_subgroup/lstv_combined/mean_fg_dice"] = float(np.mean(lstv_fg_means))
+            out["val/lstv_subgroup/lstv_combined/n_cases"] = float(len(lstv_fg_means))
+
+        return out
+
+    def _print_per_subgroup_summary(self,
+                                      epoch: int,
+                                      subgroup_payload: Dict[str, float]) -> None:
+        """
+        Print a compact per-epoch per-subgroup dice summary to the SLURM log.
+
+        Format (one block per epoch):
+
+            ─── LSTV per-subgroup val dice (epoch 12) ───
+            normal         (n=94)  mean_fg=0.612  lumb=0.531  pelvis=0.778
+            sacralization  (n=5)   mean_fg=0.541  lumb=0.448  pelvis=0.728
+            lumbarization  (n=4)   mean_fg=0.498  lumb=0.402  pelvis=0.694
+              L6 dice on lumbarization cases: 0.184  (n=4)
+
+        Failure-tolerant: any exception bails silently. Per-subgroup
+        logging should never break training.
+        """
+        try:
+            self.print_to_log_file(
+                f"--- LSTV per-subgroup val dice (epoch {epoch}) ---")
+            for sub in (_SUBTYPE_NORMAL, _SUBTYPE_SACR, _SUBTYPE_LUMB):
+                n_key = f"val/lstv_subgroup/{sub}/n_cases"
+                fg_key = f"val/lstv_subgroup/{sub}/mean_fg_dice"
+                lb_key = f"val/lstv_subgroup/{sub}/mean_lumbar_dice"
+                pv_key = f"val/lstv_subgroup/{sub}/mean_pelvis_dice"
+                n = subgroup_payload.get(n_key)
+                if n is None or n == 0:
+                    self.print_to_log_file(f"  {sub:<14s} (n=0)  no val cases this epoch")
+                    continue
+
+                def _fmt(key):
+                    v = subgroup_payload.get(key)
+                    return f"{v:.3f}" if v is not None else "  n/a"
+
+                self.print_to_log_file(
+                    f"  {sub:<14s} (n={int(n)})  "
+                    f"mean_fg={_fmt(fg_key)}  "
+                    f"lumb={_fmt(lb_key)}  pelvis={_fmt(pv_key)}")
+
+            # Per-class dice for lumbarization (the rare class — most useful
+            # to watch). Only print if we have at least one lumb case.
+            lumb_n = subgroup_payload.get(f"val/lstv_subgroup/{_SUBTYPE_LUMB}/n_cases")
+            if lumb_n and int(lumb_n) > 0:
+                cls_parts = []
+                for cls_name in _ANATOMY_NAMES:
+                    k = f"val/lstv_subgroup/{_SUBTYPE_LUMB}/dice/{cls_name}"
+                    v = subgroup_payload.get(k)
+                    if v is not None:
+                        cls_parts.append(f"{cls_name}={v:.2f}")
+                    else:
+                        cls_parts.append(f"{cls_name}=---")
+                self.print_to_log_file(
+                    f"  lumbarization per-class: [{', '.join(cls_parts)}]")
+
+            # Per-class dice for sacralization (the other rare class).
+            sacr_n = subgroup_payload.get(f"val/lstv_subgroup/{_SUBTYPE_SACR}/n_cases")
+            if sacr_n and int(sacr_n) > 0:
+                cls_parts = []
+                for cls_name in _ANATOMY_NAMES:
+                    k = f"val/lstv_subgroup/{_SUBTYPE_SACR}/dice/{cls_name}"
+                    v = subgroup_payload.get(k)
+                    if v is not None:
+                        cls_parts.append(f"{cls_name}={v:.2f}")
+                    else:
+                        cls_parts.append(f"{cls_name}=---")
+                self.print_to_log_file(
+                    f"  sacralization per-class: [{', '.join(cls_parts)}]")
+
+            # Headline metric: L6 dice on lumbarization cases — paper's key claim
+            l6_dice = subgroup_payload.get("val/headline/L6_dice_on_lumbarization")
+            l6_n    = subgroup_payload.get("val/headline/L6_n_lumbarization_cases")
+            if l6_dice is not None and l6_n is not None:
+                self.print_to_log_file(
+                    f"  HEADLINE: L6 dice on lumbarization cases = "
+                    f"{l6_dice:.3f}  (n={int(l6_n)})")
+        except Exception as exc:
+            try:
+                self.print_to_log_file(
+                    f"per-subgroup summary print failed: {exc}")
+            except Exception:
+                pass
+
     # ---- train_step / validation_step wrappers --------------------------
 
     def train_step(self, batch):  # type: ignore[override]
@@ -557,6 +984,40 @@ class _WandBMixin:
                     batch['data'] = d.contiguous(memory_format=torch.channels_last_3d)
             except Exception:
                 pass
+
+        # Per-subgroup dice path: we need the network output, which the
+        # parent validation_step doesn't return. So we run our own
+        # forward in inference mode to compute per-case dice, then call
+        # the parent for its global aggregation. The double-forward
+        # cost is small relative to validation IO, and only happens
+        # during val (50 iter/epoch by default), not training.
+        if self._per_subgroup_logging_enabled:
+            try:
+                net = getattr(self, "network", None)
+                if net is not None and isinstance(batch, dict) and 'data' in batch:
+                    data = batch['data']
+                    if isinstance(data, torch.Tensor):
+                        # Move to device if needed, matching what nnU-Net
+                        # does internally
+                        device = getattr(self, "device", None)
+                        if device is not None and data.device != device:
+                            data = data.to(device, non_blocking=True)
+                        net.eval()
+                        with torch.no_grad():
+                            with torch.amp.autocast(
+                                device_type=device.type if device is not None else 'cuda',
+                                enabled=True,
+                            ):
+                                output = net(data)
+                        self._record_per_case_dice(batch, output)
+            except Exception as exc:
+                try:
+                    self.print_to_log_file(
+                        f"per-subgroup dice: validation_step pre-forward "
+                        f"failed: {exc}")
+                except Exception:
+                    pass
+
         return super().validation_step(batch)
 
     # ---- W&B init / log / finish ----------------------------------------
@@ -589,7 +1050,9 @@ class _WandBMixin:
                   "channels_last_3d": _env_truthy("SPINESURG_CHANNELS_LAST"),
                   "compile_enabled": os.environ.get("nnUNet_compile", "<default>"),
                   "perf_tuning":
-                      os.environ.get("SPINESURG_PERF", "1") != "0"}
+                      os.environ.get("SPINESURG_PERF", "1") != "0",
+                  "lstv_per_subgroup_dice":
+                      self._per_subgroup_logging_enabled}
         for attr, getter in [
             ("dataset",      lambda: self.plans_manager.dataset_name),
             ("plans",        lambda: self.plans_manager.plans_name),
@@ -608,6 +1071,13 @@ class _WandBMixin:
                 config[attr] = getter()
             except Exception:
                 pass
+
+        # Pass through LSTV oversampling config so it shows up in W&B
+        try:
+            config["lstv_oversample_frac"] = float(
+                os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.25"))
+        except Exception:
+            pass
 
         max_retries = _env_int("WANDB_INIT_MAX_RETRIES", 3)
         init_timeout = _env_int("WANDB_INIT_TIMEOUT_SEC", 120)
@@ -696,6 +1166,14 @@ class _WandBMixin:
         except Exception:
             pass
         try:
+            self._maybe_load_subtype_map()
+        except Exception as exc:
+            try:
+                self.print_to_log_file(
+                    f"LSTV per-subgroup dice: subtype map load failed: {exc}")
+            except Exception:
+                pass
+        try:
             self._dump_environment()
         except Exception:
             pass
@@ -724,6 +1202,13 @@ class _WandBMixin:
                 self.print_to_log_file(f"WandB: init failed: {exc}")
             except Exception:
                 pass
+
+    def on_train_epoch_start(self):  # type: ignore[override]
+        super().on_train_epoch_start()
+        # Reset per-subgroup buffer at the start of each epoch so the
+        # *validation* phase that comes after training fills a clean
+        # buffer.
+        self._reset_subgroup_dice_buffer()
 
     def on_epoch_end(self):  # type: ignore[override]
         super().on_epoch_end()
@@ -793,6 +1278,26 @@ class _WandBMixin:
                 "timing/epoch_sec":  epoch_time,
                 **per_class_log,
             }
+
+            # Per-subgroup dice
+            try:
+                subgroup_payload = self._aggregate_subgroup_dice()
+                payload.update(subgroup_payload)
+                # Per-epoch human-readable summary (always; this is the
+                # number you actually want to watch scroll by).
+                self._print_per_subgroup_summary(epoch, subgroup_payload)
+                # First-epoch verbose diagnostic (keys list) for debugging.
+                if epoch <= 1:
+                    sg_keys = sorted(k for k in subgroup_payload if k is not None)
+                    self.print_to_log_file(
+                        f"WandB: epoch {epoch} per-subgroup keys ({len(sg_keys)}): "
+                        f"{sg_keys[:8]}{'...' if len(sg_keys) > 8 else ''}")
+            except Exception as exc:
+                try:
+                    self.print_to_log_file(
+                        f"WandB: per-subgroup dice aggregation failed: {exc}")
+                except Exception:
+                    pass
 
             if epoch <= 1:
                 self.print_to_log_file(
@@ -900,7 +1405,11 @@ class _LSTVOversampleMixin:
       d) Legacy L6-voxel scan over labelsTr (lumbarization only)
 
     Env vars:
-        LSTV_OVERSAMPLE_FRAC  target fraction (default 0.5, capped 0.95)
+        LSTV_OVERSAMPLE_FRAC  target fraction (default 0.25, capped 0.95)
+                              Lowered from 0.50 in v8 -- avg_dup_factor at
+                              0.50 was ~20x per unique LSTV case, very
+                              high overfitting risk on rare classes.
+                              0.25 gives ~9x duplication, more moderate.
         HF_EXPORT_DIR         override HF export path
         LSTV_LABELS_DIR       override labelsTr path
 
@@ -924,7 +1433,7 @@ class _LSTVOversampleMixin:
                     f"LSTV oversample: checking {json_path}")
                 result = _read_lstv_cases_json(json_path)
                 if result is not None:
-                    ids, subtypes = result
+                    ids, subtypes, _ = result
                     self._lstv_case_ids = ids
                     self._lstv_subtype_counts = subtypes
                     self._lstv_detection_source = f"json:{json_path}"
@@ -937,7 +1446,7 @@ class _LSTVOversampleMixin:
                 f"LSTV oversample: checking manifest path {hf_dir}")
             result = _read_lstv_records_from_manifest(hf_dir)
             if result is not None:
-                ids, subtypes = result
+                ids, subtypes, _ = result
                 self._lstv_case_ids = ids
                 self._lstv_subtype_counts = subtypes
                 self._lstv_detection_source = f"manifest:{hf_dir}"
@@ -981,12 +1490,13 @@ class _LSTVOversampleMixin:
         return None
 
     def _apply_lstv_sampler(self) -> None:
+        # v8: default lowered from 0.5 to 0.25.
         try:
-            frac = float(os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.5"))
+            frac = float(os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.25"))
         except ValueError:
             self.print_to_log_file(
-                "LSTV oversample: invalid LSTV_OVERSAMPLE_FRAC; using 0.5")
-            frac = 0.5
+                "LSTV oversample: invalid LSTV_OVERSAMPLE_FRAC; using 0.25")
+            frac = 0.25
         frac = max(0.0, min(0.95, frac))
         if frac <= 0:
             self.print_to_log_file("LSTV oversample: frac=0, no-op.")
@@ -1176,7 +1686,9 @@ class nnUNetTrainerWandB_500ep_LSTVOversample(
     _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
 ):
     """500 epochs + LSTV oversampling. DEFAULT TRAINER for the SpineSurg-CT
-    paper run. 500 ep × 250 iter = 125k training steps."""
+    paper run. 500 ep × 250 iter = 125k training steps.
+
+    v8: LSTV_OVERSAMPLE_FRAC default lowered to 0.25 (was 0.50)."""
     def __init__(self, plans: dict, configuration: str, fold: int,
                  dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
