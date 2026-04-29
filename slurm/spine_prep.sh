@@ -26,15 +26,35 @@
 # -------------------
 # The preprocessed-data directory under preprocessed/<dataset>/ is named
 # after the plans' data_identifier (e.g. "nnUNetPlans_3d_fullres"),
-# NOT after ${CONFIG} (e.g. "3d_fullres"). Earlier versions hardcoded
-# "${NFS_PREP_DS}/${CONFIG}" in both the cache check and the sanity
-# check, which produced two failure modes:
-#   (a) Sanity check at the end always reported "zero .npz files"
-#       even after a successful preprocess, exiting 2.
-#   (b) The fast-exit cache check on resume always missed, forcing a
-#       full re-preprocess every time.
-# resolve_prep_data_dir() now reads data_identifier from the plans JSON
-# (with a glob fallback) so the path matches what nnU-Net actually wrote.
+# NOT after ${CONFIG} (e.g. "3d_fullres"). resolve_prep_data_dir() now
+# reads data_identifier from the plans JSON (with a glob fallback).
+#
+# v3 (2026-04-29) — flexible HF_EXPORT_DIR + SPLITS_FILE overrides
+# ----------------------------------------------------------------
+# Earlier this script hardcoded HF export at
+#   ${PROJECT_ROOT}/data/hf_export
+# and splits at
+#   ${PROJECT_ROOT}/data/splits_5fold.json
+# That broke when the export lives under ~/CTSpinoPelvic1K/data/hf_export
+# (the natural Stage 3 output) and the splits ride along inside that
+# export at hf_export/splits_5fold.json (where export_dataset.sh writes
+# them). Two new env vars make this configurable:
+#
+#   HF_EXPORT_DIR   path to hf_export/ (CT, labels, manifest.json, ...)
+#                   default tries:
+#                     1. ${PROJECT_ROOT}/data/hf_export   (legacy)
+#                     2. ${HOME}/CTSpinoPelvic1K/data/hf_export
+#                   first hit wins.
+#
+#   SPLITS_FILE     path to splits_5fold.json
+#                   default tries:
+#                     1. ${HF_EXPORT_DIR}/splits_5fold.json  (preferred,
+#                        co-located with the export it describes)
+#                     2. ${PROJECT_ROOT}/data/splits_5fold.json (legacy)
+#                   first hit wins.
+#
+# Both can be overridden explicitly to point anywhere on NFS:
+#     HF_EXPORT_DIR=/some/path/hf_export sbatch slurm/spine_prep.sh
 # =============================================================================
 
 set -euo pipefail
@@ -72,8 +92,40 @@ case "${PLANNER}" in
 esac
 
 PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/spinesurg-ct-nnunet}"
-HF_EXPORT_NFS="${PROJECT_ROOT}/data/hf_export"
-SPLITS_FILE_HOST="${PROJECT_ROOT}/data/splits_5fold.json"
+
+# -- HF export discovery -----------------------------------------------------
+# Default search order: legacy in-project location first (so existing setups
+# keep working), then the natural CTSpinoPelvic1K location. Either can be
+# overridden with HF_EXPORT_DIR=...
+if [[ -z "${HF_EXPORT_DIR:-}" ]]; then
+    for cand in \
+        "${PROJECT_ROOT}/data/hf_export" \
+        "${HOME}/CTSpinoPelvic1K/data/hf_export"; do
+        if [[ -d "${cand}/ct" ]]; then
+            HF_EXPORT_DIR="${cand}"
+            break
+        fi
+    done
+fi
+HF_EXPORT_DIR="${HF_EXPORT_DIR:-${PROJECT_ROOT}/data/hf_export}"
+HF_EXPORT_NFS="${HF_EXPORT_DIR}"
+
+# -- Splits file discovery ---------------------------------------------------
+# Prefer the splits file co-located with the HF export it describes.
+# Earlier setups put it in ${PROJECT_ROOT}/data/ — fall back to that for
+# legacy compatibility.
+if [[ -z "${SPLITS_FILE:-}" ]]; then
+    for cand in \
+        "${HF_EXPORT_NFS}/splits_5fold.json" \
+        "${PROJECT_ROOT}/data/splits_5fold.json"; do
+        if [[ -f "${cand}" ]]; then
+            SPLITS_FILE="${cand}"
+            break
+        fi
+    done
+fi
+SPLITS_FILE_HOST="${SPLITS_FILE:-${HF_EXPORT_NFS}/splits_5fold.json}"
+
 NNUNET_NFS="${PROJECT_ROOT}/nnunet"
 CONTAINER="${PROJECT_ROOT}/containers/spinesurg-ct.sif"
 WANDB_TRAINER_HOST="${PROJECT_ROOT}/tools/nnunet_wandb_variant.py"
@@ -141,14 +193,23 @@ PY
 
 # -- Preflight ---------------------------------------------------------------
 [[ ! -f "${CONTAINER}"          ]] && { echo "ERROR: container not found: ${CONTAINER}" >&2; exit 1; }
-[[ ! -d "${HF_EXPORT_NFS}/ct"   ]] && { echo "ERROR: ${HF_EXPORT_NFS}/ct missing" >&2; exit 1; }
+[[ ! -d "${HF_EXPORT_NFS}/ct"   ]] && {
+    echo "ERROR: ${HF_EXPORT_NFS}/ct missing" >&2
+    echo "  Override with HF_EXPORT_DIR=/path/to/hf_export sbatch slurm/spine_prep.sh" >&2
+    exit 1
+}
 [[ ! -f "${WANDB_TRAINER_HOST}" ]] && { echo "ERROR: ${WANDB_TRAINER_HOST} missing" >&2; exit 1; }
 [[ ! -f "${PROJECT_ROOT}/tools/convert_hf_to_nnunet.py" ]] && {
     echo "ERROR: tools/convert_hf_to_nnunet.py missing" >&2; exit 1; }
 
 if [[ "${SINGLE_FOLD_SPLITS}" != "1" ]]; then
     [[ ! -f "${SPLITS_FILE_HOST}" ]] && {
-        echo "ERROR: ${SPLITS_FILE_HOST} missing." >&2; exit 1; }
+        echo "ERROR: splits file not found at ${SPLITS_FILE_HOST}" >&2
+        echo "  Searched: ${HF_EXPORT_NFS}/splits_5fold.json" >&2
+        echo "            ${PROJECT_ROOT}/data/splits_5fold.json" >&2
+        echo "  Override with SPLITS_FILE=/path/to/splits.json or run with SINGLE_FOLD_SPLITS=1" >&2
+        exit 1
+    }
     SP_MTIME=$(stat -c '%y' "${SPLITS_FILE_HOST}" 2>/dev/null || stat -f '%Sm' "${SPLITS_FILE_HOST}")
     echo "  splits_5fold.json mtime: ${SP_MTIME}"
 fi
@@ -187,6 +248,8 @@ echo "================================================================"
 echo " Stage A: convert + preprocess (SIMPLE, NFS-only)"
 echo "   Dataset      : ${DS_DIR_NAME}"
 echo "   Plans        : ${PLANS} (target ${GPU_MEMORY_TARGET_GB} GB)"
+echo "   HF export    : ${HF_EXPORT_NFS}"
+echo "   Splits file  : ${SPLITS_FILE_HOST}"
 echo "   NFS dest     : ${NFS_PREP_DS}"
 echo "   Splits mode  : $([[ ${SINGLE_FOLD_SPLITS} == 1 ]] && echo 'single-fold' || echo '5-fold CV')"
 echo "   Workers      : ${N_PREPROCESS_THREADS} x ${BLAS_THREADS} BLAS threads = $((N_PREPROCESS_THREADS*BLAS_THREADS)) total"
