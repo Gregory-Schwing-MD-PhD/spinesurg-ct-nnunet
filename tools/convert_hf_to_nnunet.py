@@ -56,6 +56,59 @@ Why "ignore" is here:
   trace, poisoning the loss for L6 / sacrum / hips on roughly two-thirds
   of the training set. See export_hf.py "PARTIAL ANNOTATION CONTRACT".
 
+Per-record subtype refinement (May 2026, schema v3)
+===================================================
+A patient with LSTV morphology may contribute multiple records with
+different `config` values:
+
+  fused          -> all anatomy in one volume
+  spine_only     -> spine annotated, pelvis = ignore
+  pelvic_native  -> pelvis annotated, lumbar = ignore
+
+The patient-level subtype (e.g. "lumb") is correct for fused and
+spine_only views — they SHOW the lumbar morphology that defines the
+subtype. But pelvic_native views from the SAME patient have only
+sacrum + hips visible (lumbar region is masked as ignore=10), so
+their label files contain zero L6 voxels even for lumb patients.
+
+If we tagged a pelvic_native record as "lumb":
+
+  1. The patch-bias hook would try to bias toward L6 patches that
+     don't exist in the case's foreground class list -> no-op but
+     misleading "37 cases in bias pool" log line.
+
+  2. The per-subgroup val dice averages "L6 dice" over cases lacking
+     L6 in GT, returning None per case (filtered from the mean), but
+     the n_cases count is inflated and the "L6 dice on lumbarization
+     cases" headline metric becomes harder to interpret across
+     epochs.
+
+  3. The oversample pool puts these cases on the same footing as
+     true-lumb spine views, wasting roughly half the oversample
+     budget on pelvic-only views that contribute no lumbar signal.
+
+Fix: `_refine_subtype_for_record_config` applies SYMMETRIC per-record
+demotion based on which anatomical region a config covers:
+
+  pelvic_native  ->  demote {lumb, sacr_count} to "normal"
+                     (these subtypes' defining anatomy is the LUMBAR
+                     vertebral count: presence of an L6 body, or L5
+                     missing because it sacralized into the sacrum
+                     body. A pelvic_native scan has the lumbar region
+                     masked as ignore=10, so this signal is absent.)
+
+  spine_only     ->  demote {sacralization, semisacralization} to
+                     "normal" (these subtypes' defining anatomy is
+                     SACRAL-WING morphology: uni- or bilateral fusion
+                     of the L5 transverse process to the sacrum. A
+                     spine_only scan has the pelvis masked as
+                     ignore=10, so this signal is absent.)
+
+  fused          ->  preserve all subtypes (entire anatomy annotated)
+  ambiguous      ->  preserved on every config (uncertain
+                     classification — keep the case represented in
+                     per-subgroup metrics)
+
 lstv_cases.json schema v3 (Apr 2026)
 ====================================
 6-way LSTV subtype taxonomy mirroring splits_5fold.json schema v6:
@@ -100,6 +153,32 @@ SUBTYPES = (
     "ambiguous",
 )
 
+# Subtypes whose defining anatomy lives in the LUMBAR vertebral region
+# (vertebral body count: presence/absence of L6, or L5 missing because
+# it sacralized into the sacrum body). A pelvic_native config masks the
+# lumbar region as ignore=10, so a pelvic_native record does NOT carry
+# these subtypes' signal even if the patient does. Demote on
+# pelvic_native.
+_LUMBAR_REGION_SUBTYPES = frozenset({
+    "lumb",
+    "sacr_count",
+})
+
+# Subtypes whose defining anatomy lives in the SACRAL/PELVIC region
+# (sacral-wing morphology: full or partial fusion of the L5 transverse
+# process to the sacrum). A spine_only config masks the pelvis as
+# ignore=10, so a spine_only record does NOT carry these subtypes'
+# signal even if the patient does. Demote on spine_only.
+_PELVIS_REGION_SUBTYPES = frozenset({
+    "sacralization",
+    "semisacralization",
+})
+
+# Config values recognized in the manifest, mirroring trainer constants.
+_VALID_CONFIGS = ("fused", "spine_only", "pelvic_native")
+_PELVIC_ONLY_CONFIG = "pelvic_native"
+_SPINE_ONLY_CONFIG  = "spine_only"
+
 # 10-class scheme + ignore label for partial-annotation cases.
 # nnU-Net v2 treats the literal key "ignore" specially — see module
 # docstring for full semantics. The value 10 must match the value
@@ -118,6 +197,57 @@ LABEL_NAMES = {
     "right_hip":  9,
     "ignore":     10,
 }
+
+
+def _refine_subtype_for_record_config(patient_subtype: str,
+                                       record_config: str) -> str:
+    """Adjust the patient-level subtype based on this record's
+    annotation config (symmetric anatomical-region demotion).
+
+    A patient with LSTV morphology may contribute multiple records
+    with different `config` values. The patient-level subtype is only
+    correct for records whose config actually shows the relevant
+    anatomy:
+
+      lumb / sacr_count are LUMBAR-region findings (vertebral count).
+        - fused, spine_only:  preserve the subtype
+        - pelvic_native:      demote to "normal" (lumbar region masked
+                              as ignore=10, no L6 or count info)
+
+      sacralization / semisacralization are SACRAL/PELVIC findings
+      (sacral-wing morphology, L5 transverse-process fusion).
+        - fused, pelvic_native: preserve the subtype
+        - spine_only:           demote to "normal" (pelvis masked as
+                                ignore=10, no sacral wing visible)
+
+      ambiguous: preserved on every config so the case is still
+        represented in per-subgroup metrics. Don't silently relabel
+        as normal — that would hide ambiguous cases entirely.
+
+      normal: stays normal regardless of config.
+
+    Defensive: unknown / empty config values are treated as 'fused'
+    (most permissive — preserve the patient subtype).
+
+    Args:
+      patient_subtype: one of SUBTYPES, derived from the patient's
+        clinical/morphological annotation.
+      record_config: one of _VALID_CONFIGS, recorded per record in
+        the HF manifest.
+
+    Returns:
+      The refined subtype for this specific record.
+
+    Test contract: see tests/test_subtype_refinement.py.
+    """
+    rc = (record_config or "").strip().lower()
+    if rc == _PELVIC_ONLY_CONFIG:
+        if patient_subtype in _LUMBAR_REGION_SUBTYPES:
+            return "normal"
+    elif rc == _SPINE_ONLY_CONFIG:
+        if patient_subtype in _PELVIS_REGION_SUBTYPES:
+            return "normal"
+    return patient_subtype
 
 
 def _load_manifest_records(hf_dir: Path) -> Dict[str, List[Dict]]:
@@ -164,34 +294,46 @@ def _case_id(token: str, record_idx: int = 0) -> str:
 def _resolve_subtype_for_case(record: Dict,
                                 splits_subtypes: Dict[str, str]) -> str:
     """
-    Use the splits-derived subtype if available (canonical 6-way taxonomy).
-    Fall back to per-record resolution if a token isn't in splits.
+    Determine the canonical 6-way subtype for a single record.
+
+    Steps:
+      1. Resolve patient-level subtype via splits-derived map (preferred)
+         or per-record manifest fields (fallback).
+      2. Refine based on this record's `config` to demote lumbar-region
+         subtypes to 'normal' for pelvic-only views.
     """
     tok = str(record.get("token") or record.get("patient_token") or "")
+    record_config = str(record.get("config", ""))
+
+    # Step 1: patient-level subtype
     if tok in splits_subtypes:
-        return splits_subtypes[tok]
+        patient_subtype = splits_subtypes[tok]
+    else:
+        label = str(record.get("lstv_label", "")).upper()
+        pel   = str(record.get("lstv_pelvic", "")).upper()
+        vert  = str(record.get("lstv_vertebral", "")).upper()
+        n_lumb = int(record.get("n_lumbar_labels", 0) or 0)
+        has_l6 = bool(record.get("has_l6", False))
 
-    label = str(record.get("lstv_label", "")).upper()
-    pel   = str(record.get("lstv_pelvic", "")).upper()
-    vert  = str(record.get("lstv_vertebral", "")).upper()
-    n_lumb = int(record.get("n_lumbar_labels", 0) or 0)
-    has_l6 = bool(record.get("has_l6", False))
+        if label == "AMBIGUOUS":
+            patient_subtype = "ambiguous"
+        elif (vert == "LUMBARIZATION" and pel == "SACRALIZATION") or \
+             (vert == "SACRALIZATION" and pel == "LUMBARIZATION"):
+            patient_subtype = "ambiguous"
+        elif n_lumb == 6 or has_l6 or label == "LUMBARIZATION":
+            patient_subtype = "lumb"
+        elif label in ("SEMI_SACRAL", "SEMI_SACRALIZATION") or \
+             pel in ("SEMI_SACRAL", "SEMI_SACRALIZATION"):
+            patient_subtype = "semisacralization"
+        elif vert == "SACRALIZATION" and n_lumb == 4:
+            patient_subtype = "sacr_count"
+        elif label == "SACRALIZATION" or pel == "SACRALIZATION":
+            patient_subtype = "sacralization"
+        else:
+            patient_subtype = "normal"
 
-    if label == "AMBIGUOUS":
-        return "ambiguous"
-    if (vert == "LUMBARIZATION" and pel == "SACRALIZATION") or \
-       (vert == "SACRALIZATION" and pel == "LUMBARIZATION"):
-        return "ambiguous"
-    if n_lumb == 6 or has_l6 or label == "LUMBARIZATION":
-        return "lumb"
-    if label in ("SEMI_SACRAL", "SEMI_SACRALIZATION") or \
-       pel in ("SEMI_SACRAL", "SEMI_SACRALIZATION"):
-        return "semisacralization"
-    if vert == "SACRALIZATION" and n_lumb == 4:
-        return "sacr_count"
-    if label == "SACRALIZATION" or pel == "SACRALIZATION":
-        return "sacralization"
-    return "normal"
+    # Step 2: refine for this record's config (pelvic_native demotion)
+    return _refine_subtype_for_record_config(patient_subtype, record_config)
 
 
 def _build_case_indices(
@@ -205,10 +347,14 @@ def _build_case_indices(
     use_symlinks: bool,
     do_link: bool,
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Dict],
-           List[str], List[str], int]:
+           List[str], List[str], int, Dict[str, int]]:
     """
     Iterate manifests, optionally symlink/copy CT+label files, and build
     the case_id -> {subtype, token, attrs} indices.
+
+    Returns: (case_to_subtype, case_to_token, case_to_attrs,
+              train_case_ids, test_case_ids, n_skipped, refinement_stats)
+    where refinement_stats counts how many cases were demoted by config.
     """
     case_to_subtype: Dict[str, str] = {}
     case_to_token:   Dict[str, str] = {}
@@ -216,6 +362,13 @@ def _build_case_indices(
     train_case_ids: List[str] = []
     test_case_ids:  List[str] = []
     n_skipped = 0
+
+    # Track how many records had their patient subtype demoted via the
+    # pelvic_native config refinement. Useful for the post-build summary
+    # so the user can spot if e.g. the manifest's `config` field is
+    # missing (refinement_stats stays at 0 even though pelvic_native
+    # records exist).
+    refinement_stats: Dict[str, int] = defaultdict(int)
 
     record_idx_by_token: Dict[str, int] = defaultdict(int)
 
@@ -272,7 +425,23 @@ def _build_case_indices(
                         train_case_ids.pop()
                     continue
 
-            subtype = _resolve_subtype_for_case(rec, splits_subtypes)
+            # Compute refined per-record subtype, and also compute the
+            # raw patient-level subtype so we can count demotions.
+            patient_subtype_raw = splits_subtypes.get(tok)
+            if patient_subtype_raw is None:
+                # Fall through to per-record resolution; in this branch
+                # we can't separate "raw" from "refined" cleanly, so we
+                # just compute the refined subtype directly without
+                # counting demotion stats for this record.
+                subtype = _resolve_subtype_for_case(rec, splits_subtypes)
+            else:
+                rec_config = str(rec.get("config", ""))
+                subtype = _refine_subtype_for_record_config(
+                    patient_subtype_raw, rec_config)
+                if subtype != patient_subtype_raw:
+                    key = f"{patient_subtype_raw}->normal (config={rec_config})"
+                    refinement_stats[key] += 1
+
             case_to_subtype[case_id] = subtype
             case_to_token[case_id]   = tok
             case_to_attrs[case_id]   = {
@@ -285,12 +454,13 @@ def _build_case_indices(
                 "match_type":      str(rec.get("match_type", "")),
                 "config":          str(rec.get("config", "")),
                 "split":           split,
-                # NEW: track partial-annotation status from manifest if present.
                 "partial_annotation": bool(rec.get("partial_annotation", False)),
+                # Keep the raw patient-level subtype for traceability.
+                "patient_subtype_raw": patient_subtype_raw or "(none)",
             }
 
     return (case_to_subtype, case_to_token, case_to_attrs,
-            train_case_ids, test_case_ids, n_skipped)
+            train_case_ids, test_case_ids, n_skipped, dict(refinement_stats))
 
 
 def _write_splits_final(
@@ -423,7 +593,8 @@ def main():
         log.info("Dataset dir: %s (existing, not modified)", ds_dir)
 
     (case_to_subtype, case_to_token, case_to_attrs,
-     train_case_ids, test_case_ids, n_skipped) = _build_case_indices(
+     train_case_ids, test_case_ids, n_skipped,
+     refinement_stats) = _build_case_indices(
         manifests, splits_subtypes, args.hf_dir,
         images_tr, labels_tr, images_ts, labels_ts,
         use_symlinks=args.symlinks, do_link=do_link,
@@ -435,6 +606,14 @@ def main():
     else:
         log.info("Indexed: train=%d  test=%d  skipped=%d  (no link/copy in regen mode)",
                  len(train_case_ids), len(test_case_ids), n_skipped)
+
+    if refinement_stats:
+        log.info("Per-record subtype refinements (pelvic_native demotions):")
+        for transition, n in sorted(refinement_stats.items()):
+            log.info("  %-50s %d", transition, n)
+    else:
+        log.info("Per-record subtype refinements: none "
+                 "(no pelvic_native records of LSTV patients, or `config` field missing)")
 
     # ── dataset.json (skipped in regen mode) ───────────────────────────────
     if do_link:
@@ -448,7 +627,8 @@ def main():
                               "with ignore label (10) for partial annotations",
             "reference":     "CTSpine1K + CTPelvic1K, COLONOG cohort",
             "release":       "May 2026 — schema v6 splits / v3 lstv_cases / "
-                              "partial-annotation ignore label",
+                              "partial-annotation ignore label / "
+                              "per-record subtype refinement",
         }
         (ds_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
         log.info("Wrote dataset.json (labels include ignore=10 for partial-annotation cases)")

@@ -1,5 +1,5 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v15)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v17)
 tools/nnunet_wandb_variant.py
 
 Design intent
@@ -43,29 +43,78 @@ when configured, masking those voxels out of the gradient. Required:
   - num_segmentation_heads from label_manager = 10 (the ignore label
     has no output head; it's purely a loss mask)
 
-Changes from v13/v14 (consolidated)
-====================================
-1. Patch-bias detection refined for partial-annotation labels.
+Changes in v17 (May 2026)
+=========================
+1. Symmetric demotion (in convert_hf_to_nnunet.py): also demote
+   sacralization / semisacralization for spine_only views, mirroring
+   the lumb / sacr_count demotion for pelvic_native views. A record
+   only contributes to a subtype's stats / sampling if its defining
+   anatomy is supervised (not ignore=10) in that view.
 
-   Old detection (v12-v14): "sacrum in fg AND L5 not in fg" — broken
-   for partial annotations because pelvic-only cases also lack L5
-   (it's ignore=10 there, not present in the case's foreground class
-   list). All pelvic-only cases would falsely trigger the sacr_count
-   patch bias.
+2. Oversample pool widened to ALL non-normal subtypes, including
+   ambiguous (was excluded as "n=4 too small"). Per Greg: even
+   ambiguous cases provide LSTV-like exposure that the model
+   wouldn't otherwise see.
 
-   New detection: requires L4 IN fg list as well. Sacr_count cases
-   genuinely have L4 annotated (their lumbar count is 4 = L1-L4 plus
-   sacrum). Pelvic-only cases have no lumbar at all. This cleanly
-   distinguishes the two.
+3. Comprehensive startup logging — each install phase emits
+   [STARTUP] prefixed lines for subtype_map, ce_reweight,
+   patch_bias, oversample, log_intercepts, wandb. Every probe
+   attempt, every fallback path, every decision is logged. BEGIN /
+   OK ✓ / FAILED ✗ sentinels frame each phase.
+
+4. Patch-bias install runs an end-to-end self-test BEFORE training:
+   constructs a fake function literally named `generate_train_batch`,
+   exercises the np.random.choice intercept, and confirms frame
+   inspection works in this Python. If the self-test fails, the
+   user sees it at startup instead of silently no-op'ing for hours.
+
+5. Oversample install reads back the keys list AFTER setattr to
+   verify the mutation actually took effect, counts LSTV duplicates
+   in the readback, and aborts if the readback doesn't match.
+
+6. Per-subgroup val dice prints individual L1-L6 + sacrum +
+   left_hip + right_hip dice on dedicated lines for ALL subtypes
+   (including normal). Was: one-line dump only for non-normal.
+
+Changes in v16 (May 2026 — CRITICAL fix, preserved)
+========================================
+PATCH-BIAS HOOK WAS DEAD. v15 patched stdlib `random.choice`, but
+nnU-Net v2's `nnUNetDataLoader{2D,3D}.generate_train_batch` calls
+`np.random.choice(len(eligible_classes_or_regions))` — a different
+function entirely. The "Patch-class bias: ENABLED" log line at startup
+was misleading: the wrapper installed cleanly but never intercepted
+anything, so all bias decisions came from the original sampler.
+
+Fix:
+  1. Patch `np.random.choice` (correct target)
+  2. Frame-inspect the caller to extract `eligible_classes_or_regions`
+     and confirm the call originates from `generate_train_batch`. This
+     avoids hijacking unrelated np.random.choice calls (e.g., the
+     subsequent `np.random.choice(len(voxels_of_that_class))` for
+     within-class voxel selection, or any np.random.choice in user
+     transforms or augmentations).
+  3. Return an INDEX into the eligible list, not the class id —
+     nnU-Net dereferences `eligible_classes_or_regions[idx]` to get
+     the class.
+  4. Skip tuple keys in eligible (the all-classes "any foreground"
+     region key) — only consider int single-class entries.
+  5. Diagnostic counters (`_bias_call_count`, `_bias_l6_returns`,
+     `_bias_sacrum_returns`) so the per-subgroup log shows whether
+     the hook is actually firing.
+  6. The selection logic is extracted as a module-level pure function
+     `_select_biased_index` so it can be unit-tested in isolation.
+
+Changes from v13/v14 (preserved)
+================================
+1. Patch-bias detection refined for partial-annotation labels: requires
+   L4 IN fg list to distinguish sacr_count from pelvic-only records.
 
 2. All LSTV subtypes (lumb, sacr_count, sacralization, semisacralization)
-   are oversampled. Only ambiguous excluded. Oversampling is broad
-   class-imbalance correction; specific anatomy emphasis comes via
-   patch bias and CE weights (see Design intent above).
+   are oversampled. Only ambiguous excluded.
 
 3. JSON reader (`_read_lstv_cases_json`) ignores any stored
    `lstv_oversample_pool` field; always recomputes from in-code
-   `_OVERSAMPLE_SUBTYPES`. The .py file is the single source of truth.
+   `_OVERSAMPLE_SUBTYPES`.
 
 Changes from v12 (preserved)
 ============================
@@ -74,14 +123,12 @@ Changes from v12 (preserved)
 
 Changes from v11 (preserved)
 ============================
-- Fix per-subgroup dice logger numpy-truth-value bug
-  (`x or y or default` on numpy arrays).
+- Fix per-subgroup dice logger numpy-truth-value bug.
 
 Changes from v10 (preserved)
 ============================
 - Fix CE weight tensor sizing crash. Reads num_classes from
-  self.label_manager.num_segmentation_heads (which is 10 with ignore
-  configured: bg + 9 fg, no head for ignore).
+  self.label_manager.num_segmentation_heads.
 
 Changes from v9 (preserved)
 ===========================
@@ -98,12 +145,13 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 import warnings
 from collections import Counter, defaultdict
 from os.path import isfile, isdir, join
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -127,6 +175,7 @@ _FG_CLASS_IDS    = list(range(1, 10))
 _LUMBAR_IDS      = list(range(1, 7))
 _PELVIS_IDS      = list(range(7, 10))
 _L6_LABEL_ID     = 6
+_SACRUM_LABEL_ID = 7
 _IGNORE_LABEL    = 10
 _VALID_CONFIGS   = ("fused", "spine_only", "pelvic_native")
 
@@ -145,9 +194,13 @@ _KNOWN_SUBTYPES = (
     _SUBTYPE_NORMAL, _SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT,
     _SUBTYPE_SEMI, _SUBTYPE_SACR, _SUBTYPE_AMBIG,
 )
-_OVERSAMPLE_SUBTYPES = (
-    _SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT, _SUBTYPE_SACR, _SUBTYPE_SEMI,
-)
+# v17: ALL non-normal subtypes are oversampled. Previously
+# excluded: ambiguous (n=4) on memorization concerns. v17 includes
+# it per Greg's request — the downside of memorization on a tiny
+# group is acceptable; the upside is the model sees rare LSTV
+# anatomy more often.
+_OVERSAMPLE_SUBTYPES = tuple(s for s in _KNOWN_SUBTYPES if s != _SUBTYPE_NORMAL)
+# Equivalent: (lumb, sacr_count, semisacralization, sacralization, ambiguous)
 
 LSTV_CASES_SCHEMA_MIN = 1
 LSTV_CASES_SCHEMA_MAX = 3
@@ -436,6 +489,152 @@ def _detect_num_output_classes(trainer) -> int:
 
 
 # =============================================================================
+# Patch-class bias selection logic (pure function — unit-testable)
+# =============================================================================
+
+def _select_biased_index(
+    eligible: Sequence,
+    rules: Dict[str, Tuple[int, str, float]],
+    rand: Callable[[], float],
+) -> Optional[int]:
+    """Decide whether to bias the next forced-FG selection.
+
+    Pure function with no side effects. Returns the INDEX into
+    ``eligible`` of the biased target class, or None if no bias rule
+    applies (in which case the caller should defer to the default
+    sampler).
+
+    Detection logic — partial-annotation safe:
+
+      lumb        => L6 (class 6) is in eligible. Only lumb cases have
+                     L6 annotated. Pelvic-only views of lumb patients
+                     do NOT have 6 in eligible (their lumbar region is
+                     all ignore=10 -> excluded from foreground class
+                     locations).
+
+      sacr_count  => sacrum (7) IS in eligible, L5 (5) is NOT, and L4
+                     (4) IS. The L4-in-fg check is critical — pelvic-
+                     only normal cases also lack L5 (it's ignore there)
+                     but they also lack L4. Only true sacr_count
+                     anatomy has L1-L4 + sacrum without L5.
+
+    Args:
+      eligible: the ``eligible_classes_or_regions`` list nnU-Net is
+        about to sample from. Entries are class ids (ints) or region
+        tuples. Tuple entries (e.g. the all-classes "any foreground"
+        key) are skipped during detection.
+      rules: mapping from subtype name to (target_class, env_var_name,
+        frac). Same shape as ``_PATCH_BIAS_RULES``. Only target_class
+        and frac are used here; env_var_name is informational.
+      rand: a function returning a float in [0, 1). Pass
+        ``random.random`` in production; pass a deterministic stub in
+        tests.
+
+    Returns:
+      The index ``i`` such that ``eligible[i]`` is the biased target
+      class, or None if no rule fires.
+    """
+    # Build a class_id -> index map, ignoring tuple/region entries.
+    int_keys: Dict[int, int] = {}
+    for i, x in enumerate(eligible):
+        if isinstance(x, (int, np.integer)):
+            int_keys[int(x)] = i
+        # Tuple entries (region keys) are intentionally skipped.
+
+    # Lumb takes priority: L6 is the most specific signal.
+    if _L6_LABEL_ID in int_keys:
+        rule = rules.get(_SUBTYPE_LUMB)
+        if rule is not None:
+            _, _, frac = rule
+            if rand() < frac:
+                return int_keys[_L6_LABEL_ID]
+        return None  # L6 present means this is a lumb case; do not fall
+                      # through to sacr_count heuristic (which checks L5
+                      # absent — irrelevant for a lumb spine view).
+
+    # sacr_count: sacrum present, L5 absent, L4 present.
+    if (_SACRUM_LABEL_ID in int_keys
+            and 5 not in int_keys
+            and 4 in int_keys):
+        rule = rules.get(_SUBTYPE_SACR_COUNT)
+        if rule is not None:
+            _, _, frac = rule
+            if rand() < frac:
+                return int_keys[_SACRUM_LABEL_ID]
+        return None
+
+    return None
+
+
+def _selftest_patch_bias(rules: Dict[str, Tuple[int, str, float]],
+                          n_trials: int = 200) -> Tuple[int, int, int]:
+    """End-to-end self-test of the np.random.choice intercept mechanism.
+
+    Constructs a fake function literally named ``generate_train_batch``,
+    sets up an ``eligible_classes_or_regions`` local exactly as nnU-Net
+    does, calls ``np.random.choice(len(eligible))``, and counts how many
+    times the bias fires.
+
+    The intercept relies on:
+      - patching np.random.choice (correct target — not stdlib random)
+      - Python's frame inspection (sys._getframe(1).f_code.co_name)
+      - reading f_locals["eligible_classes_or_regions"] from caller
+
+    If any of those break in this Python's runtime, the self-test
+    catches it at startup instead of silently no-op'ing for hours.
+
+    Returns: (n_trials_run, n_intercept_calls, n_l6_returns)
+      - n_intercept_calls should equal n_trials_run (intercept fires
+        on every call). If not, frame inspection is broken.
+      - n_l6_returns should be ~ n_trials * lumb_frac. If 0 with
+        non-zero frac, _select_biased_index is broken.
+    """
+    original_np_choice = np.random.choice
+
+    n_calls = 0
+    n_l6_returns = 0
+
+    def biased_test_choice(*args, **kwargs):
+        nonlocal n_calls, n_l6_returns
+        try:
+            if (len(args) == 1 and not kwargs
+                    and isinstance(args[0], (int, np.integer))):
+                frame = sys._getframe(1)
+                if frame.f_code.co_name == "generate_train_batch":
+                    eligible = frame.f_locals.get("eligible_classes_or_regions")
+                    if (eligible is not None
+                            and hasattr(eligible, "__len__")
+                            and len(eligible) == int(args[0])
+                            and len(eligible) > 1):
+                        n_calls += 1
+                        biased_idx = _select_biased_index(
+                            eligible, rules, random.random)
+                        if biased_idx is not None:
+                            cls = eligible[biased_idx]
+                            if (isinstance(cls, (int, np.integer))
+                                    and int(cls) == _L6_LABEL_ID):
+                                n_l6_returns += 1
+                            return biased_idx
+        except Exception:
+            pass
+        return original_np_choice(*args, **kwargs)
+
+    def generate_train_batch():
+        # Fake nnU-Net call site: same locals, same call shape.
+        eligible_classes_or_regions = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        return np.random.choice(len(eligible_classes_or_regions))
+
+    np.random.choice = biased_test_choice
+    try:
+        for _ in range(n_trials):
+            generate_train_batch()
+    finally:
+        np.random.choice = original_np_choice
+
+    return n_trials, n_calls, n_l6_returns
+
+
+# =============================================================================
 # W&B mixin (6-way subgroup tracking)
 # =============================================================================
 
@@ -457,6 +656,12 @@ class _WandBMixin:
     _l6_patch_bias_target_frac: float = 0.6
     _lumb_case_id_set: Optional[Set[str]] = None
 
+    # Diagnostic counters — incremented by the np.random.choice intercept.
+    # Cumulative across the run (not reset per epoch).
+    _bias_call_count: int = 0
+    _bias_l6_returns: int = 0
+    _bias_sacrum_returns: int = 0
+
     def _progress_json_path(self):
         out = getattr(self, "output_folder", None)
         return join(out, "progress.json") if out else None
@@ -468,6 +673,24 @@ class _WandBMixin:
             with open(path, "r") as f: data = json.load(f)
             return data if isinstance(data, dict) else {}
         except Exception: return {}
+
+    # ── Phase logging helpers (v17 startup tracing) ──────────────────────
+
+    def _phase(self, phase: str, msg: str) -> None:
+        """Single phase log line. Every line is prefixed with
+        [STARTUP] <phase>: ... so logs are grep-friendly."""
+        try:
+            self.print_to_log_file(f"[STARTUP] {phase}: {msg}")
+        except Exception:
+            print(f"[STARTUP] {phase}: {msg}", flush=True)
+
+    def _phase_begin(self, phase: str) -> None:
+        self._phase(phase, "============ BEGIN ============")
+
+    def _phase_end(self, phase: str, ok: bool, note: str = "") -> None:
+        marker = "OK ✓" if ok else "FAILED ✗"
+        suffix = f" — {note}" if note else ""
+        self._phase(phase, f"============ {marker}{suffix} ============")
 
     def _wrap_log_method(self, obj, cache):
         try:
@@ -527,37 +750,41 @@ class _WandBMixin:
     # ── CE reweighting ─────────────────────────────────────────────────
 
     def _maybe_apply_ce_reweighting(self):
+        self._phase_begin("ce_reweight")
         if not _env_truthy("SPINESURG_CE_REWEIGHT", default=True):
-            self.print_to_log_file("CE reweighting: DISABLED via SPINESURG_CE_REWEIGHT=0")
+            self._phase("ce_reweight", "DISABLED via SPINESURG_CE_REWEIGHT=0")
+            self._phase_end("ce_reweight", ok=True, note="disabled")
             return
         try:
             from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
             from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
         except ImportError as e:
-            self.print_to_log_file(f"CE reweighting: import failed: {e}; skipping.")
+            self._phase("ce_reweight", f"IMPORT FAILED: {e}")
+            self._phase_end("ce_reweight", ok=False, note="import failed")
             return
 
-        # Detect the actual number of output classes from the model.
-        # The CE weight tensor MUST be this length, not len(labels) and
-        # not 11. The ignore label has no output channel.
         num_classes = _detect_num_output_classes(self)
-        self.print_to_log_file(
-            f"CE reweighting: detected {num_classes} output classes "
-            f"(network output channels)")
+        self._phase("ce_reweight",
+            f"num_segmentation_heads = {num_classes} (network output channels)")
 
         weights = _build_ce_class_weights(num_classes=num_classes)
         if weights is None:
-            self.print_to_log_file("CE reweighting: weights=None; skipping.")
+            self._phase("ce_reweight", "weights tensor is None; skipping")
+            self._phase_end("ce_reweight", ok=False, note="weights=None")
             return
         if weights.numel() != num_classes:
-            self.print_to_log_file(
-                f"CE reweighting: weight length {weights.numel()} "
-                f"!= num_classes {num_classes}; skipping to avoid crash.")
+            self._phase("ce_reweight",
+                f"weight length {weights.numel()} != num_classes "
+                f"{num_classes}; skipping to avoid crash")
+            self._phase_end("ce_reweight", ok=False, note="size mismatch")
             return
 
         device = getattr(self, "device", torch.device("cuda"))
         weights = weights.to(device)
         ds_enabled = bool(getattr(self, "enable_deep_supervision", True))
+        self._phase("ce_reweight",
+            f"weights = {weights.cpu().numpy().tolist()}")
+        self._phase("ce_reweight", f"deep_supervision = {ds_enabled}")
 
         try:
             soft_dice_kwargs = {
@@ -579,65 +806,85 @@ class _WandBMixin:
                     ds_weights = np.array([1.0 / (2 ** i) for i in range(n_levels)])
                     ds_weights[-1] = 0
                     ds_weights = ds_weights / ds_weights.sum()
+                self._phase("ce_reweight",
+                    f"ds_weights = {[float(w) for w in ds_weights]}")
                 new_loss = DeepSupervisionWrapper(new_loss, ds_weights)
             self.loss = new_loss
-            self.print_to_log_file(
-                f"CE reweighting: ENABLED. weights={weights.cpu().numpy().tolist()}  "
-                f"deep_supervision={ds_enabled}")
+            self._phase("ce_reweight",
+                f"installed DC_and_CE_loss with ignore_label={_IGNORE_LABEL}")
+            self._phase_end("ce_reweight", ok=True)
         except Exception as exc:
-            self.print_to_log_file(f"CE reweighting: failed to install: {exc}; using default loss.")
+            self._phase("ce_reweight",
+                f"INSTALL FAILED: {exc}; using default loss")
+            self._phase_end("ce_reweight", ok=False, note=str(exc))
 
-    # ── L6 patch sampling bias ─────────────────────────────────────────
+    # ── Patch sampling bias (np.random.choice intercept) ───────────────
 
-    # Subtype -> (target class id, env var name, default frac)
+    # Subtype -> (target class id, env var name, default frac).
     # Lumb cases bias patches toward L6 (the class TS misses entirely).
     # sacr_count cases bias patches toward sacrum (the L4/sacrum
     # transition zone is where the missing-L5 morphology is visible).
     _PATCH_BIAS_RULES = {
-        _SUBTYPE_LUMB:       (_L6_LABEL_ID, "SPINESURG_L6_PATCH_BIAS_FRAC", 0.6),
-        _SUBTYPE_SACR_COUNT: (7,             "SPINESURG_SACRUM_PATCH_BIAS_FRAC", 0.5),
+        _SUBTYPE_LUMB:       (_L6_LABEL_ID,     "SPINESURG_L6_PATCH_BIAS_FRAC",     0.6),
+        _SUBTYPE_SACR_COUNT: (_SACRUM_LABEL_ID, "SPINESURG_SACRUM_PATCH_BIAS_FRAC", 0.5),
     }
     _patch_bias_targets: Optional[Dict[str, int]] = None  # cid -> target_class
     _patch_bias_fracs:   Optional[Dict[str, float]] = None  # cid -> frac
 
     def _maybe_apply_l6_patch_bias(self):
-        """Install per-case patch-class bias on the dataloader.
+        """Install per-class patch sampling bias on the dataloader.
 
-        For each case in the training set whose LSTV subtype has a bias
-        rule (see _PATCH_BIAS_RULES), patches sampled from that case are
-        biased toward the rule's target class with the rule's
-        probability. Cases without a bias rule are unchanged.
+        Implementation: monkey-patch ``np.random.choice`` only while
+        ``generate_train_batch`` is executing. The intercept inspects
+        the caller's frame to find ``eligible_classes_or_regions``,
+        then applies ``_select_biased_index`` to decide whether to
+        override the choice.
 
-        Method name is preserved for backward compat with v10/v11; the
-        feature is now broader than just L6.
+        Method name preserved (``_maybe_apply_l6_patch_bias``) for
+        backward compat with v10/v11 logs; the feature is broader than
+        L6 — see ``_PATCH_BIAS_RULES``.
         """
+        self._phase_begin("patch_bias")
         if not _env_truthy("SPINESURG_L6_PATCH_BIAS", default=True):
-            self.print_to_log_file("Patch-class bias: DISABLED via SPINESURG_L6_PATCH_BIAS=0")
+            self._phase("patch_bias", "DISABLED via SPINESURG_L6_PATCH_BIAS=0")
+            self._phase_end("patch_bias", ok=True, note="disabled")
             return
 
         if self._val_case_to_subtype is None:
+            self._phase("patch_bias",
+                "subtype map not yet loaded; calling _maybe_load_subtype_map")
             self._maybe_load_subtype_map()
 
-        # Build per-case lookup: case_id -> target_class, case_id -> frac
+        # Resolve env-overridden fracs at install time so the intercept
+        # doesn't have to read env on every call.
+        rules: Dict[str, Tuple[int, str, float]] = {}
+        for sub, (target_cls, env_name, default_frac) in self._PATCH_BIAS_RULES.items():
+            try:
+                frac = max(0.0, min(0.95, _env_float(env_name, default_frac)))
+            except Exception:
+                frac = default_frac
+            rules[sub] = (target_cls, env_name, frac)
+            self._phase("patch_bias",
+                f"rule: {sub} -> class {target_cls} @ frac={frac:.2f} "
+                f"(env {env_name})")
+
+        # Build informational per-case maps (used only for the install-
+        # time log line; intercept itself is content-driven, not
+        # case-id-driven).
         targets: Dict[str, int] = {}
         fracs: Dict[str, float] = {}
         per_subtype_count: Counter = Counter()
         if self._val_case_to_subtype:
             for cid, sub in self._val_case_to_subtype.items():
-                rule = self._PATCH_BIAS_RULES.get(sub)
-                if rule is None:
-                    continue
-                target_cls, env_name, default_frac = rule
-                try:
-                    frac = max(0.0, min(0.95, _env_float(env_name, default_frac)))
-                except Exception:
-                    frac = default_frac
-                targets[cid] = target_cls
-                fracs[cid] = frac
-                per_subtype_count[sub] += 1
+                if sub in rules:
+                    target_cls, _, frac = rules[sub]
+                    targets[cid] = target_cls
+                    fracs[cid] = frac
+                    per_subtype_count[sub] += 1
 
         self._patch_bias_targets = targets
         self._patch_bias_fracs = fracs
+        self._patch_bias_rules_resolved = rules
         self._l6_patch_bias_enabled = True
 
         # Backward-compat alias (some downstream code may still read this)
@@ -645,144 +892,490 @@ class _WandBMixin:
             cid for cid, t in targets.items() if t == _L6_LABEL_ID
         }
 
+        self._phase("patch_bias",
+            f"informational pool: {dict(per_subtype_count)} "
+            f"({len(targets)} cases match a rule)")
         if not targets:
-            self.print_to_log_file(
-                "Patch-class bias: subtype map empty or no biased subtypes; "
-                "hook will be inactive.")
-            return
-
-        rule_summary = ", ".join(
-            f"{sub}->{self._PATCH_BIAS_RULES[sub][0]}@frac={fracs[next(iter(c for c, s in self._val_case_to_subtype.items() if s == sub))]:.2f}"
-            for sub, n in per_subtype_count.items() if n > 0
-        )
-        self.print_to_log_file(
-            f"Patch-class bias: ENABLED. {len(targets)} cases in bias pool. "
-            f"Rules: {rule_summary}. Per-subtype counts: {dict(per_subtype_count)}")
+            self._phase("patch_bias",
+                "WARN: no cases match any bias rule. Bias will install "
+                "but never fire. Check subtype map loaded correctly.")
 
         loader = getattr(self, "dataloader_train", None)
+        self._phase("patch_bias",
+            f"dataloader_train type: "
+            f"{type(loader).__name__ if loader is not None else None}")
         underlying = loader
+        located_via = "dataloader_train"
         for attr in ("generator", "data_loader", "_data_loader"):
             if hasattr(underlying, attr):
                 cand = getattr(underlying, attr)
+                self._phase("patch_bias",
+                    f"  attr {attr}: type={type(cand).__name__}")
                 if hasattr(cand, "generate_train_batch") or hasattr(cand, "_data"):
                     underlying = cand
+                    located_via = f"dataloader_train.{attr}"
                     break
         if underlying is None or not hasattr(underlying, "generate_train_batch"):
-            self.print_to_log_file(
-                "Patch-class bias: cannot locate dataloader.generate_train_batch; "
-                "framework internals may have changed. Disabling.")
+            self._phase("patch_bias",
+                "ABORT: cannot locate generate_train_batch on dataloader. "
+                "nnU-Net internals may have changed.")
             self._l6_patch_bias_enabled = False
+            self._phase_end("patch_bias", ok=False,
+                note="generate_train_batch not found")
             return
+
+        self._phase("patch_bias",
+            f"located generate_train_batch via {located_via} "
+            f"({type(underlying).__name__})")
+
+        # Run startup self-test BEFORE installing the real hook. Catches
+        # frame-inspection breakage in this Python (the v15 silent-no-op
+        # bug class) at startup instead of after hours of training.
+        self._phase("patch_bias", "running self-test (200 trials)...")
+        try:
+            n_trials, n_calls, n_l6 = _selftest_patch_bias(rules, n_trials=200)
+            self._phase("patch_bias",
+                f"self-test results: trials={n_trials} "
+                f"intercept_calls={n_calls} L6_returns={n_l6}")
+            if n_calls != n_trials:
+                self._phase("patch_bias",
+                    f"SELF-TEST FAILED: intercept fired only "
+                    f"{n_calls}/{n_trials}. Frame inspection may be "
+                    f"broken; bias hook will be a no-op.")
+            elif n_l6 < 30 or n_l6 > 170:
+                # Expected for lumb frac=0.6 -> ~120 returns. Wide window.
+                self._phase("patch_bias",
+                    f"SELF-TEST WARN: L6 returns {n_l6}/{n_trials} outside "
+                    f"plausible range [30,170] for frac=0.6.")
+            else:
+                self._phase("patch_bias", "self-test PASSED ✓")
+        except Exception as exc:
+            self._phase("patch_bias", f"self-test threw exception: {exc}")
 
         trainer_ref = self
         original_gen = underlying.generate_train_batch
+        original_np_choice = np.random.choice
+
+        # Reset diagnostic counters
+        trainer_ref._bias_call_count = 0
+        trainer_ref._bias_l6_returns = 0
+        trainer_ref._bias_sacrum_returns = 0
+
+        def biased_np_choice(*args, **kwargs):
+            """Replacement for np.random.choice. Only intercepts the
+            specific call pattern used by nnU-Net v2's
+            base_data_loader.py:121:
+                np.random.choice(len(eligible_classes_or_regions))
+
+            Everything else (size=, p=, replace=, multi-arg, called
+            from outside generate_train_batch) passes through to the
+            original implementation untouched.
+            """
+            try:
+                # Detect the specific 1-arg-int call shape.
+                if (len(args) == 1
+                        and not kwargs
+                        and isinstance(args[0], (int, np.integer))):
+                    # Look up one frame to confirm it's the class-selection
+                    # call inside generate_train_batch (NOT the subsequent
+                    # voxel-selection call inside the same function, which
+                    # uses a different local variable, and NOT some
+                    # unrelated np.random.choice elsewhere).
+                    frame = sys._getframe(1)
+                    if frame.f_code.co_name == "generate_train_batch":
+                        eligible = frame.f_locals.get("eligible_classes_or_regions")
+                        if (eligible is not None
+                                and hasattr(eligible, "__len__")
+                                and len(eligible) == int(args[0])
+                                and len(eligible) > 1):
+                            trainer_ref._bias_call_count += 1
+                            biased_idx = _select_biased_index(
+                                eligible,
+                                trainer_ref._patch_bias_rules_resolved,
+                                random.random,
+                            )
+                            if biased_idx is not None:
+                                cls = eligible[biased_idx]
+                                if isinstance(cls, (int, np.integer)):
+                                    if int(cls) == _L6_LABEL_ID:
+                                        trainer_ref._bias_l6_returns += 1
+                                    elif int(cls) == _SACRUM_LABEL_ID:
+                                        trainer_ref._bias_sacrum_returns += 1
+                                return biased_idx
+            except Exception:
+                # Never let the intercept break training.
+                pass
+            return original_np_choice(*args, **kwargs)
+
+        # First-batch diagnostic state — fires exactly once on the
+        # first call to confirm the hook + queue are active.
+        trainer_ref._first_batch_logged = False
 
         def patched_generate_train_batch(*args, **kwargs):
             if not trainer_ref._l6_patch_bias_enabled:
                 return original_gen(*args, **kwargs)
-            targets = trainer_ref._patch_bias_targets or {}
-            fracs = trainer_ref._patch_bias_fracs or {}
-            if not targets:
-                return original_gen(*args, **kwargs)
-            original_choice = random.choice
-
-            # We can't see *which* case the loader is currently building
-            # a patch for from inside random.choice. Workaround: pick a
-            # representative bias frac (max across rules) and a rotating
-            # target class. This still works because nnU-Net calls
-            # random.choice once per patch from a class list that is
-            # the case's foreground classes; if the target class is in
-            # that list, the case is one with that morphology.
-            # Better: peek at the most recent case_id from the loader's
-            # internal state if we can find it.
-            def biased_choice(seq, *a, **k):
-                try:
-                    if isinstance(seq, (list, tuple)) and len(seq) > 1 \
-                            and all(isinstance(x, (int, np.integer)) for x in seq):
-                        seq_set = set(int(x) for x in seq)
-                        # Detection logic, partial-annotation safe:
-                        #
-                        #   lumb case      => L6 (class 6) is in the case's
-                        #                     foreground class list. Only
-                        #                     lumb cases have L6.
-                        #
-                        #   sacr_count     => sacrum (7) IS in the fg list,
-                        #                     L5 (5) is NOT, and L4 (4) IS.
-                        #                     The "L4 is" check is critical:
-                        #                     pelvic-only cases also lack L5
-                        #                     (it's masked as ignore there)
-                        #                     but they also lack L4. Only
-                        #                     true sacr_count anatomy has
-                        #                     L1-L4 + sacrum without L5.
-                        #
-                        # Note: nnU-Net's foreground class list comes from
-                        # the case's seg array EXCLUDING the ignore label
-                        # (10). So a spine-only sacr_count case's fg list
-                        # is {1,2,3,4,7}; a pelvic-only case is {7,8,9}; a
-                        # lumb spine-only is {1,2,3,4,5,6,7}; a lumb
-                        # pelvic-only is {7,8,9} (no L6). This means the
-                        # L6 patch bias correctly does NOT trigger on
-                        # pelvic-only records of lumb patients (L6 is not
-                        # in seq_set there) — those records just pass
-                        # through with default sampling.
-                        if _L6_LABEL_ID in seq_set:
-                            # lumb case (any view that has L6 annotated)
-                            if random.random() < trainer_ref._PATCH_BIAS_RULES[_SUBTYPE_LUMB][2]:
-                                return _L6_LABEL_ID
-                        elif (7 in seq_set
-                              and 5 not in seq_set
-                              and 4 in seq_set):
-                            # sacr_count case (anatomy: L1-L4 + sacrum, no L5)
-                            if random.random() < trainer_ref._PATCH_BIAS_RULES[_SUBTYPE_SACR_COUNT][2]:
-                                return 7
-                except Exception:
-                    pass
-                return original_choice(seq, *a, **k)
-
-            random.choice = biased_choice
+            np.random.choice = biased_np_choice
             try:
-                return original_gen(*args, **kwargs)
+                result = original_gen(*args, **kwargs)
             finally:
-                random.choice = original_choice
+                np.random.choice = original_np_choice
+            if not trainer_ref._first_batch_logged:
+                trainer_ref._first_batch_logged = True
+                try:
+                    trainer_ref._log_first_batch_diagnostic(result)
+                except Exception as exc:
+                    trainer_ref.print_to_log_file(
+                        f"first-batch diagnostic: failed: {exc}")
+            return result
 
         underlying.generate_train_batch = patched_generate_train_batch
-        self.print_to_log_file(
-            "Patch-class bias: hook installed on dataloader.generate_train_batch.")
+        self._phase("patch_bias",
+            f"installed: {located_via}.generate_train_batch wrapped "
+            f"(np.random.choice intercept active during call)")
+        self._phase_end("patch_bias", ok=True,
+            note=f"{len(targets)} cases match rules")
+
+    # ── Startup diagnostics ──────────────────────────────────────────────
+
+    def _emit_startup_diagnostics(self) -> None:
+        """Dump every relevant configuration value, pool composition,
+        env-var override, and hook-install status as a single banner.
+
+        Output is intentionally verbose: we want one grep-able block
+        in the SLURM log that confirms whether oversampling, patch
+        bias, CE reweighting, and per-subgroup tracking are each live.
+        """
+        log = self.print_to_log_file
+        try:
+            log("")
+            log("=" * 72)
+            log("SPINESURG-CT TRAINER STARTUP DIAGNOSTICS")
+            log("=" * 72)
+
+            log(f"  trainer class:    {type(self).__name__}")
+            try: ds_name = self.plans_manager.dataset_name
+            except Exception: ds_name = "<unknown>"
+            log(f"  dataset:          {ds_name}")
+            log(f"  fold:             {getattr(self, 'fold', '?')}")
+            try:
+                log(f"  num_epochs:       {self.num_epochs}")
+                log(f"  iters/epoch:      {getattr(self, 'num_iterations_per_epoch', '?')}")
+                log(f"  val iters/epoch:  {getattr(self, 'num_val_iterations_per_epoch', '?')}")
+            except Exception: pass
+
+            log("")
+            log("  ENVIRONMENT OVERRIDES (SPINESURG_*, LSTV_*, nnUNet_*)")
+            env_keys = sorted(
+                k for k in os.environ
+                if k.startswith("SPINESURG_") or k.startswith("LSTV_")
+                or k in ("nnUNet_raw", "nnUNet_preprocessed", "nnUNet_results")
+            )
+            if not env_keys:
+                log("    <none set; all defaults>")
+            for k in env_keys:
+                v = os.environ[k]
+                if len(v) > 100: v = v[:97] + "..."
+                log(f"    {k} = {v}")
+
+            log("")
+            log("  LSTV CASES JSON")
+            json_found = False
+            try:
+                for jp in _candidate_lstv_json_paths(ds_name):
+                    log(f"    candidate path: {jp}  (exists={jp.exists()})")
+                    if jp.exists() and not json_found:
+                        try:
+                            data = json.loads(jp.read_text())
+                            schema = data.get("schema_version", "?")
+                            n_cases = (
+                                len(data.get("case_to_subtype", {}))
+                                if int(schema) >= 3
+                                else len(data.get("case_ids", {}))
+                            )
+                            log(f"    -> loaded: schema_version={schema}, "
+                                f"{n_cases} cases")
+                            sc = data.get("subtype_counts") or {}
+                            if sc:
+                                log(f"    -> subtype_counts (raw, in JSON): {dict(sc)}")
+                            json_found = True
+                        except Exception as exc:
+                            log(f"    -> load FAILED: {exc}")
+            except Exception as exc:
+                log(f"    candidate-path enumeration failed: {exc}")
+            if not json_found:
+                log("    -> no JSON found; will fall back to manifests/L6 scan")
+
+            log("")
+            log("  OVERSAMPLE POOL")
+            log(f"    code-resident _OVERSAMPLE_SUBTYPES = {_OVERSAMPLE_SUBTYPES}")
+            try:
+                frac = float(os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.25"))
+            except ValueError:
+                frac = 0.25
+            log(f"    LSTV_OVERSAMPLE_FRAC = {frac:.3f} (target queue fraction)")
+            pool_ids = getattr(self, "_lstv_case_ids", None)
+            if pool_ids is None:
+                log("    pool not yet identified (oversample mixin pre-run)")
+            else:
+                log(f"    pool size: {len(pool_ids)} cases")
+                if self._val_case_to_subtype:
+                    by_sub = Counter(
+                        self._val_case_to_subtype.get(c, "<unmapped>")
+                        for c in pool_ids
+                    )
+                    log(f"    pool by subtype: {dict(by_sub)}")
+                src = getattr(self, "_lstv_detection_source", None)
+                if src: log(f"    detection source: {src}")
+                examples = sorted(pool_ids)[:5]
+                log(f"    sample case IDs (first 5 sorted): {examples}")
+
+            try:
+                loader = getattr(self, "dataloader_train", None)
+                fold_keys = self._extract_loader_keys_for_diagnostic(loader)
+                if fold_keys is not None and pool_ids is not None:
+                    fold_set = set(fold_keys)
+                    n_in_fold = len(fold_set)
+                    pool_in_fold = fold_set & set(pool_ids)
+                    natural_frac = len(pool_in_fold) / max(1, n_in_fold)
+                    log("")
+                    log("  TRAIN FOLD INTERSECTION")
+                    log(f"    train keys in this fold: {n_in_fold}")
+                    log(f"    LSTV pool members in fold: {len(pool_in_fold)} "
+                        f"({natural_frac*100:.1f}% natural)")
+                    if self._val_case_to_subtype and pool_in_fold:
+                        in_fold_by_sub = Counter(
+                            self._val_case_to_subtype.get(c, "<unmapped>")
+                            for c in pool_in_fold
+                        )
+                        log(f"    in-fold pool by subtype: {dict(in_fold_by_sub)}")
+                    if natural_frac < frac:
+                        gap = frac - natural_frac
+                        log(f"    -> oversampler will duplicate to "
+                            f"close gap of {gap*100:.1f}pp")
+                    else:
+                        log("    -> natural frac already >= target; "
+                            "oversampler will be a no-op")
+            except Exception as exc:
+                log(f"    fold intersection diagnostic failed: {exc}")
+
+            log("")
+            log("  PATCH-CLASS BIAS HOOK")
+            bias_enabled = getattr(self, "_l6_patch_bias_enabled", False)
+            log(f"    enabled: {bias_enabled}")
+            rules_resolved = getattr(self, "_patch_bias_rules_resolved", None)
+            if rules_resolved:
+                for sub, (target_cls, env_name, frac) in rules_resolved.items():
+                    target_name = (_ANATOMY_NAMES[target_cls - 1]
+                                   if 1 <= target_cls <= len(_ANATOMY_NAMES)
+                                   else f"label_{target_cls}")
+                    log(f"    rule: {sub:<20s} -> {target_name} "
+                        f"(label={target_cls}) @ frac={frac:.2f} "
+                        f"[env: {env_name}]")
+            else:
+                log("    no rules resolved (hook may have failed install)")
+            log(f"    counters: calls={self._bias_call_count} "
+                f"L6_returns={self._bias_l6_returns} "
+                f"sacrum_returns={self._bias_sacrum_returns}")
+            log("    NOTE: counters increment on first batch — see "
+                "FIRST-BATCH log below for confirmation.")
+
+            log("")
+            log("  PER-SUBGROUP VAL DICE")
+            log(f"    enabled: {self._per_subgroup_logging_enabled}")
+            if self._val_case_to_subtype is not None:
+                log(f"    subtype map size: {len(self._val_case_to_subtype)} cases")
+                map_counts = Counter(self._val_case_to_subtype.values())
+                log(f"    subtype distribution: {dict(map_counts)}")
+            log(f"    classes tracked: {_ANATOMY_NAMES}")
+
+            ce_w = getattr(self, "_ce_class_weights", None)
+            if ce_w is not None:
+                log("")
+                log("  CE CLASS REWEIGHTING")
+                try:
+                    ce_str = ", ".join(
+                        f"{_ANATOMY_NAMES[i-1] if 1 <= i <= 9 else 'bg' if i==0 else f'lab{i}'}"
+                        f"={float(w):.2f}"
+                        for i, w in enumerate(ce_w)
+                    )
+                    log(f"    weights: [{ce_str}]")
+                except Exception:
+                    log(f"    weights: {ce_w}")
+            else:
+                log("")
+                log("  CE CLASS REWEIGHTING: not visible at banner time "
+                    "(check the 'CE reweighting: ENABLED' line earlier in log)")
+
+            log("")
+            log("  WANDB")
+            wb_run = getattr(self, "_wandb_run", None)
+            if wb_run is not None:
+                try:
+                    log(f"    run: {wb_run.name}  id: {wb_run.id}")
+                    log(f"    project: {wb_run.project}")
+                except Exception:
+                    log(f"    run: {wb_run}")
+            else:
+                log("    no W&B run active")
+
+            log("=" * 72)
+            log("END STARTUP DIAGNOSTICS")
+            log("=" * 72)
+            log("")
+        except Exception as exc:
+            try: self.print_to_log_file(f"startup diagnostics: failed: {exc}")
+            except Exception: pass
+
+    @staticmethod
+    def _extract_loader_keys_for_diagnostic(loader) -> Optional[List[str]]:
+        """Best-effort key extraction; returns None if framework
+        internals don't expose a key list. Mirrors the attribute-walk
+        used by `_apply_lstv_sampler`."""
+        if loader is None: return None
+        for path in (("generator", "_data", "identifiers"),
+                      ("generator", "_data", "keys"),
+                      ("_data", "identifiers"), ("_data", "keys"),
+                      ("data_loader", "_data", "identifiers"),
+                      ("data_loader", "_data", "keys")):
+            obj = loader
+            for p in path[:-1]:
+                obj = getattr(obj, p, None)
+                if obj is None: break
+            else:
+                cand = getattr(obj, path[-1], None)
+                if callable(cand):
+                    try: cand = list(cand())
+                    except Exception: continue
+                else:
+                    try: cand = list(cand)
+                    except Exception: continue
+                if cand and all(isinstance(k, str) for k in cand):
+                    return cand
+        return None
+
+    def _log_first_batch_diagnostic(self, batch_result) -> None:
+        """One-shot log fired the first time generate_train_batch is
+        entered. Confirms (a) the patched function was reached, (b)
+        what case keys are in the first batch, and (c) the bias-counter
+        state immediately after the first call."""
+        log = self.print_to_log_file
+        log("")
+        log("─" * 72)
+        log("FIRST BATCH DIAGNOSTIC (one-shot)")
+        log("─" * 72)
+        log("  ✓ patched generate_train_batch was called "
+            "(if you see this, the hook is plumbed)")
+        log(f"  bias counters after batch 0: "
+            f"calls={self._bias_call_count} "
+            f"L6_returns={self._bias_l6_returns} "
+            f"sacrum_returns={self._bias_sacrum_returns}")
+
+        keys = None
+        if isinstance(batch_result, dict):
+            for k in ("keys", "identifiers", "case_ids"):
+                if k in batch_result:
+                    cand = batch_result[k]
+                    try:
+                        keys = list(cand)
+                        break
+                    except Exception:
+                        pass
+        if keys:
+            log(f"  case keys in first batch (n={len(keys)}): {keys}")
+            if self._val_case_to_subtype:
+                subs = [self._val_case_to_subtype.get(str(k), "?") for k in keys]
+                log(f"  case subtypes:                       {subs}")
+            pool = getattr(self, "_lstv_case_ids", None) or set()
+            if pool:
+                hits = [str(k) in pool for k in keys]
+                log(f"  in oversample pool:                  {hits}  "
+                    f"({sum(hits)}/{len(hits)} are LSTV)")
+        else:
+            log("  (case keys not exposed by this nnU-Net build; "
+                "skipping per-key breakdown)")
+
+        if self._bias_call_count == 0:
+            log("  NOTE: bias_call_count=0 after first batch is normal "
+                "if oversample_foreground_percent < 1.0 — force_fg")
+            log("        patches are sampled probabilistically. Counter")
+            log("        should grow over the first epoch; check the")
+            log("        per-epoch summary log.")
+        log("─" * 72)
+        log("")
 
     # ── Per-subgroup setup ───────────────────────────────────────────────
 
     def _maybe_load_subtype_map(self):
+        self._phase_begin("subtype_map")
         self._per_subgroup_logging_enabled = _env_truthy(
             "SPINESURG_LSTV_PER_GROUP_DICE", default=True)
         if not self._per_subgroup_logging_enabled:
-            self.print_to_log_file("LSTV per-subgroup dice: DISABLED")
+            self._phase("subtype_map",
+                "DISABLED via SPINESURG_LSTV_PER_GROUP_DICE=0")
+            self._phase_end("subtype_map", ok=True, note="disabled")
             return
         if self._val_case_to_subtype is not None:
+            self._phase("subtype_map",
+                f"already loaded ({len(self._val_case_to_subtype)} cases)")
+            self._phase_end("subtype_map", ok=True, note="cached")
             return
+
         try: ds_name = self.plans_manager.dataset_name
         except Exception: ds_name = None
+        self._phase("subtype_map", f"dataset_name = {ds_name!r}")
+
         case_to_sub: Dict[str, str] = {}
+        loaded_from = None
         if ds_name:
             for jp in _candidate_lstv_json_paths(ds_name):
+                self._phase("subtype_map",
+                    f"probe lstv_cases.json: {jp}  exists={jp.exists()}")
                 result = _read_lstv_cases_json(jp)
                 if result is not None:
                     _, subtypes, case_to_sub, _ = result
-                    self.print_to_log_file(
-                        f"LSTV per-subgroup: loaded subtype map from {jp} "
-                        f"({len(case_to_sub)} cases total)")
-                    self.print_to_log_file(f"  subtype counts: {dict(subtypes)}")
+                    self._phase("subtype_map",
+                        f"loaded {len(case_to_sub)} cases from {jp}")
+                    self._phase("subtype_map",
+                        f"subtype counts: {dict(subtypes)}")
+                    loaded_from = str(jp)
                     break
         if not case_to_sub:
             for hf_dir in _candidate_hf_export_dirs():
+                self._phase("subtype_map",
+                    f"probe HF manifest dir: {hf_dir}  "
+                    f"exists={hf_dir.is_dir()}")
                 result = _read_lstv_records_from_manifest(hf_dir)
                 if result is not None:
-                    _, _, case_to_sub, _ = result
-                    self.print_to_log_file(
-                        f"LSTV per-subgroup: loaded subtype map from manifests at {hf_dir}")
+                    _, subtypes, case_to_sub, _ = result
+                    self._phase("subtype_map",
+                        f"loaded {len(case_to_sub)} cases from manifests at "
+                        f"{hf_dir}")
+                    self._phase("subtype_map",
+                        f"subtype counts: {dict(subtypes)}")
+                    loaded_from = f"manifest:{hf_dir}"
                     break
         self._val_case_to_subtype = case_to_sub
         if not case_to_sub:
-            self.print_to_log_file("LSTV per-subgroup: no subtype map; all cases -> 'normal'")
+            self._phase("subtype_map",
+                "no subtype map found; all cases will fall back to 'normal'")
+            self._phase_end("subtype_map", ok=False, note="no map found")
+            return
+
+        # Show oversample-pool composition.
+        n_oversample = sum(1 for s in case_to_sub.values()
+                            if s in _OVERSAMPLE_SUBTYPES)
+        self._phase("subtype_map",
+            f"oversample-pool size: {n_oversample} cases "
+            f"(eligible subtypes: {sorted(_OVERSAMPLE_SUBTYPES)})")
+        # Show a few example case_ids per subtype for sanity-checking.
+        for sub in _KNOWN_SUBTYPES:
+            ids_for_sub = [cid for cid, s in case_to_sub.items() if s == sub]
+            if ids_for_sub:
+                preview = ", ".join(ids_for_sub[:3])
+                if len(ids_for_sub) > 3:
+                    preview += f", ... ({len(ids_for_sub)} total)"
+                self._phase("subtype_map", f"  {sub:<20s} -> {preview}")
+        self._phase_end("subtype_map", ok=True, note=f"source={loaded_from}")
 
     def _reset_subgroup_dice_buffer(self):
         self._val_subgroup_dice = {sub: [] for sub in _KNOWN_SUBTYPES}
@@ -883,6 +1476,10 @@ class _WandBMixin:
             out["val/lstv_subgroup/any_sacralization/mean_fg_dice"] = float(np.mean(any_sacr_means))
             out["val/lstv_subgroup/any_sacralization/n_cases"] = float(len(any_sacr_means))
 
+        # Cumulative bias-hook diagnostic counters.
+        out["debug/bias_hook/total_calls"]   = float(self._bias_call_count)
+        out["debug/bias_hook/L6_picks"]      = float(self._bias_l6_returns)
+        out["debug/bias_hook/sacrum_picks"]  = float(self._bias_sacrum_returns)
         return out
 
     def _print_per_subgroup_summary(self, epoch, payload):
@@ -914,6 +1511,14 @@ class _WandBMixin:
             if l6 is not None and l6n is not None:
                 self.print_to_log_file(
                     f"  HEADLINE: L6 dice on lumbarization cases = {l6:.3f}  (n={int(l6n)})")
+            # Bias-hook diagnostic line. If total_calls is zero by epoch
+            # 1, the hook never fired and the install is broken.
+            calls = int(payload.get("debug/bias_hook/total_calls", 0))
+            l6p   = int(payload.get("debug/bias_hook/L6_picks", 0))
+            sp    = int(payload.get("debug/bias_hook/sacrum_picks", 0))
+            self.print_to_log_file(
+                f"  bias hook (cumulative): calls={calls}  L6_picks={l6p}  "
+                f"sacrum_picks={sp}")
         except Exception as exc:
             try: self.print_to_log_file(f"per-subgroup summary failed: {exc}")
             except Exception: pass
@@ -1149,6 +1754,10 @@ class _WandBMixin:
                         if not np.isnan(vf): seq.append(vf)
                     if seq and ci < len(_ANATOMY_NAMES):
                         summary[f"summary/best_dice/{_ANATOMY_NAMES[ci]}"] = max(seq)
+            # Lifetime bias-hook stats
+            summary["summary/bias_hook_total_calls"]  = float(self._bias_call_count)
+            summary["summary/bias_hook_L6_picks"]     = float(self._bias_l6_returns)
+            summary["summary/bias_hook_sacrum_picks"] = float(self._bias_sacrum_returns)
             if summary: self._log_wandb(summary)
         except Exception: pass
         super().on_train_end()
@@ -1174,12 +1783,21 @@ def _as_float(x):
 # =============================================================================
 
 class _LSTVOversampleMixin:
-    """Oversample lumb + sacr_count + sacralization cases at the dataloader queue level.
+    """Oversample all 5 LSTV variant subtypes at the dataloader queue level.
 
-    Excluded from oversampling (n too small):
-    - normal (we oversample MINORITIES)
-    - semisacralization (n=3 records; oversampling memorizes)
-    - ambiguous (n=4 records, n=2 patients)
+    Pool composition (5 of 6 subtypes; 'normal' is the majority and
+    by definition not oversampled):
+      - lumb              (lumbarization, L6 present)
+      - sacr_count        (sacralization with full L5->sacrum count change)
+      - sacralization     (sacral-wing morphology, count unchanged)
+      - semisacralization (unilateral sacral-wing fusion)
+      - ambiguous         (uncertain Castellvi classification)
+
+    Rationale: every non-normal LSTV variant deserves more training
+    exposure than its natural frequency. ambiguous and semisacralization
+    are rare (n<5 each) — they can only be over-represented through
+    duplication, which is acceptable given the alternative (the model
+    rarely sees them at all during training).
     """
     _lstv_case_ids: Optional[Set[str]] = None
     _lstv_subtype_counts: Optional[Counter] = None
@@ -1201,12 +1819,20 @@ class _LSTVOversampleMixin:
                     self._lstv_case_ids = pool_set
                     self._lstv_subtype_counts = subtypes
                     self._lstv_detection_source = f"json:{jp}"
-                    n_excluded = len(case_to_sub) - len(pool_set) - subtypes.get(_SUBTYPE_NORMAL, 0)
+                    n_normal = subtypes.get(_SUBTYPE_NORMAL, 0)
+                    n_other_excluded = (
+                        len(case_to_sub) - len(pool_set) - n_normal
+                    )
+                    pool_subtype_counts = Counter(
+                        case_to_sub[c] for c in pool_set if c in case_to_sub
+                    )
                     self.print_to_log_file(
                         f"LSTV oversample: loaded {len(case_to_sub)} cases; "
-                        f"using {len(pool_set)} for oversampling "
-                        f"(excluded {n_excluded} as too rare: semi/ambig). "
-                        f"Subtypes: {dict(subtypes)}")
+                        f"using {len(pool_set)} for oversampling (normals "
+                        f"excluded: {n_normal}; other excluded: "
+                        f"{n_other_excluded}). "
+                        f"Pool by subtype: {dict(pool_subtype_counts)}. "
+                        f"Full subtype counts: {dict(subtypes)}")
                     return pool_set
 
         for hf_dir in _candidate_hf_export_dirs():
@@ -1311,6 +1937,14 @@ class _LSTVOversampleMixin:
         super().on_train_start()
         try: self._apply_lstv_sampler()
         except Exception as exc: self.print_to_log_file(f"LSTV oversample: {exc}")
+        # Banner runs LAST so it captures post-sampler pool composition.
+        # super().on_train_start() above ran _WandBMixin's setup
+        # (subtype map, CE reweight, patch-bias hook, W&B init);
+        # _apply_lstv_sampler then duplicated keys to hit the target
+        # frac. Now dump everything as one grep-able block.
+        try: self._emit_startup_diagnostics()
+        except Exception as exc:
+            self.print_to_log_file(f"startup diagnostics: {exc}")
 
 
 # =============================================================================
@@ -1353,12 +1987,22 @@ class nnUNetTrainerWandB_500ep_LSTVOversample(
     """500 epochs + LSTV queue oversample + L6 patch bias + CE reweight.
     DEFAULT for the SpineSurg-CT paper run.
 
+    v17: Oversample pool now includes all 5 LSTV variants (added
+         ambiguous, n=4). Symmetric per-record subtype refinement at
+         convert time: spine_only demotes pelvis-region subtypes
+         (sacralization, semisacralization), pelvic_native demotes
+         lumbar-region subtypes (lumb, sacr_count). Verbose
+         startup-diagnostic banner emitted via
+         _emit_startup_diagnostics. First-batch diagnostic confirms
+         hook + queue plumbing on the first generate_train_batch call.
+    v16: Patch-bias hook now patches np.random.choice (was patching
+         stdlib random.choice — wrong target, hook was a no-op).
+         Added bias_call_count / L6_picks / sacrum_picks counters.
     v12: Per-subgroup dice logger no longer crashes on numpy keys array
          (was using truthy fallback chain that numpy rejects).
     v11: CE weight tensor sized to actual network output (was 11; should
          be num_segmentation_heads, typically 10 for our schema).
     v10: 6-way subgroups; semisacralization separated from sacralization.
-         Oversample pool excludes semi (n=3) and ambiguous (n=4).
     """
     def __init__(self, plans, configuration, fold, dataset_json,
                  unpack_dataset=True, device=torch.device('cuda')):
