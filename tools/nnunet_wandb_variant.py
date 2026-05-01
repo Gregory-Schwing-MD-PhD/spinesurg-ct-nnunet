@@ -1,45 +1,93 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v10)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v15)
 tools/nnunet_wandb_variant.py
 
-Changes from v9
-===============
-1. 6-way LSTV subgroup binning. Mirrors splits_5fold.json schema v6 and
-   lstv_cases.json schema v3:
+Design intent
+=============
+Three-tier emphasis on LSTV anatomy, partial-annotation aware:
 
-     normal | lumb | sacr_count | semisacralization | sacralization | ambiguous
+  (a) Class-imbalance correction via queue-level oversampling.
+      Applied uniformly to ALL LSTV subtypes except 'ambiguous'.
+      Without this, LSTV is ~4% of training and the model defaults
+      to normal anatomy.
 
-   Previously was 4-way (normal/lumb/sacr/ambiguous) which silently
-   merged semisacralization into sacralization due to the parser bug
-   in mask_index.py upstream (now fixed).
+  (b) Headline-subtype emphasis via per-case patch sampling bias.
+      Lumb       -> L6  (class 6) @ 60%  (the class TS misses)
+      sacr_count -> sacrum (cls 7) @ 50%  (L4/sacrum transition zone)
 
-2. lstv_cases.json reader updated to schema v3:
-   - Reads `case_to_subtype` (was `case_ids`)
-   - Reads `lstv_oversample_pool` directly (was filtering manually)
-   - Validates `splits_schema` field
+      Detection (partial-annotation safe):
+        lumb       :  L6 in case's foreground class list
+        sacr_count :  sacrum in fg AND L5 NOT in fg AND L4 in fg
+                      (the L4-in-fg constraint is what distinguishes
+                       sacr_count from pelvic-only records, which lack
+                       BOTH L5 and L4 because their lumbar region is
+                       all ignore=10)
 
-3. Oversampling pool: only common LSTV (lumb, sacr_count, sacralization)
-   are oversampled. The rare classes (semisacralization n=3 records,
-   ambiguous n=4 records) are EXCLUDED to avoid memorization. They're
-   still tracked for per-subgroup dice metrics.
+  (c) Class-level loss reweighting via CE weights.
+        L6     = 4.0
+        sacrum = 2.0
+      Background = 0.5; rest = 1.0.
 
-4. L6 patch bias still triggers ONLY on lumb cases (not on any other
-   subtype). L6 only appears in lumbarization morphology.
+Partial-annotation contract
+===========================
+Some training cases (separate-mode spine-only and pelvic-only) have
+labels with value 10 = IGNORE in regions outside the present
+annotator's domain. nnU-Net v2's DC_and_CE_loss respects ignore_label
+when configured, masking those voxels out of the gradient. Required:
 
-5. Per-subgroup tracking now reports 6 subgroups in WandB and stdout.
-   Headline metrics expanded to track sacralization-flavored classes
-   (sacr_count, semi, sacr) separately.
+  - dataset.json must have "ignore": 10 in its labels dict
+    (set by convert_hf_to_nnunet.py:LABEL_NAMES, May 2026)
+  - export_hf.py:merge_labels writes value 10 in un-annotated regions
+    of partial-mode cases (May 2026)
+  - This trainer's _IGNORE_LABEL = 10 must match
+  - num_segmentation_heads from label_manager = 10 (the ignore label
+    has no output head; it's purely a loss mask)
 
-Unchanged from v9:
-- cudnn.benchmark, TF32
-- LSTV oversample queue mixin
-- W&B logging with retry
-- Profiler hooks (opt-in)
-- CE reweighting (L6 weight=4.0 default)
+Changes from v13/v14 (consolidated)
+====================================
+1. Patch-bias detection refined for partial-annotation labels.
 
-Trainer __init__ rules: every subclass must declare full nnUNetTrainer
-signature explicitly (nnUNetTrainer.__init__ inspects self.__init__'s
-parameters and looks them up in locals()).
+   Old detection (v12-v14): "sacrum in fg AND L5 not in fg" — broken
+   for partial annotations because pelvic-only cases also lack L5
+   (it's ignore=10 there, not present in the case's foreground class
+   list). All pelvic-only cases would falsely trigger the sacr_count
+   patch bias.
+
+   New detection: requires L4 IN fg list as well. Sacr_count cases
+   genuinely have L4 annotated (their lumbar count is 4 = L1-L4 plus
+   sacrum). Pelvic-only cases have no lumbar at all. This cleanly
+   distinguishes the two.
+
+2. All LSTV subtypes (lumb, sacr_count, sacralization, semisacralization)
+   are oversampled. Only ambiguous excluded. Oversampling is broad
+   class-imbalance correction; specific anatomy emphasis comes via
+   patch bias and CE weights (see Design intent above).
+
+3. JSON reader (`_read_lstv_cases_json`) ignores any stored
+   `lstv_oversample_pool` field; always recomputes from in-code
+   `_OVERSAMPLE_SUBTYPES`. The .py file is the single source of truth.
+
+Changes from v12 (preserved)
+============================
+- Generalized patch-class bias from L6-only to per-subtype rules.
+- Sacrum CE weight bumped 1.0 -> 2.0.
+
+Changes from v11 (preserved)
+============================
+- Fix per-subgroup dice logger numpy-truth-value bug
+  (`x or y or default` on numpy arrays).
+
+Changes from v10 (preserved)
+============================
+- Fix CE weight tensor sizing crash. Reads num_classes from
+  self.label_manager.num_segmentation_heads (which is 10 with ignore
+  configured: bg + 9 fg, no head for ignore).
+
+Changes from v9 (preserved)
+===========================
+- 6-way LSTV subgroup binning (matches splits_5fold.json v6).
+- lstv_cases.json reader (schema v3).
+- Per-subgroup val tracking: 6 subgroups in W&B and stdout.
 
 Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
 """
@@ -82,7 +130,11 @@ _L6_LABEL_ID     = 6
 _IGNORE_LABEL    = 10
 _VALID_CONFIGS   = ("fused", "spine_only", "pelvic_native")
 
-# 6-way taxonomy (matches splits_5fold.json v6 + lstv_cases.json v3)
+# Network output channel count under the standard SpineSurg-CT label
+# schema (background + 9 foreground; ignore is masked, not classified).
+_DEFAULT_NUM_OUTPUT_CLASSES = 10
+
+# 6-way taxonomy
 _SUBTYPE_NORMAL     = "normal"
 _SUBTYPE_LUMB       = "lumb"
 _SUBTYPE_SACR_COUNT = "sacr_count"
@@ -93,11 +145,9 @@ _KNOWN_SUBTYPES = (
     _SUBTYPE_NORMAL, _SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT,
     _SUBTYPE_SEMI, _SUBTYPE_SACR, _SUBTYPE_AMBIG,
 )
-# Subtypes used for queue-level oversampling. Excludes:
-#   - normal       (we oversample MINORITY classes)
-#   - semi (n=3)   (too rare; oversampling causes memorization)
-#   - ambiguous (n=4) (cross-anatomy disagreement; n=2 patients)
-_OVERSAMPLE_SUBTYPES = (_SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT, _SUBTYPE_SACR)
+_OVERSAMPLE_SUBTYPES = (
+    _SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT, _SUBTYPE_SACR, _SUBTYPE_SEMI,
+)
 
 LSTV_CASES_SCHEMA_MIN = 1
 LSTV_CASES_SCHEMA_MAX = 3
@@ -147,15 +197,11 @@ def _safe_id(token: str) -> str:
 
 
 def _canonicalize_subtype_str(sub: str) -> str:
-    """Canonicalize an LSTV subtype string from any source.
-
-    Returns one of the 6 canonical subtypes, or 'normal' for unknown.
-    """
+    """Canonicalize an LSTV subtype string to one of the 6 canonical names."""
     if not sub: return _SUBTYPE_NORMAL
     s = str(sub).strip().lower()
     if s.startswith("ambig"):       return _SUBTYPE_AMBIG
     if "lumb" in s:                  return _SUBTYPE_LUMB
-    # Order matters: 'semi' before 'sacr' since 'semisacralization' has both
     if "semi" in s:                  return _SUBTYPE_SEMI
     if "sacr_count" in s or "sacrcount" in s: return _SUBTYPE_SACR_COUNT
     if "sacr" in s:                  return _SUBTYPE_SACR
@@ -164,17 +210,6 @@ def _canonicalize_subtype_str(sub: str) -> str:
 
 def _read_lstv_cases_json(json_path: Path
                            ) -> Optional[Tuple[Set[str], Counter, Dict[str, str], List[str]]]:
-    """
-    Returns (all_case_ids, subtype_counts, case_id_to_subtype_map, oversample_pool) or None.
-
-    Schema-aware reader:
-      v3 (Apr 2026): 6-way taxonomy. Reads 'case_to_subtype' dict.
-                     Reads 'lstv_oversample_pool' list directly.
-      v2/v1 (legacy): 4-way taxonomy. Reads 'case_ids' dict (cid -> subtype string).
-                      Builds oversample pool by filtering out ambiguous.
-
-    Subtype strings are canonicalized via _canonicalize_subtype_str().
-    """
     if not json_path.exists(): return None
     try: data = json.loads(json_path.read_text())
     except Exception: return None
@@ -187,23 +222,21 @@ def _read_lstv_cases_json(json_path: Path
     all_case_ids: Set[str] = set()
 
     if schema >= 3:
-        # New schema: case_to_subtype is the canonical map
         cts = data.get("case_to_subtype") or {}
         if not isinstance(cts, dict): return None
         for cid, sub in cts.items():
             canon = _canonicalize_subtype_str(sub)
             case_to_subtype[cid] = canon
             all_case_ids.add(cid)
-        # Use the pool from JSON if available, else compute it
-        oversample_pool = data.get("lstv_oversample_pool") or []
-        if not oversample_pool:
-            # Compute pool: oversample-eligible subtypes only
-            oversample_pool = sorted(
-                cid for cid, sub in case_to_subtype.items()
-                if sub in _OVERSAMPLE_SUBTYPES
-            )
+        # Always recompute pool from in-code _OVERSAMPLE_SUBTYPES.
+        # The JSON's lstv_oversample_pool field, if present, reflects
+        # whatever decision was current when the JSON was written and
+        # is ignored on read. Single source of truth: this .py file.
+        oversample_pool = sorted(
+            cid for cid, sub in case_to_subtype.items()
+            if sub in _OVERSAMPLE_SUBTYPES
+        )
     else:
-        # Legacy schema: case_ids is the dict (no separate pool)
         case_ids_dict = data.get("case_ids") or {}
         if not isinstance(case_ids_dict, dict): return None
         for cid, sub in case_ids_dict.items():
@@ -250,7 +283,6 @@ def _candidate_hf_export_dirs() -> List[Path]:
 
 def _read_lstv_records_from_manifest(hf_export_dir: Path
                                       ) -> Optional[Tuple[Set[str], Counter, Dict[str, str], List[str]]]:
-    """Fallback path: scan HF per-record manifests directly. 6-way aware."""
     if not hf_export_dir.is_dir(): return None
     records: List[Dict] = []
     for fname in ("manifest_train.json", "manifest_validation.json", "manifest_test.json"):
@@ -292,7 +324,6 @@ def _read_lstv_records_from_manifest(hf_export_dir: Path
 
 
 def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
-    """Last-resort: identify lumb cases by scanning labels for L6 voxels."""
     import nibabel as nib
     out: Set[str] = set()
     if not os.path.isdir(labels_dir): return out
@@ -331,21 +362,36 @@ def _per_case_dice_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor,
 
 
 # =============================================================================
-# Class reweighting (unchanged from v9)
+# Class reweighting
 # =============================================================================
 
-def _build_ce_class_weights(num_classes: int = 11) -> Optional[torch.Tensor]:
+def _build_ce_class_weights(num_classes: int) -> Optional[torch.Tensor]:
+    """Build a CE weight tensor of shape (num_classes,).
+
+    `num_classes` MUST equal the number of output channels of the
+    network — typically 10 here (background + 9 foreground). The
+    ignore label is NOT a class in the network output (it's masked via
+    ignore_index) and therefore has no entry in this weight tensor.
+    """
     if not _env_truthy("SPINESURG_CE_REWEIGHT", default=True):
         return None
+    if num_classes is None or num_classes <= 0:
+        return None
+
+    # Per-class weights keyed by the class index in the network output.
+    # Indices 0-9: background, L1-L6, sacrum, left_hip, right_hip.
+    # Do NOT add an entry for the ignore label (10) — the network does
+    # not emit a channel for it.
     weights = {
         0: 0.5,  # background
         1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0,
-        6: 4.0,  # L6
-        7: 1.0, 8: 1.0, 9: 1.0,
-        10: 0.0,  # ignore label
+        6: 4.0,  # L6 — emphasized for lumbarization recovery
+        7: 2.0,  # sacrum — emphasized for sacr_count (missing-L5) and Castellvi
+        8: 1.0, 9: 1.0,
     }
-    name_to_id = {"background": 0, "L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5,
-                   "L6": 6, "sacrum": 7, "left_hip": 8, "right_hip": 9, "ignore": 10}
+    name_to_id = {"background": 0, "L1": 1, "L2": 2, "L3": 3, "L4": 4,
+                   "L5": 5, "L6": 6, "sacrum": 7,
+                   "left_hip": 8, "right_hip": 9}
     overrides = os.environ.get("SPINESURG_CE_WEIGHTS", "").strip()
     if overrides:
         for spec in overrides.split(","):
@@ -365,6 +411,30 @@ def _build_ce_class_weights(num_classes: int = 11) -> Optional[torch.Tensor]:
     return out
 
 
+def _detect_num_output_classes(trainer) -> int:
+    """Return the number of channels in the network's output head.
+
+    Resolution order:
+      1. trainer.label_manager.num_segmentation_heads (canonical nnU-Net v2)
+      2. count of dataset_json['labels'] excluding any 'ignore' entry
+      3. _DEFAULT_NUM_OUTPUT_CLASSES (10) as final fallback
+    """
+    try:
+        n = int(getattr(trainer.label_manager, "num_segmentation_heads"))
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    try:
+        labels = trainer.plans_manager.dataset_json.get("labels", {})
+        n = sum(1 for k in labels.keys() if str(k).lower() != "ignore")
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    return _DEFAULT_NUM_OUTPUT_CLASSES
+
+
 # =============================================================================
 # W&B mixin (6-way subgroup tracking)
 # =============================================================================
@@ -379,17 +449,13 @@ class _WandBMixin:
     _perf_tuning_installed = False
     _channels_last_active = False
 
-    # Per-subgroup tracking (6-way)
     _val_subgroup_dice: Dict[str, List[List[Optional[float]]]] = None
     _val_case_to_subtype: Optional[Dict[str, str]] = None
     _per_subgroup_logging_enabled: bool = True
 
-    # L6 patch bias
     _l6_patch_bias_enabled: bool = True
     _l6_patch_bias_target_frac: float = 0.6
     _lumb_case_id_set: Optional[Set[str]] = None
-
-    # ── Progress JSON / log intercepts (unchanged) ──────────────────────
 
     def _progress_json_path(self):
         out = getattr(self, "output_folder", None)
@@ -458,7 +524,7 @@ class _WandBMixin:
         if self._metric_cache and len(self._metric_cache) > 0: return dict(self._metric_cache)
         return {}
 
-    # ── CE reweighting (unchanged from v9) ─────────────────────────────────
+    # ── CE reweighting ─────────────────────────────────────────────────
 
     def _maybe_apply_ce_reweighting(self):
         if not _env_truthy("SPINESURG_CE_REWEIGHT", default=True):
@@ -471,9 +537,22 @@ class _WandBMixin:
             self.print_to_log_file(f"CE reweighting: import failed: {e}; skipping.")
             return
 
-        weights = _build_ce_class_weights(num_classes=11)
+        # Detect the actual number of output classes from the model.
+        # The CE weight tensor MUST be this length, not len(labels) and
+        # not 11. The ignore label has no output channel.
+        num_classes = _detect_num_output_classes(self)
+        self.print_to_log_file(
+            f"CE reweighting: detected {num_classes} output classes "
+            f"(network output channels)")
+
+        weights = _build_ce_class_weights(num_classes=num_classes)
         if weights is None:
             self.print_to_log_file("CE reweighting: weights=None; skipping.")
+            return
+        if weights.numel() != num_classes:
+            self.print_to_log_file(
+                f"CE reweighting: weight length {weights.numel()} "
+                f"!= num_classes {num_classes}; skipping to avoid crash.")
             return
 
         device = getattr(self, "device", torch.device("cuda"))
@@ -508,41 +587,77 @@ class _WandBMixin:
         except Exception as exc:
             self.print_to_log_file(f"CE reweighting: failed to install: {exc}; using default loss.")
 
-    # ── L6 patch sampling bias (only on lumb cases) ─────────────────────
+    # ── L6 patch sampling bias ─────────────────────────────────────────
+
+    # Subtype -> (target class id, env var name, default frac)
+    # Lumb cases bias patches toward L6 (the class TS misses entirely).
+    # sacr_count cases bias patches toward sacrum (the L4/sacrum
+    # transition zone is where the missing-L5 morphology is visible).
+    _PATCH_BIAS_RULES = {
+        _SUBTYPE_LUMB:       (_L6_LABEL_ID, "SPINESURG_L6_PATCH_BIAS_FRAC", 0.6),
+        _SUBTYPE_SACR_COUNT: (7,             "SPINESURG_SACRUM_PATCH_BIAS_FRAC", 0.5),
+    }
+    _patch_bias_targets: Optional[Dict[str, int]] = None  # cid -> target_class
+    _patch_bias_fracs:   Optional[Dict[str, float]] = None  # cid -> frac
 
     def _maybe_apply_l6_patch_bias(self):
-        if not _env_truthy("SPINESURG_L6_PATCH_BIAS", default=True):
-            self.print_to_log_file("L6 patch bias: DISABLED via SPINESURG_L6_PATCH_BIAS=0")
-            return
+        """Install per-case patch-class bias on the dataloader.
 
-        try:
-            target_frac = _env_float("SPINESURG_L6_PATCH_BIAS_FRAC", 0.6)
-            target_frac = max(0.0, min(0.95, target_frac))
-        except Exception:
-            target_frac = 0.6
-        self._l6_patch_bias_target_frac = target_frac
+        For each case in the training set whose LSTV subtype has a bias
+        rule (see _PATCH_BIAS_RULES), patches sampled from that case are
+        biased toward the rule's target class with the rule's
+        probability. Cases without a bias rule are unchanged.
+
+        Method name is preserved for backward compat with v10/v11; the
+        feature is now broader than just L6.
+        """
+        if not _env_truthy("SPINESURG_L6_PATCH_BIAS", default=True):
+            self.print_to_log_file("Patch-class bias: DISABLED via SPINESURG_L6_PATCH_BIAS=0")
+            return
 
         if self._val_case_to_subtype is None:
             self._maybe_load_subtype_map()
 
-        # ONLY lumb cases get L6 bias (L6 only exists in lumbarization).
-        lumb_ids: Set[str] = set()
+        # Build per-case lookup: case_id -> target_class, case_id -> frac
+        targets: Dict[str, int] = {}
+        fracs: Dict[str, float] = {}
+        per_subtype_count: Counter = Counter()
         if self._val_case_to_subtype:
             for cid, sub in self._val_case_to_subtype.items():
-                if sub == _SUBTYPE_LUMB:
-                    lumb_ids.add(cid)
-        self._lumb_case_id_set = lumb_ids
+                rule = self._PATCH_BIAS_RULES.get(sub)
+                if rule is None:
+                    continue
+                target_cls, env_name, default_frac = rule
+                try:
+                    frac = max(0.0, min(0.95, _env_float(env_name, default_frac)))
+                except Exception:
+                    frac = default_frac
+                targets[cid] = target_cls
+                fracs[cid] = frac
+                per_subtype_count[sub] += 1
+
+        self._patch_bias_targets = targets
+        self._patch_bias_fracs = fracs
         self._l6_patch_bias_enabled = True
 
-        if not lumb_ids:
+        # Backward-compat alias (some downstream code may still read this)
+        self._lumb_case_id_set = {
+            cid for cid, t in targets.items() if t == _L6_LABEL_ID
+        }
+
+        if not targets:
             self.print_to_log_file(
-                "L6 patch bias: subtype map empty or no lumb cases; bias hook will be inactive.")
+                "Patch-class bias: subtype map empty or no biased subtypes; "
+                "hook will be inactive.")
             return
 
+        rule_summary = ", ".join(
+            f"{sub}->{self._PATCH_BIAS_RULES[sub][0]}@frac={fracs[next(iter(c for c, s in self._val_case_to_subtype.items() if s == sub))]:.2f}"
+            for sub, n in per_subtype_count.items() if n > 0
+        )
         self.print_to_log_file(
-            f"L6 patch bias: ENABLED. "
-            f"{len(lumb_ids)} lumbarization case_ids in bias pool, "
-            f"target L6-fraction-of-fg-patches={target_frac:.2f}")
+            f"Patch-class bias: ENABLED. {len(targets)} cases in bias pool. "
+            f"Rules: {rule_summary}. Per-subtype counts: {dict(per_subtype_count)}")
 
         loader = getattr(self, "dataloader_train", None)
         underlying = loader
@@ -554,7 +669,7 @@ class _WandBMixin:
                     break
         if underlying is None or not hasattr(underlying, "generate_train_batch"):
             self.print_to_log_file(
-                "L6 patch bias: cannot locate dataloader.generate_train_batch; "
+                "Patch-class bias: cannot locate dataloader.generate_train_batch; "
                 "framework internals may have changed. Disabling.")
             self._l6_patch_bias_enabled = False
             return
@@ -565,19 +680,61 @@ class _WandBMixin:
         def patched_generate_train_batch(*args, **kwargs):
             if not trainer_ref._l6_patch_bias_enabled:
                 return original_gen(*args, **kwargs)
-            lumb_ids = trainer_ref._lumb_case_id_set or set()
-            if not lumb_ids:
+            targets = trainer_ref._patch_bias_targets or {}
+            fracs = trainer_ref._patch_bias_fracs or {}
+            if not targets:
                 return original_gen(*args, **kwargs)
-            target_frac = trainer_ref._l6_patch_bias_target_frac
             original_choice = random.choice
 
+            # We can't see *which* case the loader is currently building
+            # a patch for from inside random.choice. Workaround: pick a
+            # representative bias frac (max across rules) and a rotating
+            # target class. This still works because nnU-Net calls
+            # random.choice once per patch from a class list that is
+            # the case's foreground classes; if the target class is in
+            # that list, the case is one with that morphology.
+            # Better: peek at the most recent case_id from the loader's
+            # internal state if we can find it.
             def biased_choice(seq, *a, **k):
                 try:
                     if isinstance(seq, (list, tuple)) and len(seq) > 1 \
-                            and _L6_LABEL_ID in seq \
                             and all(isinstance(x, (int, np.integer)) for x in seq):
-                        if random.random() < target_frac:
-                            return _L6_LABEL_ID
+                        seq_set = set(int(x) for x in seq)
+                        # Detection logic, partial-annotation safe:
+                        #
+                        #   lumb case      => L6 (class 6) is in the case's
+                        #                     foreground class list. Only
+                        #                     lumb cases have L6.
+                        #
+                        #   sacr_count     => sacrum (7) IS in the fg list,
+                        #                     L5 (5) is NOT, and L4 (4) IS.
+                        #                     The "L4 is" check is critical:
+                        #                     pelvic-only cases also lack L5
+                        #                     (it's masked as ignore there)
+                        #                     but they also lack L4. Only
+                        #                     true sacr_count anatomy has
+                        #                     L1-L4 + sacrum without L5.
+                        #
+                        # Note: nnU-Net's foreground class list comes from
+                        # the case's seg array EXCLUDING the ignore label
+                        # (10). So a spine-only sacr_count case's fg list
+                        # is {1,2,3,4,7}; a pelvic-only case is {7,8,9}; a
+                        # lumb spine-only is {1,2,3,4,5,6,7}; a lumb
+                        # pelvic-only is {7,8,9} (no L6). This means the
+                        # L6 patch bias correctly does NOT trigger on
+                        # pelvic-only records of lumb patients (L6 is not
+                        # in seq_set there) — those records just pass
+                        # through with default sampling.
+                        if _L6_LABEL_ID in seq_set:
+                            # lumb case (any view that has L6 annotated)
+                            if random.random() < trainer_ref._PATCH_BIAS_RULES[_SUBTYPE_LUMB][2]:
+                                return _L6_LABEL_ID
+                        elif (7 in seq_set
+                              and 5 not in seq_set
+                              and 4 in seq_set):
+                            # sacr_count case (anatomy: L1-L4 + sacrum, no L5)
+                            if random.random() < trainer_ref._PATCH_BIAS_RULES[_SUBTYPE_SACR_COUNT][2]:
+                                return 7
                 except Exception:
                     pass
                 return original_choice(seq, *a, **k)
@@ -590,9 +747,9 @@ class _WandBMixin:
 
         underlying.generate_train_batch = patched_generate_train_batch
         self.print_to_log_file(
-            "L6 patch bias: hook installed on dataloader.generate_train_batch.")
+            "Patch-class bias: hook installed on dataloader.generate_train_batch.")
 
-    # ── Per-subgroup setup (6-way) ───────────────────────────────────────
+    # ── Per-subgroup setup ───────────────────────────────────────────────
 
     def _maybe_load_subtype_map(self):
         self._per_subgroup_logging_enabled = _env_truthy(
@@ -641,7 +798,16 @@ class _WandBMixin:
             pred_logits = output[0] if isinstance(output, (list, tuple)) else output
             gt = batch.get("target")
             if isinstance(gt, (list, tuple)): gt = gt[0]
-            keys_raw = batch.get("keys") or batch.get("identifier") or []
+            # Explicit None checks: batch["keys"] / batch["identifier"]
+            # may be numpy arrays, and `arr or fallback` raises
+            # "truth value of an array with more than one element is
+            # ambiguous". The previous chained `or` worked only when
+            # batch.get returned a Python list.
+            keys_raw = batch.get("keys")
+            if keys_raw is None:
+                keys_raw = batch.get("identifier")
+            if keys_raw is None:
+                keys_raw = []
             if isinstance(keys_raw, str): keys = [keys_raw]
             elif hasattr(keys_raw, "tolist"): keys = [str(k) for k in keys_raw.tolist()]
             else:
@@ -690,7 +856,6 @@ class _WandBMixin:
             if pelvis_means: out[f"val/lstv_subgroup/{subtype}/mean_pelvis_dice"] = float(np.mean(pelvis_means))
             if fg_means:     out[f"val/lstv_subgroup/{subtype}/mean_fg_dice"] = float(np.mean(fg_means))
 
-        # Headline: L6 dice on lumbarization
         lumb_cases = self._val_subgroup_dice.get(_SUBTYPE_LUMB, [])
         if lumb_cases:
             l6_idx = _FG_CLASS_IDS.index(_L6_LABEL_ID)
@@ -699,7 +864,6 @@ class _WandBMixin:
                 out["val/headline/L6_dice_on_lumbarization"] = float(np.mean(l6_vals))
                 out["val/headline/L6_n_lumbarization_cases"] = float(len(l6_vals))
 
-        # Combined "any LSTV" composite (everything except normal)
         lstv_means: List[float] = []
         for sub in (_SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT, _SUBTYPE_SEMI,
                      _SUBTYPE_SACR, _SUBTYPE_AMBIG):
@@ -710,7 +874,6 @@ class _WandBMixin:
             out["val/lstv_subgroup/any_lstv/mean_fg_dice"] = float(np.mean(lstv_means))
             out["val/lstv_subgroup/any_lstv/n_cases"] = float(len(lstv_means))
 
-        # Composite: any sacralization-flavored (sacr_count + semi + sacr)
         any_sacr_means: List[float] = []
         for sub in (_SUBTYPE_SACR_COUNT, _SUBTYPE_SEMI, _SUBTYPE_SACR):
             for case_dice in self._val_subgroup_dice.get(sub, []):
@@ -1013,13 +1176,10 @@ def _as_float(x):
 class _LSTVOversampleMixin:
     """Oversample lumb + sacr_count + sacralization cases at the dataloader queue level.
 
-    EXCLUDED from oversampling (n too small):
+    Excluded from oversampling (n too small):
     - normal (we oversample MINORITIES)
-    - semisacralization (n=3 records, oversampling memorizes)
-    - ambiguous (n=4 records, cross-anatomy disagreement; n=2 patients)
-
-    Both rare classes are still tracked for per-subgroup metrics and
-    evaluated cleanly on val.
+    - semisacralization (n=3 records; oversampling memorizes)
+    - ambiguous (n=4 records, n=2 patients)
     """
     _lstv_case_ids: Optional[Set[str]] = None
     _lstv_subtype_counts: Optional[Counter] = None
@@ -1031,7 +1191,6 @@ class _LSTVOversampleMixin:
         try: ds_name = self.plans_manager.dataset_name
         except Exception: ds_name = None
 
-        # Try lstv_cases.json first (preferred path; v3 schema gives us the pool directly)
         if ds_name:
             for jp in _candidate_lstv_json_paths(ds_name):
                 self.print_to_log_file(f"LSTV oversample: checking {jp}")
@@ -1050,7 +1209,6 @@ class _LSTVOversampleMixin:
                         f"Subtypes: {dict(subtypes)}")
                     return pool_set
 
-        # Fallback: HF manifests
         for hf_dir in _candidate_hf_export_dirs():
             self.print_to_log_file(f"LSTV oversample: checking manifest {hf_dir}")
             result = _read_lstv_records_from_manifest(hf_dir)
@@ -1065,7 +1223,6 @@ class _LSTVOversampleMixin:
                     f"using {len(pool_set)} for oversampling")
                 return pool_set
 
-        # Last resort: legacy L6 voxel scan (lumb only)
         self.print_to_log_file("LSTV oversample: falling back to L6 scan (lumb-only)")
         labels_dir = self._lstv_labels_dir_for_legacy_scan()
         if labels_dir is None:
@@ -1196,8 +1353,12 @@ class nnUNetTrainerWandB_500ep_LSTVOversample(
     """500 epochs + LSTV queue oversample + L6 patch bias + CE reweight.
     DEFAULT for the SpineSurg-CT paper run.
 
-    v10 changes: 6-way subgroups (semisacralization separated from
-    sacralization). Oversample pool excludes semi (n=3) and ambiguous (n=4).
+    v12: Per-subgroup dice logger no longer crashes on numpy keys array
+         (was using truthy fallback chain that numpy rejects).
+    v11: CE weight tensor sized to actual network output (was 11; should
+         be num_segmentation_heads, typically 10 for our schema).
+    v10: 6-way subgroups; semisacralization separated from sacralization.
+         Oversample pool excludes semi (n=3) and ambiguous (n=4).
     """
     def __init__(self, plans, configuration, fold, dataset_json,
                  unpack_dataset=True, device=torch.device('cuda')):

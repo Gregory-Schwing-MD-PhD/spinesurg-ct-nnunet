@@ -55,6 +55,18 @@
 #
 # Both can be overridden explicitly to point anywhere on NFS:
 #     HF_EXPORT_DIR=/some/path/hf_export sbatch slurm/spine_prep.sh
+#
+# v4 (2026-05-01) — convert_hf_to_nnunet.py CLI updated
+# ------------------------------------------------------
+# The convert script's CLI was renamed to align with its sibling
+# generate_5fold_splits.py:
+#   --hf_export_dir  -> --hf_dir
+#   --nnunet_raw_dir -> --nnunet_raw
+#   --splits_file    -> --splits
+# These are the only changes. The args that no longer exist
+# (--single_fold_splits, --include_train_match_types, --test_match_types)
+# have been removed from this script; setting their env-var counterparts
+# now produces an explicit error instead of silently being ignored.
 # =============================================================================
 
 set -euo pipefail
@@ -83,6 +95,22 @@ SINGLE_FOLD_SPLITS="${SINGLE_FOLD_SPLITS:-0}"
 INCLUDE_TRAIN_MATCH_TYPES="${INCLUDE_TRAIN_MATCH_TYPES:-}"
 TEST_MATCH_TYPES="${TEST_MATCH_TYPES:-}"
 
+# Hard error on env vars that map to convert features that no longer
+# exist (May 2026 CLI). Better to fail loudly than silently train on
+# an unfiltered dataset.
+if [[ "${SINGLE_FOLD_SPLITS}" == "1" ]]; then
+    echo "ERROR: SINGLE_FOLD_SPLITS=1 is no longer supported by convert_hf_to_nnunet.py." >&2
+    echo "       The new CLI requires --splits to point at a real splits_5fold.json." >&2
+    exit 1
+fi
+if [[ -n "${INCLUDE_TRAIN_MATCH_TYPES}" || -n "${TEST_MATCH_TYPES}" ]]; then
+    echo "ERROR: INCLUDE_TRAIN_MATCH_TYPES / TEST_MATCH_TYPES are no longer supported." >&2
+    echo "       The convert script now uses ALL records from manifest_train.json + " >&2
+    echo "       manifest_validation.json as training cases, and manifest_test.json " >&2
+    echo "       as test cases. Filter at the manifest level upstream if needed." >&2
+    exit 1
+fi
+
 case "${PLANNER}" in
     nnUNetPlannerResEncM)  PLANS="nnUNetResEncUNetPlans_${GPU_MEMORY_TARGET_GB}G"   ;;
     nnUNetPlannerResEncL)  PLANS="nnUNetResEncUNetLPlans_${GPU_MEMORY_TARGET_GB}G"  ;;
@@ -94,9 +122,6 @@ esac
 PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/spinesurg-ct-nnunet}"
 
 # -- HF export discovery -----------------------------------------------------
-# Default search order: legacy in-project location first (so existing setups
-# keep working), then the natural CTSpinoPelvic1K location. Either can be
-# overridden with HF_EXPORT_DIR=...
 if [[ -z "${HF_EXPORT_DIR:-}" ]]; then
     for cand in \
         "${PROJECT_ROOT}/data/hf_export" \
@@ -111,9 +136,6 @@ HF_EXPORT_DIR="${HF_EXPORT_DIR:-${PROJECT_ROOT}/data/hf_export}"
 HF_EXPORT_NFS="${HF_EXPORT_DIR}"
 
 # -- Splits file discovery ---------------------------------------------------
-# Prefer the splits file co-located with the HF export it describes.
-# Earlier setups put it in ${PROJECT_ROOT}/data/ — fall back to that for
-# legacy compatibility.
 if [[ -z "${SPLITS_FILE:-}" ]]; then
     for cand in \
         "${HF_EXPORT_NFS}/splits_5fold.json" \
@@ -140,18 +162,6 @@ mkdir -p "${NNUNET_NFS}/raw" "${NNUNET_NFS}/preprocessed" "${NNUNET_NFS}/results
          "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/tmp"
 
 # -- Resolver: find the preprocessed-data subdirectory -----------------------
-# nnU-Net writes preprocessed npz/pkl files into
-#   <preprocessed>/<dataset>/<data_identifier>/
-# where <data_identifier> comes from plans.configurations.<config>.data_identifier.
-# That string varies with planner + plans-name (e.g. "nnUNetPlans_3d_fullres",
-# "nnUNetResEncUNetPlans_100G_3d_fullres", etc.), so we resolve it at
-# runtime instead of assuming it equals ${CONFIG}.
-#
-# Strategy:
-#   1. Read data_identifier from <plans>.json via python (preferred).
-#   2. Fall back to a glob: any direct child of preprocessed/<dataset>/
-#      whose name contains ${CONFIG} and that holds at least one .npz.
-# Echoes the resolved absolute path on stdout, or empty string on failure.
 resolve_prep_data_dir() {
     local plans_json="${NFS_PREP_DS}/${PLANS}.json"
     local cfg="${CONFIG}"
@@ -176,7 +186,6 @@ PY
         return 0
     fi
 
-    # Fallback: glob for a child dir containing ${CONFIG} in its name with npz files.
     if [[ -d "${NFS_PREP_DS}" ]]; then
         local cand
         while IFS= read -r cand; do
@@ -202,17 +211,15 @@ PY
 [[ ! -f "${PROJECT_ROOT}/tools/convert_hf_to_nnunet.py" ]] && {
     echo "ERROR: tools/convert_hf_to_nnunet.py missing" >&2; exit 1; }
 
-if [[ "${SINGLE_FOLD_SPLITS}" != "1" ]]; then
-    [[ ! -f "${SPLITS_FILE_HOST}" ]] && {
-        echo "ERROR: splits file not found at ${SPLITS_FILE_HOST}" >&2
-        echo "  Searched: ${HF_EXPORT_NFS}/splits_5fold.json" >&2
-        echo "            ${PROJECT_ROOT}/data/splits_5fold.json" >&2
-        echo "  Override with SPLITS_FILE=/path/to/splits.json or run with SINGLE_FOLD_SPLITS=1" >&2
-        exit 1
-    }
-    SP_MTIME=$(stat -c '%y' "${SPLITS_FILE_HOST}" 2>/dev/null || stat -f '%Sm' "${SPLITS_FILE_HOST}")
-    echo "  splits_5fold.json mtime: ${SP_MTIME}"
-fi
+[[ ! -f "${SPLITS_FILE_HOST}" ]] && {
+    echo "ERROR: splits file not found at ${SPLITS_FILE_HOST}" >&2
+    echo "  Searched: ${HF_EXPORT_NFS}/splits_5fold.json" >&2
+    echo "            ${PROJECT_ROOT}/data/splits_5fold.json" >&2
+    echo "  Override with SPLITS_FILE=/path/to/splits.json" >&2
+    exit 1
+}
+SP_MTIME=$(stat -c '%y' "${SPLITS_FILE_HOST}" 2>/dev/null || stat -f '%Sm' "${SPLITS_FILE_HOST}")
+echo "  splits_5fold.json mtime: ${SP_MTIME}"
 
 # -- Step 0: NFS cache check (fast exit if already complete) -----------------
 if [[ -f "${COMPLETE_MARKER}" ]] \
@@ -242,7 +249,7 @@ fi
 # >>> NO host-side dangling-symlink cleanup. <<<
 # Convert writes container-path symlinks (/data/hf_export/...). They look
 # "broken" from the host but resolve inside the container via the bind
-# mount. Cleaning them up was the reason resumes kept failing.
+# mount.
 
 echo "================================================================"
 echo " Stage A: convert + preprocess (SIMPLE, NFS-only)"
@@ -251,7 +258,6 @@ echo "   Plans        : ${PLANS} (target ${GPU_MEMORY_TARGET_GB} GB)"
 echo "   HF export    : ${HF_EXPORT_NFS}"
 echo "   Splits file  : ${SPLITS_FILE_HOST}"
 echo "   NFS dest     : ${NFS_PREP_DS}"
-echo "   Splits mode  : $([[ ${SINGLE_FOLD_SPLITS} == 1 ]] && echo 'single-fold' || echo '5-fold CV')"
 echo "   Workers      : ${N_PREPROCESS_THREADS} x ${BLAS_THREADS} BLAS threads = $((N_PREPROCESS_THREADS*BLAS_THREADS)) total"
 echo "   Started      : $(date)"
 echo "================================================================"
@@ -262,7 +268,6 @@ export SINGULARITYENV_nnUNet_raw="/nnunet_nfs/raw"
 export SINGULARITYENV_nnUNet_preprocessed="/nnunet_nfs/preprocessed"
 export SINGULARITYENV_nnUNet_results="/nnunet_nfs/results"
 
-# Cap BLAS threads inside each worker to avoid blowing past RLIMIT_NPROC.
 export SINGULARITYENV_OMP_NUM_THREADS=${BLAS_THREADS}
 export SINGULARITYENV_OPENBLAS_NUM_THREADS=${BLAS_THREADS}
 export SINGULARITYENV_MKL_NUM_THREADS=${BLAS_THREADS}
@@ -274,34 +279,32 @@ SING_BINDS=(
     --bind "${HF_EXPORT_NFS}:/data/hf_export"
     --bind "${NNUNET_NFS}:/nnunet_nfs"
     --bind "${WANDB_TRAINER_HOST}:${WANDB_TRAINER_CONTAINER}"
+    --bind "${SPLITS_FILE_HOST}:/workspace/splits_5fold.json:ro"
     --pwd  /workspace
 )
-if [[ "${SINGLE_FOLD_SPLITS}" != "1" ]]; then
-    SING_BINDS+=( --bind "${SPLITS_FILE_HOST}:/workspace/splits_5fold.json:ro" )
-fi
 
 # -- Step 1: convert HF export -> nnU-Net raw (on NFS) -----------------------
+#
+# May 2026 CLI:
+#   --hf_dir       (was --hf_export_dir)
+#   --splits       (was --splits_file)
+#   --nnunet_raw   (was --nnunet_raw_dir)
+#
+# All three are now required; no SINGLE_FOLD_SPLITS / match_type filter
+# fallbacks. The earlier args, if encountered in old logs, indicate the
+# convert script was rolled back.
 echo ""; echo "----- Step 1: convert HF export -> nnU-Net raw -----"
 if [[ -f "${NFS_RAW_DS}/dataset.json" ]]; then
     echo "  dataset.json present; skipping convert."
 else
-    CONVERT_ARGS=(
-        --hf_export_dir  /data/hf_export
-        --nnunet_raw_dir /nnunet_nfs/raw
-        --dataset_id     ${DATASET_ID}
-        --dataset_name   ${DATASET_NAME}
-    )
-    if [[ "${SINGLE_FOLD_SPLITS}" == "1" ]]; then
-        CONVERT_ARGS+=( --single_fold_splits )
-    else
-        CONVERT_ARGS+=( --splits_file /workspace/splits_5fold.json )
-    fi
-    [[ -n "${INCLUDE_TRAIN_MATCH_TYPES}" ]] && \
-        CONVERT_ARGS+=( --include_train_match_types "${INCLUDE_TRAIN_MATCH_TYPES}" )
-    [[ -n "${TEST_MATCH_TYPES}" ]] && \
-        CONVERT_ARGS+=( --test_match_types "${TEST_MATCH_TYPES}" )
     singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
-        python tools/convert_hf_to_nnunet.py "${CONVERT_ARGS[@]}"
+        python tools/convert_hf_to_nnunet.py \
+            --hf_dir     /data/hf_export \
+            --splits     /workspace/splits_5fold.json \
+            --nnunet_raw /nnunet_nfs/raw \
+            --dataset_id   ${DATASET_ID} \
+            --dataset_name ${DATASET_NAME} \
+            --symlinks
 fi
 
 # -- Step 2: plan + preprocess (reads + writes on NFS) -----------------------
@@ -340,6 +343,30 @@ if [[ "${N_NPZ_NFS}" -eq 0 ]]; then
     echo "ERROR: zero .npz files after preprocess in ${PREP_DATA_DIR}." >&2
     exit 2
 fi
+
+# Sanity: confirm dataset.json has the ignore label so downstream training
+# honors partial-annotation cases. Catches the failure mode where the
+# old dataset.json (without ignore=10) survived from a prior run.
+DS_JSON_OK=$(python - "${NFS_RAW_DS}/dataset.json" <<'PY' 2>/dev/null || echo "fail"
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    labels = d.get('labels', {})
+    if labels.get('ignore') == 10:
+        print('ok')
+    else:
+        print(f'missing-ignore: labels={labels}')
+except Exception as e:
+    print(f'fail: {e}')
+PY
+)
+if [[ "${DS_JSON_OK}" != "ok" ]]; then
+    echo "ERROR: dataset.json sanity check FAILED: ${DS_JSON_OK}" >&2
+    echo "       Expected labels.ignore == 10 for partial-annotation training." >&2
+    echo "       Re-run convert_hf_to_nnunet.py against the patched export." >&2
+    exit 3
+fi
+echo "  dataset.json: labels.ignore == 10 (partial-annotation training will work)"
 
 touch "${COMPLETE_MARKER}"
 

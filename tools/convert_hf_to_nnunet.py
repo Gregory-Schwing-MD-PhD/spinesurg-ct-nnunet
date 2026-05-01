@@ -18,7 +18,7 @@ Writes
     labelsTr/{caseID}.nii.gz        (symlinks or copies of label)
     imagesTs/{caseID}_0000.nii.gz   (test set)
     labelsTs/{caseID}.nii.gz
-    dataset.json                    (10-class label scheme)
+    dataset.json                    (10-class label scheme + ignore)
     lstv_cases.json                 (schema v3 — 6-way LSTV subtypes)
     splits_final.json               (5-fold CV splits, mirrored from input)
 
@@ -31,17 +31,35 @@ Default: full build (link/copy + dataset.json + splits + lstv_cases).
     the fold assignments / subtype mapping (e.g. after re-running
     generate_5fold_splits.py).
 
-dataset.json label scheme
--------------------------
+dataset.json label scheme (May 2026 update)
+-------------------------------------------
   0 background  1 L1  2 L2  3 L3  4 L4  5 L5  6 L6  7 sacrum  8 left_hip  9 right_hip
+  10 ignore (NEW)
+
+Why "ignore" is here:
+  Some HF export records are *partial annotations* — separate-mode
+  patients have one CT scan annotated only for spine (L1-L6) and a
+  different CT scan annotated only for pelvis (sacrum + hips). The
+  patched export_hf.py (May 2026) writes those label files with value
+  10 in voxels outside the present annotator's domain.
+
+  nnU-Net v2 honors `"ignore"` in `labels` by:
+    - setting `has_ignore_label = True` on the LabelManager
+    - using `ignore_label = 10` as `ignore_index` in CE loss
+    - masking ignore voxels out of the Dice loss via the DC_and_CE_loss
+      wrapper when `ignore_label` is configured
+    - NOT allocating an output head for class 10 (network output stays
+      at 10 channels: bg + 9 fg)
+
+  Without this entry, partial-annotation labels would falsely supervise
+  the network with "background" wherever the partial annotator did not
+  trace, poisoning the loss for L6 / sacrum / hips on roughly two-thirds
+  of the training set. See export_hf.py "PARTIAL ANNOTATION CONTRACT".
 
 lstv_cases.json schema v3 (Apr 2026)
 ====================================
 6-way LSTV subtype taxonomy mirroring splits_5fold.json schema v6:
   normal, lumb, sacr_count, semisacralization, sacralization, ambiguous
-
-Replaces schema v2 which had a 4-way scheme (lost the semi-sacralization
-distinction due to the substring-match bug in mask_index.py upstream).
 
   {
     "schema_version": 3,
@@ -82,6 +100,11 @@ SUBTYPES = (
     "ambiguous",
 )
 
+# 10-class scheme + ignore label for partial-annotation cases.
+# nnU-Net v2 treats the literal key "ignore" specially — see module
+# docstring for full semantics. The value 10 must match the value
+# written by export_hf.merge_labels() in partial-annotation mode and
+# the trainer's _IGNORE_LABEL constant.
 LABEL_NAMES = {
     "background": 0,
     "L1":         1,
@@ -93,6 +116,7 @@ LABEL_NAMES = {
     "sacrum":     7,
     "left_hip":   8,
     "right_hip":  9,
+    "ignore":     10,
 }
 
 
@@ -147,7 +171,6 @@ def _resolve_subtype_for_case(record: Dict,
     if tok in splits_subtypes:
         return splits_subtypes[tok]
 
-    # Fallback: minimal per-record resolution
     label = str(record.get("lstv_label", "")).upper()
     pel   = str(record.get("lstv_pelvic", "")).upper()
     vert  = str(record.get("lstv_vertebral", "")).upper()
@@ -214,8 +237,6 @@ def _build_case_indices(
             ct_src    = hf_dir / ct_rel
             label_src = hf_dir / label_rel
 
-            # In regen_splits_only mode we skip the file existence check —
-            # we're not touching files, just rebuilding the case index.
             if do_link:
                 if not ct_src.exists() or not label_src.exists():
                     log.warning("file not found token=%s ct=%s label=%s; skipping",
@@ -264,6 +285,8 @@ def _build_case_indices(
                 "match_type":      str(rec.get("match_type", "")),
                 "config":          str(rec.get("config", "")),
                 "split":           split,
+                # NEW: track partial-annotation status from manifest if present.
+                "partial_annotation": bool(rec.get("partial_annotation", False)),
             }
 
     return (case_to_subtype, case_to_token, case_to_attrs,
@@ -347,21 +370,13 @@ def _write_lstv_cases(
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--hf_dir",   required=True, type=Path,
-                   help="HF export dir (contains ct/, labels/, manifest_*.json)")
-    p.add_argument("--splits",   required=True, type=Path,
-                   help="splits_5fold.json from generate_5fold_splits.py v6+")
-    p.add_argument("--nnunet_raw", required=True, type=Path,
-                   help="nnU-Net raw root (Dataset{ID}_{NAME} will be created here)")
+    p.add_argument("--hf_dir",   required=True, type=Path)
+    p.add_argument("--splits",   required=True, type=Path)
+    p.add_argument("--nnunet_raw", required=True, type=Path)
     p.add_argument("--dataset_id",   type=int, default=802)
     p.add_argument("--dataset_name", default="SpineSurgCTFull")
-    p.add_argument("--symlinks", action="store_true",
-                   help="Use symlinks instead of copies (saves disk)")
-    p.add_argument("--regen_splits_only", action="store_true",
-                   help="Skip link/copy + dataset.json. Only refresh "
-                        "splits_final.json + lstv_cases.json. Use after "
-                        "re-running generate_5fold_splits.py when the "
-                        "dataset on disk doesn't need rebuilding.")
+    p.add_argument("--symlinks", action="store_true")
+    p.add_argument("--regen_splits_only", action="store_true")
     args = p.parse_args()
 
     if not args.hf_dir.exists():
@@ -429,12 +444,14 @@ def main():
             "numTraining":   len(train_case_ids),
             "file_ending":   ".nii.gz",
             "name":          args.dataset_name,
-            "description":   "CTSpinoPelvic1K — fused 10-class spine + pelvis CT",
+            "description":   "CTSpinoPelvic1K — fused 10-class spine + pelvis CT "
+                              "with ignore label (10) for partial annotations",
             "reference":     "CTSpine1K + CTPelvic1K, COLONOG cohort",
-            "release":       "Apr 2026 — schema v6 splits / v3 lstv_cases",
+            "release":       "May 2026 — schema v6 splits / v3 lstv_cases / "
+                              "partial-annotation ignore label",
         }
         (ds_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
-        log.info("Wrote dataset.json")
+        log.info("Wrote dataset.json (labels include ignore=10 for partial-annotation cases)")
 
     # ── splits_final.json + lstv_cases.json (always written) ───────────────
     _write_splits_final(
