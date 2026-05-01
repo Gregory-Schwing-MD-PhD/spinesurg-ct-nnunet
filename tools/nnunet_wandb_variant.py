@@ -143,6 +143,7 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as _mp
 import os
 import random
 import sys
@@ -635,6 +636,164 @@ def _selftest_patch_bias(rules: Dict[str, Tuple[int, str, float]],
 
 
 # =============================================================================
+# Module-level bias-hook state (v17.2 fix for worker-fork bug)
+#
+# Why module-level instead of instance-level:
+#   nnU-Net v2's NonDetMultiThreadedAugmenter spawns worker processes
+#   that pickle (or fork-copy) the data loader. Patches on
+#   trainer-instance attributes don't reliably reach the workers, so
+#   the v15-v17 instance-level patch produced the right startup self-
+#   test signal but never actually fired during real training (visible
+#   as "bias hook (cumulative): calls=0" in every epoch log).
+#
+# Architecture:
+#   - On Linux fork (default for batchgenerators on Python<3.8 and on
+#     explicit fork-mode setups), child processes inherit the parent's
+#     entire memory image at fork time. If we replace ``np.random.choice``
+#     on the parent BEFORE workers fork, every worker sees the patched
+#     version — the patch lives in the np.random module's __dict__,
+#     which forks just like everything else.
+#   - On spawn mode, workers re-import nnunet_wandb_variant (it's in
+#     the import path) and the module-level state below is set during
+#     import. The trainer also replaces np.random.choice during
+#     initialize() before workers start, so spawned workers see the
+#     replacement after they finish importing this module.
+#   - Counters live in multiprocessing.Value so worker increments are
+#     visible to the parent. Without this, the parent's counter would
+#     stay at zero even with the patch firing in workers.
+#
+# Frame guard:
+#   The patch fires ONLY when called from a function literally named
+#   ``generate_train_batch`` AND when an ``eligible_classes_or_regions``
+#   local variable is present AND its length matches the int arg.
+#   Anything else (size=, p=, multi-arg, called from anywhere else)
+#   passes through to the original numpy implementation untouched.
+# =============================================================================
+
+_BIAS_RULES_FOR_WORKERS: Optional[Dict[str, Tuple[int, str, float]]] = None
+_BIAS_ORIGINAL_NP_CHOICE = None  # the real np.random.choice
+_BIAS_INSTALLED: bool = False    # idempotency
+_BIAS_CALL_COUNT = None          # multiprocessing.Value('i', 0)
+_BIAS_L6_RETURNS = None
+_BIAS_SACRUM_RETURNS = None
+
+
+def _ensure_bias_counters() -> None:
+    """Lazily initialize cross-process atomic counters.
+
+    Must be called BEFORE any worker fork. After fork, child processes
+    share the same ``Value`` objects as the parent (they live in shared
+    memory via the multiprocessing primitive)."""
+    global _BIAS_CALL_COUNT, _BIAS_L6_RETURNS, _BIAS_SACRUM_RETURNS
+    if _BIAS_CALL_COUNT is None:
+        _BIAS_CALL_COUNT     = _mp.Value("i", 0)
+        _BIAS_L6_RETURNS     = _mp.Value("i", 0)
+        _BIAS_SACRUM_RETURNS = _mp.Value("i", 0)
+
+
+def _read_bias_counters() -> Tuple[int, int, int]:
+    """Read the current values from the cross-process counters.
+    Returns (calls, l6_returns, sacrum_returns) as plain ints."""
+    if _BIAS_CALL_COUNT is None:
+        return 0, 0, 0
+    try:
+        return (int(_BIAS_CALL_COUNT.value),
+                int(_BIAS_L6_RETURNS.value),
+                int(_BIAS_SACRUM_RETURNS.value))
+    except Exception:
+        return 0, 0, 0
+
+
+def _global_biased_np_choice(*args, **kwargs):
+    """Module-level replacement for ``np.random.choice``.
+
+    Picklable, no closures over trainer instance state. Called from
+    both parent and worker processes. Increments shared
+    multiprocessing.Value counters when the bias fires.
+
+    Pass-through fallback ensures any unrelated np.random.choice call
+    (size=, p=, multi-arg, called from outside generate_train_batch)
+    behaves identically to the original numpy implementation.
+    """
+    try:
+        if (len(args) == 1
+                and not kwargs
+                and isinstance(args[0], (int, np.integer))):
+            frame = sys._getframe(1)
+            if frame.f_code.co_name == "generate_train_batch":
+                eligible = frame.f_locals.get("eligible_classes_or_regions")
+                if (eligible is not None
+                        and hasattr(eligible, "__len__")
+                        and len(eligible) == int(args[0])
+                        and len(eligible) > 1):
+                    rules = _BIAS_RULES_FOR_WORKERS
+                    if rules:
+                        # Atomic increment of shared call counter.
+                        if _BIAS_CALL_COUNT is not None:
+                            with _BIAS_CALL_COUNT.get_lock():
+                                _BIAS_CALL_COUNT.value += 1
+                        biased_idx = _select_biased_index(
+                            eligible, rules, random.random)
+                        if biased_idx is not None:
+                            cls = eligible[biased_idx]
+                            if isinstance(cls, (int, np.integer)):
+                                if int(cls) == _L6_LABEL_ID:
+                                    if _BIAS_L6_RETURNS is not None:
+                                        with _BIAS_L6_RETURNS.get_lock():
+                                            _BIAS_L6_RETURNS.value += 1
+                                elif int(cls) == _SACRUM_LABEL_ID:
+                                    if _BIAS_SACRUM_RETURNS is not None:
+                                        with _BIAS_SACRUM_RETURNS.get_lock():
+                                            _BIAS_SACRUM_RETURNS.value += 1
+                            return biased_idx
+    except Exception:
+        # Never let the intercept break training.
+        pass
+    # Pass-through to original numpy implementation.
+    if _BIAS_ORIGINAL_NP_CHOICE is not None:
+        return _BIAS_ORIGINAL_NP_CHOICE(*args, **kwargs)
+    # Should never happen — _BIAS_ORIGINAL_NP_CHOICE is set before
+    # the patch is installed. If it does, fall back to whatever's
+    # currently in np.random.choice (likely us, infinite recursion
+    # would be bad — so re-raise).
+    raise RuntimeError("bias hook fallback invoked before original captured")
+
+
+def _install_global_bias_hook(rules: Dict[str, Tuple[int, str, float]]) -> bool:
+    """Install the global np.random.choice patch.
+
+    Idempotent — safe to call multiple times. Returns True if the
+    install actually happened (or was already in place), False on
+    error. Must be called BEFORE workers fork.
+    """
+    global _BIAS_RULES_FOR_WORKERS, _BIAS_INSTALLED, _BIAS_ORIGINAL_NP_CHOICE
+    _BIAS_RULES_FOR_WORKERS = rules
+    _ensure_bias_counters()
+    if _BIAS_INSTALLED:
+        return True  # already patched (e.g., second fold in same proc)
+    try:
+        _BIAS_ORIGINAL_NP_CHOICE = np.random.choice
+        np.random.choice = _global_biased_np_choice
+        _BIAS_INSTALLED = True
+        return True
+    except Exception:
+        return False
+
+
+def _reset_bias_counters_for_new_fold() -> None:
+    """Reset shared counters (called per-fold to avoid carry-over when
+    the same parent process trains multiple folds)."""
+    if _BIAS_CALL_COUNT is None:
+        return
+    with _BIAS_CALL_COUNT.get_lock():
+        _BIAS_CALL_COUNT.value = 0
+    with _BIAS_L6_RETURNS.get_lock():
+        _BIAS_L6_RETURNS.value = 0
+    with _BIAS_SACRUM_RETURNS.get_lock():
+        _BIAS_SACRUM_RETURNS.value = 0
+
+
+# =============================================================================
 # W&B mixin (6-way subgroup tracking)
 # =============================================================================
 
@@ -952,88 +1111,77 @@ class _WandBMixin:
         except Exception as exc:
             self._phase("patch_bias", f"self-test threw exception: {exc}")
 
-        trainer_ref = self
-        original_gen = underlying.generate_train_batch
-        original_np_choice = np.random.choice
+        # ─────────────────────────────────────────────────────────────────
+        # v17.2: install GLOBALLY at module scope, not on the loader instance.
+        #
+        # Background: nnU-Net v2's NonDetMultiThreadedAugmenter spawns
+        # worker processes that get a copy (via fork or pickle) of the
+        # data loader. Pre-v17.2 we set
+        # ``underlying.generate_train_batch = patched`` on the parent's
+        # instance — but the workers had their own already-constructed
+        # copies, so the patch never reached them. The startup self-test
+        # passed (parent process) but actual training never saw a single
+        # bias intercept (visible in every prior log as "calls=0" after
+        # 250 iterations × 5 epochs of generated batches).
+        #
+        # The fix: replace ``np.random.choice`` itself, at the np.random
+        # module level. Linux fork copies the parent's memory image, so
+        # workers spawned AFTER this assignment see the patched function
+        # automatically. Counters live in multiprocessing.Value so worker
+        # increments propagate back to the parent for diagnostic output.
+        #
+        # The frame-inspection guard inside _global_biased_np_choice
+        # ensures this only intercepts the specific
+        #   ``np.random.choice(len(eligible_classes_or_regions))``
+        # call inside nnU-Net's generate_train_batch — every other
+        # numpy random call in the worker passes through untouched.
+        # ─────────────────────────────────────────────────────────────────
 
-        # Reset diagnostic counters
-        trainer_ref._bias_call_count = 0
-        trainer_ref._bias_l6_returns = 0
-        trainer_ref._bias_sacrum_returns = 0
+        # Reset cross-process counters for this fold.
+        _reset_bias_counters_for_new_fold()
 
-        def biased_np_choice(*args, **kwargs):
-            """Replacement for np.random.choice. Only intercepts the
-            specific call pattern used by nnU-Net v2's
-            base_data_loader.py:121:
-                np.random.choice(len(eligible_classes_or_regions))
+        # Snapshot rules into module-level state. Workers spawned via
+        # fork inherit this; spawn-mode workers re-import this module
+        # (its identity is preserved by Python's import system) and
+        # then read _BIAS_RULES_FOR_WORKERS at the time _global_biased_np_choice
+        # actually fires.
+        if not _install_global_bias_hook(rules):
+            self._phase("patch_bias",
+                "ABORT: global install failed (np.random.choice readonly?)")
+            self._l6_patch_bias_enabled = False
+            self._phase_end("patch_bias", ok=False, note="global install failed")
+            return
 
-            Everything else (size=, p=, replace=, multi-arg, called
-            from outside generate_train_batch) passes through to the
-            original implementation untouched.
-            """
-            try:
-                # Detect the specific 1-arg-int call shape.
-                if (len(args) == 1
-                        and not kwargs
-                        and isinstance(args[0], (int, np.integer))):
-                    # Look up one frame to confirm it's the class-selection
-                    # call inside generate_train_batch (NOT the subsequent
-                    # voxel-selection call inside the same function, which
-                    # uses a different local variable, and NOT some
-                    # unrelated np.random.choice elsewhere).
-                    frame = sys._getframe(1)
-                    if frame.f_code.co_name == "generate_train_batch":
-                        eligible = frame.f_locals.get("eligible_classes_or_regions")
-                        if (eligible is not None
-                                and hasattr(eligible, "__len__")
-                                and len(eligible) == int(args[0])
-                                and len(eligible) > 1):
-                            trainer_ref._bias_call_count += 1
-                            biased_idx = _select_biased_index(
-                                eligible,
-                                trainer_ref._patch_bias_rules_resolved,
-                                random.random,
-                            )
-                            if biased_idx is not None:
-                                cls = eligible[biased_idx]
-                                if isinstance(cls, (int, np.integer)):
-                                    if int(cls) == _L6_LABEL_ID:
-                                        trainer_ref._bias_l6_returns += 1
-                                    elif int(cls) == _SACRUM_LABEL_ID:
-                                        trainer_ref._bias_sacrum_returns += 1
-                                return biased_idx
-            except Exception:
-                # Never let the intercept break training.
-                pass
-            return original_np_choice(*args, **kwargs)
+        # Compatibility shim — older code paths in this file read
+        # self._bias_call_count etc. Wire those reads to the shared
+        # counters so existing log/payload logic just works.
+        # (Properties not used; we set plain ints periodically. To
+        # always read fresh, code that needs the live value should
+        # call _read_bias_counters() directly. The lines below also
+        # match what the v17 dataclass defaults declared.)
+        self._bias_call_count = 0
+        self._bias_l6_returns = 0
+        self._bias_sacrum_returns = 0
 
-        # First-batch diagnostic state — fires exactly once on the
-        # first call to confirm the hook + queue are active.
-        trainer_ref._first_batch_logged = False
+        # First-batch diagnostic state — set on the trainer for the
+        # parent process; ``_log_first_batch_diagnostic`` runs there
+        # the first time we see a batch return back.
+        self._first_batch_logged = False
 
-        def patched_generate_train_batch(*args, **kwargs):
-            if not trainer_ref._l6_patch_bias_enabled:
-                return original_gen(*args, **kwargs)
-            np.random.choice = biased_np_choice
-            try:
-                result = original_gen(*args, **kwargs)
-            finally:
-                np.random.choice = original_np_choice
-            if not trainer_ref._first_batch_logged:
-                trainer_ref._first_batch_logged = True
-                try:
-                    trainer_ref._log_first_batch_diagnostic(result)
-                except Exception as exc:
-                    trainer_ref.print_to_log_file(
-                        f"first-batch diagnostic: failed: {exc}")
-            return result
-
-        underlying.generate_train_batch = patched_generate_train_batch
         self._phase("patch_bias",
-            f"installed: {located_via}.generate_train_batch wrapped "
-            f"(np.random.choice intercept active during call)")
+            f"installed: np.random.choice wrapped GLOBALLY at module "
+            f"scope (worker forks inherit the patch via copy-on-write)")
         self._phase_end("patch_bias", ok=True,
             note=f"{len(targets)} cases match rules")
+
+    def _refresh_bias_counters_from_shared(self) -> None:
+        """Pull the latest cross-process counter values into the
+        instance attrs so existing read sites (log lines, W&B payload,
+        summary tables) continue to work without code changes."""
+        c, l6, sa = _read_bias_counters()
+        self._bias_call_count   = c
+        self._bias_l6_returns   = l6
+        self._bias_sacrum_returns = sa
 
     # ── Startup diagnostics ──────────────────────────────────────────────
 
@@ -1187,6 +1335,58 @@ class _WandBMixin:
                 map_counts = Counter(self._val_case_to_subtype.values())
                 log(f"    subtype distribution: {dict(map_counts)}")
             log(f"    classes tracked: {_ANATOMY_NAMES}")
+            # v17.1: dedicated LSTV val pass status
+            try:
+                ddv_enabled, ddv_every = self._resolve_lstv_dedicated_val_settings()
+                ddv_str = f"every {ddv_every} epoch(s)" if ddv_enabled else "DISABLED"
+                log(f"    dedicated LSTV val pass: {ddv_str} "
+                    f"(env: SPINESURG_LSTV_DEDICATED_VAL, "
+                    f"SPINESURG_LSTV_DEDICATED_VAL_EVERY)")
+                # Show which val cases would be hit (best-effort; some
+                # frameworks don't expose val keys at banner time).
+                if ddv_enabled:
+                    result = self._find_underlying_val_loader()
+                    if (isinstance(result, tuple)
+                            and len(result) == 4
+                            and result[1] is not None
+                            and result[2] is not None):
+                        underlying, keys_owner, keys_attr, is_callable = result
+                        try:
+                            raw = getattr(keys_owner, keys_attr)
+                            vk = list(raw() if is_callable else raw)
+                            attr_kind = "method" if is_callable else "attr"
+                            log(f"    val keys source: "
+                                f"{type(keys_owner).__name__}.{keys_attr} "
+                                f"[{attr_kind}], len={len(vk)}")
+                            lstv_subs = set(_OVERSAMPLE_SUBTYPES)
+                            lstv_in_val = [
+                                k for k in vk
+                                if (self._val_case_to_subtype or {}).get(
+                                    k, _SUBTYPE_NORMAL) in lstv_subs
+                            ]
+                            if lstv_in_val and self._val_case_to_subtype:
+                                by_sub = Counter(
+                                    self._val_case_to_subtype.get(k, "?")
+                                    for k in lstv_in_val
+                                )
+                                log(f"    LSTV val cases this fold: "
+                                    f"{len(lstv_in_val)} total -> "
+                                    f"{dict(by_sub)}")
+                                if is_callable:
+                                    log("    NOTE: keys attr is a method; "
+                                        "dedicated pass will run in "
+                                        "pass-through mode (regular val "
+                                        "sampler still produces metrics).")
+                            else:
+                                log("    LSTV val cases this fold: 0 "
+                                    "(dedicated pass will be a no-op)")
+                        except Exception as exc:
+                            log(f"    val keys probe failed: {exc}")
+                    else:
+                        log("    val keys probe: no usable list found "
+                            "(dedicated pass will be a no-op)")
+            except Exception as exc:
+                log(f"    dedicated-val settings resolve failed: {exc}")
 
             ce_w = getattr(self, "_ce_class_weights", None)
             if ce_w is not None:
@@ -1302,6 +1502,240 @@ class _WandBMixin:
             log("        per-epoch summary log.")
         log("─" * 72)
         log("")
+
+    # ── Dedicated LSTV validation pass (v17.1) ───────────────────────────
+    # nnU-Net v2's regular val loop subsamples the val set
+    # (num_val_iterations_per_epoch × batch_size = 100 cases by default,
+    # vs ~190 in a fold's val set). For the dataset's natural ~3% LSTV
+    # base rate, this means many epochs see zero LSTV val cases by luck
+    # of the draw — the per-subgroup metric is silenced when it's
+    # supposed to be the headline. The dedicated pass below runs ONE
+    # extra forward pass on every LSTV case in this fold's val set,
+    # every epoch (configurable via SPINESURG_LSTV_DEDICATED_VAL_EVERY).
+    #
+    # Cost: ~N_lstv_val * batch_size * forward_time. For 8 LSTV cases
+    # and bs=2 on H200 with the 256x320x320 patch, ≈30s per epoch.
+    # Cheaper than bumping num_val_iterations_per_epoch to cover the
+    # full fold (~70s extra) since most of those extra cases are
+    # normals we already have plenty of.
+    #
+    # The dedicated pass REPLACES (not appends to) any LSTV results
+    # the regular sampler may have caught this epoch — clears LSTV
+    # subtype slots in the buffer first, then forward-passes each
+    # LSTV case once. Normal results from the regular sampler are
+    # preserved untouched.
+
+    _lstv_dedicated_val_enabled: bool = True
+
+    def _resolve_lstv_dedicated_val_settings(self) -> Tuple[bool, int]:
+        """Return (enabled, every_n_epochs). Read once per epoch."""
+        enabled = _env_truthy("SPINESURG_LSTV_DEDICATED_VAL", default=True)
+        every = max(1, _env_int("SPINESURG_LSTV_DEDICATED_VAL_EVERY", 1))
+        return enabled, every
+
+    def _find_underlying_val_loader(self):
+        """Walk through dataloader_val's wrappers to find the actual
+        sampling list. Returns (underlying_loader, keys_owner,
+        keys_attr_name, is_callable) or (None, None, None, False) if
+        not found.
+
+        v17.2 changes from v17.1:
+          - Prefer ``loader.indices`` and ``loader.list_of_keys`` over
+            ``loader._data.identifiers`` / ``_data.keys``. The former are
+            what nnUNetDataLoader3D actually samples from in
+            ``get_indices()``; modifying them constrains the sampler.
+            Modifying ``_data.identifiers`` after construction may
+            be a no-op if the loader already snapshotted the list.
+          - Returns an extra ``is_callable`` flag so callers know
+            whether ``getattr(keys_owner, keys_attr)`` returns a
+            method (call it) or a value (use directly).
+        """
+        loader = getattr(self, "dataloader_val", None)
+        if loader is None: return None, None, None, False
+        underlying = loader
+        for attr in ("generator", "data_loader", "_data_loader"):
+            cand = getattr(underlying, attr, None)
+            if cand is not None and (hasattr(cand, "generate_train_batch")
+                                       or hasattr(cand, "_data")):
+                underlying = cand
+                break
+        if underlying is None or not hasattr(underlying, "generate_train_batch"):
+            return None, None, None, False
+
+        # Try in order: attributes the loader itself uses for sampling
+        # (these are the right place to modify), then the dataset's
+        # identifier list (modify-then-sample only works if the loader
+        # re-reads on each batch — usually not the case, but try as
+        # last resort).
+        candidates: List[Tuple[object, str]] = []
+        # Loader-level sample lists (highest priority).
+        for ka in ("indices", "list_of_keys", "_indices"):
+            if hasattr(underlying, ka):
+                candidates.append((underlying, ka))
+        # Dataset-level identifier lists (lower priority).
+        data_attr = getattr(underlying, "_data", None)
+        if data_attr is not None:
+            for ka in ("identifiers", "keys"):
+                if hasattr(data_attr, ka):
+                    candidates.append((data_attr, ka))
+
+        for owner, ka in candidates:
+            try:
+                raw = getattr(owner, ka)
+            except Exception:
+                continue
+            try:
+                if callable(raw):
+                    materialized = list(raw())
+                    is_callable = True
+                else:
+                    materialized = list(raw)
+                    is_callable = False
+            except Exception:
+                continue
+            if materialized and all(isinstance(k, str) for k in materialized):
+                return underlying, owner, ka, is_callable
+        return underlying, None, None, False
+
+    def _validate_lstv_dedicated(self) -> None:
+        """Forward-pass every LSTV case in this fold's val set and record
+        per-case dice into _val_subgroup_dice. Called from on_epoch_end
+        AFTER the regular val loop completes and BEFORE per-subgroup
+        aggregation — so the buffer reflects the dedicated-pass results
+        when _aggregate_subgroup_dice runs.
+        """
+        if not self._per_subgroup_logging_enabled: return
+        enabled, every = self._resolve_lstv_dedicated_val_settings()
+        if not enabled: return
+
+        epoch = getattr(self, "current_epoch", 0)
+        if (epoch % every) != 0:
+            # Skip this epoch — leave whatever the regular sampler
+            # caught (may be n=0; that's the price of skipping).
+            return
+
+        if self._val_case_to_subtype is None:
+            return
+        if self._val_subgroup_dice is None:
+            self._reset_subgroup_dice_buffer()
+
+        result = self._find_underlying_val_loader()
+        if not isinstance(result, tuple) or len(result) != 4:
+            self.print_to_log_file(
+                "LSTV dedicated val: _find_underlying_val_loader returned "
+                "unexpected shape; skipping.")
+            return
+        underlying, keys_owner, keys_attr, is_callable = result
+        if underlying is None or keys_owner is None:
+            self.print_to_log_file(
+                "LSTV dedicated val: cannot locate val dataloader internals; "
+                "skipping (regular val sampler still active).")
+            return
+
+        # v17.2: read the keys list, handling both attribute and method
+        # cases. The is_callable flag came from _find_underlying_val_loader
+        # which already validated the read works.
+        try:
+            raw = getattr(keys_owner, keys_attr)
+            if is_callable:
+                full_keys = list(raw())
+            else:
+                full_keys = list(raw)
+        except Exception as exc:
+            self.print_to_log_file(f"LSTV dedicated val: keys read failed: {exc}")
+            return
+
+        # Filter val keys to LSTV pool members only
+        lstv_subtypes = set(_OVERSAMPLE_SUBTYPES)
+        lstv_in_val = [
+            k for k in full_keys
+            if self._val_case_to_subtype.get(k, _SUBTYPE_NORMAL) in lstv_subtypes
+        ]
+        if not lstv_in_val:
+            # No LSTV cases in this fold's val set — silently no-op
+            # (no point logging every epoch on folds without LSTV val).
+            return
+
+        # If the keys attribute is a method (e.g., dict.keys), we
+        # cannot safely setattr to constrain it to one case — that
+        # would replace the method with a list and break subsequent
+        # callers. Skip the dedicated forward pass and just log a
+        # diagnostic. The normal val sampler still produces metrics
+        # (sub-sampled).
+        if is_callable:
+            self.print_to_log_file(
+                f"LSTV dedicated val: keys attribute "
+                f"{type(keys_owner).__name__}.{keys_attr} is a method, "
+                f"not a settable list; cannot constrain val sampler. "
+                f"Found {len(lstv_in_val)} LSTV cases in val but skipping "
+                f"forced forward passes (regular val sampler will still "
+                f"catch some). Pass-through mode.")
+            return
+
+        # Clear LSTV slots — the dedicated pass replaces the regular
+        # sampler's contribution for these subtypes. Normal slot
+        # untouched.
+        for sub in lstv_subtypes:
+            self._val_subgroup_dice[sub] = []
+
+        net = getattr(self, "network", None)
+        if net is None:
+            self.print_to_log_file(
+                "LSTV dedicated val: self.network is None; skipping")
+            return
+        device = getattr(self, "device", torch.device("cuda"))
+
+        # For each LSTV case, force the loader to see only that case
+        # then pull one batch — which will be batch_size patches all
+        # cropped from the same case. Forward-pass and record.
+        n_attempted = 0
+        n_succeeded = 0
+        was_training = net.training
+        net.eval()
+        try:
+            for cid in lstv_in_val:
+                n_attempted += 1
+                try:
+                    setattr(keys_owner, keys_attr, [cid])
+                    batch = underlying.generate_train_batch()
+                    if not isinstance(batch, dict) or "data" not in batch:
+                        continue
+                    data = batch["data"]
+                    if not isinstance(data, torch.Tensor):
+                        # Numpy → Tensor
+                        try: data = torch.as_tensor(data)
+                        except Exception: continue
+                    if data.device != device:
+                        data = data.to(device, non_blocking=True)
+                    with torch.no_grad():
+                        with torch.amp.autocast(
+                            device_type=device.type if device is not None else "cuda",
+                            enabled=True
+                        ):
+                            output = net(data)
+                    # Force the batch's keys list to this case so the
+                    # per-subgroup logger tags the dice correctly.
+                    batch["keys"] = [cid] * (data.shape[0] if data.dim() >= 1 else 1)
+                    self._record_per_case_dice(batch, output)
+                    n_succeeded += 1
+                except Exception as exc:
+                    try:
+                        self.print_to_log_file(
+                            f"LSTV dedicated val: case {cid} failed: {exc}")
+                    except Exception: pass
+        finally:
+            # Always restore full key list even if something raised
+            try:
+                setattr(keys_owner, keys_attr, full_keys)
+            except Exception: pass
+            if was_training:
+                net.train()
+
+        try:
+            self.print_to_log_file(
+                f"LSTV dedicated val (epoch {epoch}): "
+                f"forward-passed {n_succeeded}/{n_attempted} LSTV val cases")
+        except Exception: pass
 
     # ── Per-subgroup setup ───────────────────────────────────────────────
 
@@ -1476,7 +1910,13 @@ class _WandBMixin:
             out["val/lstv_subgroup/any_sacralization/mean_fg_dice"] = float(np.mean(any_sacr_means))
             out["val/lstv_subgroup/any_sacralization/n_cases"] = float(len(any_sacr_means))
 
-        # Cumulative bias-hook diagnostic counters.
+        # Cumulative bias-hook diagnostic counters. Refresh from the
+        # cross-process multiprocessing.Value shared state so worker
+        # increments propagate into this payload (v17.2).
+        try:
+            self._refresh_bias_counters_from_shared()
+        except Exception:
+            pass
         out["debug/bias_hook/total_calls"]   = float(self._bias_call_count)
         out["debug/bias_hook/L6_picks"]      = float(self._bias_l6_returns)
         out["debug/bias_hook/sacrum_picks"]  = float(self._bias_sacrum_returns)
@@ -1724,6 +2164,15 @@ class _WandBMixin:
                 "timing/epoch_sec": epoch_time,
                 **per_class_log,
             }
+            try:
+                # v17.1: dedicated LSTV val pass — forward-pass every
+                # LSTV case in this fold's val set so the per-subgroup
+                # metric is deterministic instead of subsampling-noisy.
+                # Must run BEFORE _aggregate_subgroup_dice so the
+                # buffer reflects dedicated-pass results.
+                self._validate_lstv_dedicated()
+            except Exception as exc:
+                self.print_to_log_file(f"LSTV dedicated val: {exc}")
             try:
                 sg = self._aggregate_subgroup_dice()
                 payload.update(sg)
@@ -1987,6 +2436,30 @@ class nnUNetTrainerWandB_500ep_LSTVOversample(
     """500 epochs + LSTV queue oversample + L6 patch bias + CE reweight.
     DEFAULT for the SpineSurg-CT paper run.
 
+    v17.2: Two production-bug fixes.
+         (1) Patch-bias hook installed at module level (np.random.choice
+             replaced globally with frame-inspection guard) instead of
+             on the trainer instance. The v15-v17.1 instance-level
+             install passed startup self-test in the parent process but
+             never fired in worker processes spawned by
+             NonDetMultiThreadedAugmenter — visible as "calls=0" every
+             epoch in every fold's log. v17.2 patches via module state
+             that survives fork/spawn. Counters via multiprocessing.Value
+             so worker increments propagate to the parent.
+         (2) Dedicated LSTV val pass: handle the case where the loader's
+             keys attribute is a method (e.g., dict.keys) rather than
+             a settable list. v17.1 raised "method object is not iterable"
+             and silently no-op'd. v17.2 detects this at probe time,
+             logs the actual attribute name + kind in the startup
+             banner, and skips the forced override (which would replace
+             the method with a list and break subsequent callers).
+    v17.1: Dedicated LSTV validation pass — runs forward pass on every
+         LSTV case in this fold's val set every epoch, regardless of
+         whether the regular val sampler caught them in its
+         num_val_iterations subsample. Eliminates n=0 LSTV val epochs
+         that silenced the headline metric. Adds ~30s/epoch (8 cases
+         × bs 2 forward passes on H200). Configurable via
+         SPINESURG_LSTV_DEDICATED_VAL{,_EVERY} env vars.
     v17: Oversample pool now includes all 5 LSTV variants (added
          ambiguous, n=4). Symmetric per-record subtype refinement at
          convert time: spine_only demotes pelvis-region subtypes

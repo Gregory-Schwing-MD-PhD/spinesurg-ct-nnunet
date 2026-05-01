@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=300G
+#SBATCH --mem=200G
 #SBATCH --gres=gpu:nvidia_h200:1
 #SBATCH --time=5-00:00:00
 #SBATCH --requeue

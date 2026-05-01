@@ -37,14 +37,26 @@ echo "-- tests/test_patch_bias.py --"
 "$PY" tests/test_patch_bias.py || failed=$((failed+1))
 echo
 
+echo "-- tests/test_lstv_dedicated_val.py --"
+"$PY" tests/test_lstv_dedicated_val.py || failed=$((failed+1))
+echo
+
 # nnU-Net call-site smoke test only runs if nnunetv2 is importable.
 if "$PY" -c "import nnunetv2" 2>/dev/null; then
     echo "-- tests/test_nnunet_call_site.py (nnU-Net detected) --"
     "$PY" tests/test_nnunet_call_site.py || failed=$((failed+1))
+    echo
+
+    echo "-- tests/integration/test_real_nnunet_integration.py (nnU-Net detected) --"
+    "$PY" tests/integration/test_real_nnunet_integration.py || failed=$((failed+1))
 else
     echo "-- tests/test_nnunet_call_site.py: SKIPPED (nnunetv2 not in this env) --"
     echo "   To run inside container:"
     echo "     singularity exec --nv \$CONTAINER /opt/conda/bin/python3 tests/test_nnunet_call_site.py"
+    echo
+    echo "-- tests/integration/test_real_nnunet_integration.py: SKIPPED (nnunetv2 not in this env) --"
+    echo "   To run inside container:"
+    echo "     singularity exec --nv \$CONTAINER /opt/conda/bin/python3 tests/integration/test_real_nnunet_integration.py"
 fi
 echo
 
