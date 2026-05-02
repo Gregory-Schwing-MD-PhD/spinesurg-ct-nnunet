@@ -1,6 +1,28 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v17.3)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v17.4)
 tools/nnunet_wandb_variant.py
+
+v17.4 — May 2026: hallucination metrics (specificity tracking).
+
+Adds per-(subgroup, class) tracking of false-positive predictions on
+cases where the class is ABSENT in ground truth. Reports specificity
+(fraction of absent-cases with pred ≤ 100 voxels), mean predicted
+volume when absent, and headline numbers for clinically meaningful
+pairs:
+
+    L5 specificity on sacralization     (L5 fused into sacrum, GT=0)
+    L5 specificity on sacr_count         (L5 absent, sacrum has 6 attachments)
+    L5 specificity on semisacralization  (L5 partially fused)
+    L6 specificity on normal             (no L6 in normal anatomy)
+    L6 specificity on sacralization      (no L6 in sacralization)
+    L6 specificity on semisacralization
+    L6 specificity on sacr_count
+
+These complement the existing presence-dice (sensitivity) numbers to
+give a full sensitivity/specificity picture for each anatomy variant.
+Reviewers will ask "does the model hallucinate L5 on sacralization
+patients?" — v17.4 answers that question directly in every epoch log
+and W&B run.
 
 v17.3 — May 2026: PRE-FORK install of the global np.random.choice
 patch. v17.1 → v17.2 fixed the closure-over-instance bug by moving
@@ -434,6 +456,52 @@ def _per_case_dice_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor,
     return out
 
 
+def _per_case_voxel_counts_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor,
+                                      ignore_label: int = _IGNORE_LABEL
+                                      ) -> List[Tuple[int, int]]:
+    """Return (gt_n, pred_n) per class, including classes where gt_n == 0.
+
+    v17.4: hallucination tracking. When gt_n == 0, the case is in the
+    "should not predict" condition for that class. pred_n is the number
+    of voxels the model wrongly emitted. We accumulate these per
+    subgroup so we can report:
+
+        - Hallucination rate: fraction of "absent" cases where pred_n
+          exceeds a clinically-meaningful threshold
+        - Mean/max predicted volume when GT is absent
+        - Specificity: 1 - (hallucination rate)
+
+    Voxels with gt == ignore_label are excluded from BOTH gt_n and
+    pred_n, matching the standard dice computation. This means a
+    pelvic-only case (which has ignore=10 in the lumbar region) won't
+    contribute spurious "L6 hallucination" stats from its uninformative
+    region.
+
+    Returns a list of (gt_n, pred_n) integer tuples in the same order
+    as _FG_CLASS_IDS — so the caller can index parallel to the dice
+    list.
+    """
+    pred_argmax = pred_argmax.flatten()
+    gt = gt.flatten()
+    valid = gt != ignore_label
+    if not valid.any():
+        return [(0, 0)] * len(_FG_CLASS_IDS)
+    pred_argmax = pred_argmax[valid]
+    gt = gt[valid]
+    out: List[Tuple[int, int]] = []
+    for cid in _FG_CLASS_IDS:
+        gt_n = int((gt == cid).sum().item())
+        pred_n = int((pred_argmax == cid).sum().item())
+        out.append((gt_n, pred_n))
+    return out
+
+
+# Hallucination threshold: a per-class predicted-voxel count above which
+# we consider the prediction a "meaningful hallucination" rather than
+# noise at a boundary. ~1 cc at typical CT spacing of ~0.8 mm³/voxel.
+_HALLUC_VOXEL_THRESHOLD = 100
+
+
 # =============================================================================
 # Class reweighting
 # =============================================================================
@@ -827,6 +895,13 @@ class _WandBMixin:
     _channels_last_active = False
 
     _val_subgroup_dice: Dict[str, List[List[Optional[float]]]] = None
+    # v17.4: parallel buffer of (gt_n, pred_n) tuples per case, per class.
+    # Same outer shape as _val_subgroup_dice (subtype -> list-of-cases ->
+    # list-of-classes), but each per-class entry is a (int, int) tuple
+    # instead of an Optional[float]. Used by _aggregate_subgroup_hallucination
+    # to compute specificity / hallucination volume on cases where the
+    # class is absent in GT.
+    _val_subgroup_voxels: Dict[str, List[List[Tuple[int, int]]]] = None
     _val_case_to_subtype: Optional[Dict[str, str]] = None
     _per_subgroup_logging_enabled: bool = True
 
@@ -1847,6 +1922,8 @@ class _WandBMixin:
 
     def _reset_subgroup_dice_buffer(self):
         self._val_subgroup_dice = {sub: [] for sub in _KNOWN_SUBTYPES}
+        # v17.4: hallucination tracking buffer, parallel to dice buffer
+        self._val_subgroup_voxels = {sub: [] for sub in _KNOWN_SUBTYPES}
 
     def _subtype_for_case(self, case_id: str) -> str:
         if not self._val_case_to_subtype: return _SUBTYPE_NORMAL
@@ -1886,10 +1963,13 @@ class _WandBMixin:
                 cid = str(keys[b])
                 cid_lookup = cid[:-5] if cid.endswith("_0000") else cid
                 subtype = self._subtype_for_case(cid_lookup)
-                dice_per_cls = _per_case_dice_per_class(
-                    pred_argmax[b].cpu().to(torch.int16),
-                    gt[b].cpu().to(torch.int16))
+                pred_b = pred_argmax[b].cpu().to(torch.int16)
+                gt_b   = gt[b].cpu().to(torch.int16)
+                dice_per_cls = _per_case_dice_per_class(pred_b, gt_b)
+                # v17.4: also record voxel counts for hallucination tracking
+                voxels_per_cls = _per_case_voxel_counts_per_class(pred_b, gt_b)
                 self._val_subgroup_dice.setdefault(subtype, []).append(dice_per_cls)
+                self._val_subgroup_voxels.setdefault(subtype, []).append(voxels_per_cls)
         except Exception as exc:
             try: self.print_to_log_file(f"per-subgroup dice: batch failed: {exc}")
             except Exception: pass
@@ -1954,6 +2034,105 @@ class _WandBMixin:
         out["debug/bias_hook/total_calls"]   = float(self._bias_call_count)
         out["debug/bias_hook/L6_picks"]      = float(self._bias_l6_returns)
         out["debug/bias_hook/sacrum_picks"]  = float(self._bias_sacrum_returns)
+
+        # v17.4: hallucination metrics (specificity / false-positive
+        # tracking). Merge into the same payload dict.
+        try:
+            halluc_payload = self._aggregate_subgroup_hallucination()
+            out.update(halluc_payload)
+        except Exception as exc:
+            try: self.print_to_log_file(f"hallucination aggregation: {exc}")
+            except Exception: pass
+        return out
+
+    def _aggregate_subgroup_hallucination(self) -> Dict[str, float]:
+        """v17.4: compute specificity and hallucination volume per
+        (subgroup, class) pair from the voxel-count buffer.
+
+        For each subgroup S and each foreground class C, partition cases
+        into "absent" (gt_n == 0) and "present" (gt_n > 0). Then for
+        absent cases compute:
+
+            n_absent              : how many cases had no voxels of C in GT
+            n_strict_halluc       : of those, how many had pred_n > 0
+            n_meaningful_halluc   : of those, how many had pred_n > THRESHOLD
+            mean_pred_when_absent : mean predicted voxel count over absent
+            max_pred_when_absent  : max predicted voxel count over absent
+            specificity           : 1 - n_meaningful_halluc / n_absent
+
+        Specificity is the headline number: "given the class is NOT
+        present in this anatomy variant, did the model correctly
+        predict zero voxels (or noise-level voxels) of it?"
+
+        Headline derived metrics (clinically curated):
+            val/headline/L5_specificity_on_sacralization
+            val/headline/L5_specificity_on_sacr_count
+            val/headline/L5_specificity_on_semisacralization
+            val/headline/L6_specificity_on_normal
+            val/headline/L6_specificity_on_sacralization
+            val/headline/L6_specificity_on_semisacralization
+            val/headline/L6_specificity_on_sacr_count
+        """
+        out: Dict[str, float] = {}
+        if self._val_subgroup_voxels is None:
+            return out
+        threshold = _HALLUC_VOXEL_THRESHOLD
+
+        for subtype, cases in self._val_subgroup_voxels.items():
+            if not cases:
+                continue
+            for ci, cls_id in enumerate(_FG_CLASS_IDS):
+                cls_name = _ANATOMY_NAMES[ci]
+                # Pull (gt_n, pred_n) for this class across all cases
+                # in the subgroup.
+                pairs = [c[ci] for c in cases]
+                # Partition by GT presence.
+                absent_preds = [p for (g, p) in pairs if g == 0]
+                present_preds = [(g, p) for (g, p) in pairs if g > 0]
+
+                # Per-class absent/present counts (always emitted; useful
+                # for sanity-checking the partition in W&B).
+                k = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}"
+                out[f"{k}/n_absent"]  = float(len(absent_preds))
+                out[f"{k}/n_present"] = float(len(present_preds))
+
+                if not absent_preds:
+                    # Class is always present in GT for this subgroup —
+                    # no specificity defined. Skip.
+                    continue
+
+                n_strict = sum(1 for p in absent_preds if p > 0)
+                n_meaningful = sum(1 for p in absent_preds if p > threshold)
+                mean_pred = float(np.mean(absent_preds)) if absent_preds else 0.0
+                max_pred = float(max(absent_preds)) if absent_preds else 0.0
+                specificity = 1.0 - (n_meaningful / len(absent_preds))
+
+                out[f"{k}/n_strict_halluc"]      = float(n_strict)
+                out[f"{k}/n_meaningful_halluc"]  = float(n_meaningful)
+                out[f"{k}/mean_pred_when_absent"] = mean_pred
+                out[f"{k}/max_pred_when_absent"]  = max_pred
+                out[f"{k}/specificity"]          = specificity
+
+        # ── Headline metrics: clinically meaningful (subgroup, class)
+        # pairs where the class SHOULD NOT be present in GT. These are
+        # the numbers that go into the paper table.
+        headline_pairs = [
+            ("L5", _SUBTYPE_SACR,        "L5_specificity_on_sacralization"),
+            ("L5", _SUBTYPE_SACR_COUNT,  "L5_specificity_on_sacr_count"),
+            ("L5", _SUBTYPE_SEMI,        "L5_specificity_on_semisacralization"),
+            ("L6", _SUBTYPE_NORMAL,      "L6_specificity_on_normal"),
+            ("L6", _SUBTYPE_SACR,        "L6_specificity_on_sacralization"),
+            ("L6", _SUBTYPE_SEMI,        "L6_specificity_on_semisacralization"),
+            ("L6", _SUBTYPE_SACR_COUNT,  "L6_specificity_on_sacr_count"),
+        ]
+        for cls_name, subtype, headline_key in headline_pairs:
+            spec_key = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}/specificity"
+            n_abs_key = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}/n_absent"
+            mean_key = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}/mean_pred_when_absent"
+            if spec_key in out:
+                out[f"val/headline/{headline_key}"] = out[spec_key]
+                out[f"val/headline/{headline_key}_n_cases"] = out[n_abs_key]
+                out[f"val/headline/{headline_key}_mean_voxels"] = out[mean_key]
         return out
 
     def _print_per_subgroup_summary(self, epoch, payload):
@@ -1985,6 +2164,39 @@ class _WandBMixin:
             if l6 is not None and l6n is not None:
                 self.print_to_log_file(
                     f"  HEADLINE: L6 dice on lumbarization cases = {l6:.3f}  (n={int(l6n)})")
+
+            # v17.4: hallucination headline lines. Specificity = fraction
+            # of cases where class is absent in GT and model correctly
+            # predicted ≤ 100 voxels of it (clinically: noise floor).
+            # Higher is better; 1.0 = no hallucination.
+            self.print_to_log_file(
+                f"  --- v17.4 hallucination (specificity = fraction of "
+                f"absent-cases with pred ≤ 100 voxels) ---")
+            halluc_headlines = [
+                ("L5_specificity_on_sacralization",       "L5 on sacralization     "),
+                ("L5_specificity_on_sacr_count",          "L5 on sacr_count        "),
+                ("L5_specificity_on_semisacralization",   "L5 on semisacralization "),
+                ("L6_specificity_on_normal",              "L6 on normal            "),
+                ("L6_specificity_on_sacralization",       "L6 on sacralization     "),
+                ("L6_specificity_on_semisacralization",   "L6 on semisacralization "),
+                ("L6_specificity_on_sacr_count",          "L6 on sacr_count        "),
+            ]
+            any_halluc_line = False
+            for key, label in halluc_headlines:
+                spec = payload.get(f"val/headline/{key}")
+                n = payload.get(f"val/headline/{key}_n_cases")
+                mean_vox = payload.get(f"val/headline/{key}_mean_voxels")
+                if spec is None or n is None or int(n) == 0:
+                    continue
+                any_halluc_line = True
+                mean_str = (f", mean_pred={mean_vox:.0f} voxels"
+                            if mean_vox is not None else "")
+                self.print_to_log_file(
+                    f"    {label} specificity={spec:.3f}  "
+                    f"(n_absent={int(n)}{mean_str})")
+            if not any_halluc_line:
+                self.print_to_log_file("    (no eligible (subgroup, class) pairs this epoch)")
+
             # Bias-hook diagnostic line. If total_calls is zero by epoch
             # 1, the hook never fired and the install is broken.
             calls = int(payload.get("debug/bias_hook/total_calls", 0))

@@ -41,6 +41,10 @@ echo "-- tests/test_lstv_dedicated_val.py --"
 "$PY" tests/test_lstv_dedicated_val.py || failed=$((failed+1))
 echo
 
+echo "-- tests/test_hallucination_metrics.py --"
+"$PY" tests/test_hallucination_metrics.py || failed=$((failed+1))
+echo
+
 # nnU-Net call-site smoke test only runs if nnunetv2 is importable.
 if "$PY" -c "import nnunetv2" 2>/dev/null; then
     echo "-- tests/test_nnunet_call_site.py (nnU-Net detected) --"
