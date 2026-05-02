@@ -79,6 +79,22 @@
 # Force cache rebuild (e.g., after dataset changes):
 #   SPINESURG_FORCE_DATAPREP=1 sbatch slurm/spine_train_array.sh
 #
+# May 2026 — v18 patch-bias dataloader bind
+# =========================================
+# Both nnunet_wandb_variant.py and lstv_biased_dataloader.py must be
+# bind-mounted into the container's variants/ directory. The trainer
+# imports the dataloader at module load; if the dataloader path is
+# missing inside the container, the trainer falls back to nnU-Net's
+# default uniform foreground sampling (bias INACTIVE) — visible in
+# the SLURM log's startup banner as:
+#
+#   ✗ LSTVBiasedDataLoader3D NOT IMPORTABLE
+#       import error: ...
+#       bias is INACTIVE — nnU-Net default uniform sampling
+#
+# If you see that, the bind for lstv_biased_dataloader.py is missing
+# from this script's TRAIN_BINDS array.
+#
 # Quick reference
 # ---------------
 #   sbatch slurm/spine_train_array.sh                    # all 5 folds
@@ -122,6 +138,11 @@ export WANDB_INIT_TIMEOUT_SEC="${WANDB_INIT_TIMEOUT_SEC:-180}"
 export WANDB_ALLOW_OFFLINE="${WANDB_ALLOW_OFFLINE:-1}"
 export LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC:-0.25}"
 
+# v18 patch-bias config (passed through to the container)
+export SPINESURG_LSTV_BIAS_ENABLED="${SPINESURG_LSTV_BIAS_ENABLED:-1}"
+export SPINESURG_LSTV_BIAS_L6_PROB="${SPINESURG_LSTV_BIAS_L6_PROB:-0.60}"
+export SPINESURG_LSTV_BIAS_SACRUM_PROB="${SPINESURG_LSTV_BIAS_SACRUM_PROB:-0.50}"
+
 WANDB_RUN_TAG="${WANDB_RUN_TAG:-${ARRAY_JOB}}"
 export WANDB_RUN_TAG
 
@@ -152,8 +173,17 @@ NNUNET_DA_WORKERS=24
 PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/SpineSurg-CT}"
 NNUNET_NFS="${PROJECT_ROOT}/nnunet"
 CONTAINER="${PROJECT_ROOT}/containers/spinesurg-ct.sif"
+
+# Bind-mount targets for our custom trainer + dataloader. Both must
+# land in the container's variants/ directory at runtime so nnU-Net's
+# trainer registry discovers nnUNetTrainerWandB_500ep_LSTVOversample
+# AND the trainer can `from ...variants.lstv_biased_dataloader import
+# LSTVBiasedDataLoader3D` for v18 patch biasing.
 WANDB_TRAINER_HOST="${PROJECT_ROOT}/tools/nnunet_wandb_variant.py"
 WANDB_TRAINER_CONTAINER="/opt/conda/lib/python3.11/site-packages/nnunetv2/training/nnUNetTrainer/variants/nnunet_wandb_variant.py"
+LSTV_LOADER_HOST="${PROJECT_ROOT}/tools/lstv_biased_dataloader.py"
+LSTV_LOADER_CONTAINER="/opt/conda/lib/python3.11/site-packages/nnunetv2/training/nnUNetTrainer/variants/lstv_biased_dataloader.py"
+
 DS_DIR_NAME="Dataset$(printf '%03d' ${DATASET_ID})_${DATASET_NAME}"
 
 NFS_PREP_DS="${NNUNET_NFS}/preprocessed/${DS_DIR_NAME}"
@@ -168,6 +198,8 @@ TMP_CACHE_MARKER="${SPINESURG_CACHE_ROOT_TMP}/.preunpack_ok"
 
 # ----- Preflight ------------------------------------------------------------
 [[ ! -f "${CONTAINER}" ]] && { echo "ERROR: container not found: ${CONTAINER}" >&2; exit 1; }
+[[ ! -f "${WANDB_TRAINER_HOST}" ]] && { echo "ERROR: trainer source not found: ${WANDB_TRAINER_HOST}" >&2; exit 1; }
+[[ ! -f "${LSTV_LOADER_HOST}" ]] && { echo "ERROR: LSTV biased dataloader not found: ${LSTV_LOADER_HOST}" >&2; echo "       v18 patch biasing requires this file alongside nnunet_wandb_variant.py." >&2; exit 1; }
 if [[ ! -f "${NFS_PREP_DS}/dataset_fingerprint.json" ]]; then
     echo "ERROR: preprocessed dataset missing; run sbatch slurm/spine_prep.sh first." >&2
     exit 1
@@ -495,6 +527,10 @@ export SINGULARITYENV_WANDB_INIT_MAX_RETRIES="${WANDB_INIT_MAX_RETRIES}"
 export SINGULARITYENV_WANDB_INIT_TIMEOUT_SEC="${WANDB_INIT_TIMEOUT_SEC}"
 export SINGULARITYENV_WANDB_ALLOW_OFFLINE="${WANDB_ALLOW_OFFLINE}"
 export SINGULARITYENV_LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}"
+# v18 patch-bias env vars
+export SINGULARITYENV_SPINESURG_LSTV_BIAS_ENABLED="${SPINESURG_LSTV_BIAS_ENABLED}"
+export SINGULARITYENV_SPINESURG_LSTV_BIAS_L6_PROB="${SPINESURG_LSTV_BIAS_L6_PROB}"
+export SINGULARITYENV_SPINESURG_LSTV_BIAS_SACRUM_PROB="${SPINESURG_LSTV_BIAS_SACRUM_PROB}"
 export SINGULARITYENV_SPINESURG_PERF="${SPINESURG_PERF}"
 export SINGULARITYENV_SPINESURG_CHANNELS_LAST="${SPINESURG_CHANNELS_LAST}"
 export SINGULARITYENV_SPINESURG_PROFILE="${SPINESURG_PROFILE}"
@@ -505,6 +541,10 @@ export SINGULARITYENV_SPINESURG_PROFILE_ACTIVE="${SPINESURG_PROFILE_ACTIVE}"
 export OMP_NUM_THREADS=4
 
 # Build container binds. Add /tmp_prep bind only when cache is in use.
+# Both nnunet_wandb_variant.py AND lstv_biased_dataloader.py are
+# bind-mounted into the container's variants/ directory — the trainer
+# imports the dataloader module by package path, so both must be
+# present at the canonical install location.
 TRAIN_BINDS=(
     --nv
     --bind "/dev/shm:/dev/shm"
@@ -514,6 +554,7 @@ TRAIN_BINDS=(
     --bind "${NNUNET_NFS}:/nnunet_nfs"
     --bind "${HOME}/.wandb:${HOME}/.wandb"
     --bind "${WANDB_TRAINER_HOST}:${WANDB_TRAINER_CONTAINER}"
+    --bind "${LSTV_LOADER_HOST}:${LSTV_LOADER_CONTAINER}"
     --pwd  /workspace
 )
 if [[ "${USE_CACHE}" == "1" ]]; then
@@ -532,6 +573,8 @@ PROFILE_STATE=$([[ "${SPINESURG_PROFILE}" == "1" ]] \
     || echo "disabled")
 PERF_STATE=$([[ "${SPINESURG_PERF}" == "0" ]] && echo "disabled" || echo "ENABLED")
 CHLAST_STATE=$([[ "${SPINESURG_CHANNELS_LAST}" == "1" ]] && echo "ENABLED" || echo "disabled")
+BIAS_STATE=$([[ "${SPINESURG_LSTV_BIAS_ENABLED}" == "0" ]] && echo "disabled" \
+    || echo "ENABLED (L6=${SPINESURG_LSTV_BIAS_L6_PROB}, sacrum=${SPINESURG_LSTV_BIAS_SACRUM_PROB})")
 
 echo "================================================================"
 echo " 5-fold CV (/tmp shared cache)  |  fold ${FOLD}"
@@ -545,6 +588,7 @@ echo "   cpus alloc    : ${SLURM_CPUS_PER_TASK:-?}"
 echo "   trainer       : ${TRAINER}"
 echo "   plans         : ${PLANS}"
 echo "   LSTV frac     : ${LSTV_OVERSAMPLE_FRAC}"
+echo "   patch bias    : ${BIAS_STATE}"
 echo "   wandb run id  : ${SINGULARITYENV_WANDB_RUN_ID}"
 echo "   wandb tag     : ${WANDB_RUN_TAG}"
 echo "   data source   : ${DATA_SOURCE_LABEL}"
@@ -552,6 +596,8 @@ echo "   data source   : ${DATA_SOURCE_LABEL}"
 echo "   /tmp cache    : ${SPINESURG_CACHE_ROOT_TMP} (${TMP_CACHE_SIZE}; /tmp free=${TMP_FREE})"
 echo "   workers       : preunpack=${PREUNPACK_WORKERS}  da=${NNUNET_DA_WORKERS}  export=${NNUNET_EXPORT_POOL}"
 echo "   compile cache : ${PERSISTENT_CACHE} (${CACHE_FILES} files, ${CACHE_SIZE:-0})"
+echo "   trainer src   : ${WANDB_TRAINER_HOST}"
+echo "   loader src    : ${LSTV_LOADER_HOST}"
 echo "   perf tuning   : ${PERF_STATE}"
 echo "   channels_last : ${CHLAST_STATE}"
 echo "   profiler      : ${PROFILE_STATE}"

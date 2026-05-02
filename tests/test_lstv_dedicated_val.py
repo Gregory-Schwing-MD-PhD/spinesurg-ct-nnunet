@@ -16,6 +16,15 @@ is exercised end-to-end at runtime by the SLURM training job; the
 trainer-side log line "LSTV dedicated val (epoch N): forward-passed
 M/M LSTV val cases" confirms it.
 
+v18 (May 2026): six tests checking for v17.2/v17.3 monkey-patch
+infrastructure removed (`_BIAS_RULES_FOR_WORKERS`,
+`_global_biased_np_choice`, `_maybe_apply_l6_patch_bias`,
+`_refresh_bias_counters_from_shared`, pre-fork install ordering,
+loader=None handling). v18 replaced the np.random.choice monkey-
+patch with a clean nnUNetDataLoader3D subclass — those symbols no
+longer exist. The dedicated-val-pass tests (which were also tagged
+v17.2 by coincidence) are preserved.
+
 Run:
     /opt/conda/bin/python3 -m pytest tests/test_lstv_dedicated_val.py -v
 
@@ -32,7 +41,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 # We extract the relevant logic from the trainer source via AST. This
 # avoids needing nnU-Net / torch / wandb installed in the test
-# environment. Same approach as test_patch_bias.py.
+# environment.
 
 _THIS_DIR = Path(__file__).resolve().parent
 _TOOLS_DIR = _THIS_DIR.parent / "tools"
@@ -68,6 +77,13 @@ def _extract_constants_from_trainer():
             raise RuntimeError("AST node lacks lineno; need Python 3.7+")
         return "".join(src_lines[start - 1:end])
 
+    wanted_consts = {
+        "_SUBTYPE_NORMAL", "_SUBTYPE_LUMB", "_SUBTYPE_SACR_COUNT",
+        "_SUBTYPE_SEMI", "_SUBTYPE_SACR, _SUBTYPE_AMBIG",
+        "_KNOWN_SUBTYPES", "_OVERSAMPLE_SUBTYPES",
+    }
+    # Fix a typo from earlier: _SUBTYPE_SACR and _SUBTYPE_AMBIG are
+    # separate names.
     wanted_consts = {
         "_SUBTYPE_NORMAL", "_SUBTYPE_LUMB", "_SUBTYPE_SACR_COUNT",
         "_SUBTYPE_SEMI", "_SUBTYPE_SACR", "_SUBTYPE_AMBIG",
@@ -427,7 +443,14 @@ def test_trainer_restores_keys_in_finally():
     )
 
 
-# ─── End-to-end logic test (deterministic, no nnU-Net) ──────────────────────
+# ─── Dedicated-val-pass infrastructure (was tagged v17.2) ───────────────────
+# These three tests cover the dedicated-val-pass fixes from v17.2 that
+# are still in v18 — return-tuple shape, is_callable handling, method-
+# attribute safety. The OTHER v17.2/v17.3 tests that were here checked
+# for monkey-patch infrastructure (_BIAS_RULES_FOR_WORKERS,
+# _global_biased_np_choice, _maybe_apply_l6_patch_bias, etc.) — those
+# symbols no longer exist after the v18 class-override refactor and
+# their tests have been deleted.
 
 def test_v172_find_underlying_returns_4tuple():
     """v17.2 changed _find_underlying_val_loader to return a 4-tuple
@@ -523,286 +546,7 @@ def test_v172_skips_setattr_for_method_attrs():
     )
 
 
-# ─── Module-level bias-hook state tests (v17.2) ──────────────────────────────
-
-def test_v172_module_level_bias_state_present():
-    """v17.2 introduces module-level state for the bias hook that
-    survives worker fork. Verify the module exports the expected
-    names."""
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    expected_names = [
-        "_BIAS_RULES_FOR_WORKERS",
-        "_BIAS_INSTALLED",
-        "_BIAS_CALL_COUNT",
-        "_BIAS_L6_RETURNS",
-        "_BIAS_SACRUM_RETURNS",
-        "_BIAS_ORIGINAL_NP_CHOICE",
-    ]
-    for name in expected_names:
-        assert f"\n{name}" in src or src.startswith(name), (
-            f"v17.2 module-level state missing: {name}"
-        )
-
-
-def test_v172_module_level_helpers_present():
-    """The module-level helpers must exist and be top-level
-    functions (not class methods), so workers can call them after
-    fork without needing a trainer instance."""
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    tree = ast.parse(src)
-    top_level_funcs = {
-        node.name for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-    }
-    expected_helpers = [
-        "_global_biased_np_choice",
-        "_install_global_bias_hook",
-        "_ensure_bias_counters",
-        "_read_bias_counters",
-        "_reset_bias_counters_for_new_fold",
-    ]
-    for name in expected_helpers:
-        assert name in top_level_funcs, (
-            f"v17.2 module-level helper missing or not top-level: {name}. "
-            f"Found top-level: {sorted(top_level_funcs)[:10]}..."
-        )
-
-
-def test_v172_install_uses_module_state_not_closure():
-    """v17 wrapped generate_train_batch with a closure over
-    trainer-instance state. v17.2 must replace that with the
-    module-level _install_global_bias_hook call."""
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    tree = ast.parse(src)
-    install_method_src = None
-    # The method is named _maybe_apply_l6_patch_bias (which calls
-    # _install_global_bias_hook internally in v17.2).
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_maybe_apply_l6_patch_bias":
-            try:
-                install_method_src = ast.get_source_segment(src, node)
-            except AttributeError:
-                lines = src.splitlines(keepends=True)
-                end = getattr(node, "end_lineno", None) or len(lines)
-                install_method_src = "".join(lines[node.lineno - 1:end])
-            break
-    assert install_method_src is not None, (
-        "Could not find _maybe_apply_l6_patch_bias method"
-    )
-    # v17.2 must call the module-level installer
-    assert "_install_global_bias_hook(rules)" in install_method_src, (
-        "v17.2 _maybe_apply_l6_patch_bias must delegate to "
-        "_install_global_bias_hook(rules) for cross-process patch"
-    )
-    # The old closure-based approach must be GONE
-    assert "patched_generate_train_batch" not in install_method_src, (
-        "v17.2 must not define patched_generate_train_batch closure "
-        "(replaced by module-level np.random.choice patch)"
-    )
-    assert "underlying.generate_train_batch = patched_generate_train_batch" not in install_method_src, (
-        "v17.2 must not assign instance-level generate_train_batch "
-        "(closure didn't survive worker fork)"
-    )
-
-
-def test_v172_payload_refreshes_shared_counters():
-    """The W&B payload generator reads self._bias_call_count etc.,
-    which used to be incremented by the closure. In v17.2 the real
-    counters live in multiprocessing.Value — the payload generator
-    must call _refresh_bias_counters_from_shared() before reading
-    instance attrs, otherwise it'll show 0 forever."""
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    # Find _aggregate_subgroup_dice — it's where the payload is built
-    tree = ast.parse(src)
-    method_src = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_aggregate_subgroup_dice":
-            try:
-                method_src = ast.get_source_segment(src, node)
-            except AttributeError:
-                lines = src.splitlines(keepends=True)
-                end = getattr(node, "end_lineno", None) or len(lines)
-                method_src = "".join(lines[node.lineno - 1:end])
-            break
-    assert method_src is not None
-    # Refresh must happen BEFORE reading self._bias_call_count
-    refresh_pos = method_src.find("_refresh_bias_counters_from_shared")
-    read_pos = method_src.find("self._bias_call_count")
-    assert refresh_pos > 0, (
-        "v17.2 _aggregate_subgroup_dice must call "
-        "_refresh_bias_counters_from_shared() to read worker increments"
-    )
-    assert refresh_pos < read_pos, (
-        "_refresh_bias_counters_from_shared must run BEFORE reading "
-        "self._bias_call_count (otherwise shared->instance copy hasn't "
-        "happened yet)"
-    )
-
-
-def test_v173_patch_install_called_before_super_on_train_start():
-    """v17.3 critical guarantee: the source of _WandBMixin.on_train_start
-    must call self._maybe_apply_l6_patch_bias() BEFORE
-    super().on_train_start(). This is what makes worker fork inheritance
-    work — workers fork inside super(), inheriting the parent's already-
-    patched np.random.choice.
-
-    Production v17.2 had _maybe_apply_l6_patch_bias AFTER super(), which
-    caused the bias hook to never fire (calls=0 across 52 epochs of
-    fold 0 in job 35992462). This test prevents regression.
-    """
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    # Find the _WandBMixin.on_train_start method
-    import ast
-    tree = ast.parse(src)
-    on_train_start_body = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "_WandBMixin":
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == "on_train_start":
-                    on_train_start_body = item.body
-                    break
-            break
-    assert on_train_start_body is not None, (
-        "Could not locate _WandBMixin.on_train_start in source"
-    )
-
-    # Find the line number of super().on_train_start() and the line of
-    # the _maybe_apply_l6_patch_bias call BEFORE it.
-    super_call_lineno = None
-    pre_super_patch_call_lineno = None
-    post_super_patch_call_lineno = None
-
-    def _walk_for_super(stmt):
-        for n in ast.walk(stmt):
-            if (isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "on_train_start"
-                and isinstance(n.func.value, ast.Call)
-                and isinstance(n.func.value.func, ast.Name)
-                and n.func.value.func.id == "super"):
-                return n
-        return None
-
-    def _walk_for_patch_call(stmt):
-        for n in ast.walk(stmt):
-            if (isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "_maybe_apply_l6_patch_bias"):
-                return n
-        return None
-
-    for stmt in on_train_start_body:
-        sup = _walk_for_super(stmt)
-        if sup is not None and super_call_lineno is None:
-            super_call_lineno = stmt.lineno
-            continue
-        pat = _walk_for_patch_call(stmt)
-        if pat is not None:
-            if super_call_lineno is None:
-                if pre_super_patch_call_lineno is None:
-                    pre_super_patch_call_lineno = stmt.lineno
-            else:
-                if post_super_patch_call_lineno is None:
-                    post_super_patch_call_lineno = stmt.lineno
-
-    assert super_call_lineno is not None, (
-        "_WandBMixin.on_train_start does not call super().on_train_start()"
-    )
-    assert pre_super_patch_call_lineno is not None, (
-        "v17.3 REGRESSION: _maybe_apply_l6_patch_bias must be called BEFORE "
-        "super().on_train_start() so worker forks inherit the patched "
-        "np.random.choice. Found super() call at line "
-        f"{super_call_lineno} but no patch install call before it. "
-        f"This is the v17.2 bug — fix on_train_start ordering."
-    )
-    assert pre_super_patch_call_lineno < super_call_lineno, (
-        f"Pre-super patch install at line {pre_super_patch_call_lineno} "
-        f"should be BEFORE super() call at line {super_call_lineno}"
-    )
-    print(f"  pre-super install at line {pre_super_patch_call_lineno}, "
-          f"super() at line {super_call_lineno}, "
-          f"post-super diagnostic at line {post_super_patch_call_lineno}")
-
-
-def test_v173_subtype_map_loaded_before_super():
-    """v17.3 corollary: subtype map must also load BEFORE super() so
-    that _maybe_apply_l6_patch_bias has rules to install."""
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    import ast
-    tree = ast.parse(src)
-    body = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "_WandBMixin":
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == "on_train_start":
-                    body = item.body
-                    break
-            break
-    assert body is not None
-
-    super_lineno = None
-    subtype_pre_super_lineno = None
-    for stmt in body:
-        for n in ast.walk(stmt):
-            if (isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "on_train_start"
-                and isinstance(n.func.value, ast.Call)
-                and isinstance(n.func.value.func, ast.Name)
-                and n.func.value.func.id == "super"):
-                if super_lineno is None:
-                    super_lineno = stmt.lineno
-        for n in ast.walk(stmt):
-            if (isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "_maybe_load_subtype_map"
-                and super_lineno is None):
-                if subtype_pre_super_lineno is None:
-                    subtype_pre_super_lineno = stmt.lineno
-
-    assert subtype_pre_super_lineno is not None, (
-        "v17.3 REGRESSION: _maybe_load_subtype_map must be called BEFORE "
-        "super().on_train_start() so the subtype map is populated when "
-        "_maybe_apply_l6_patch_bias runs"
-    )
-    assert subtype_pre_super_lineno < super_lineno
-
-
-def test_v173_pre_fork_branch_handles_loader_none():
-    """v17.3 trainer must gracefully handle dataloader_train=None during
-    the pre-fork install phase (since the dataloader hasn't been
-    constructed yet at that point in on_train_start)."""
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    # Look for the pre_fork loader=None handling in _maybe_apply_l6_patch_bias
-    assert "pre_fork = loader is None" in src, (
-        "v17.3 _maybe_apply_l6_patch_bias must check loader is None "
-        "and treat that as the pre-fork install branch"
-    )
-    assert "PRE-FORK install" in src, (
-        "v17.3 _maybe_apply_l6_patch_bias must log which phase "
-        "(pre-fork install vs post-fork diagnostic) it's running in"
-    )
-
-
-def test_v173_install_idempotent_check_is_present():
-    """The post-fork call to _maybe_apply_l6_patch_bias must short-circuit
-    if _BIAS_INSTALLED is already True, so we don't re-run the self-test
-    or re-snapshot rules."""
-    src = (_TOOLS_DIR / "nnunet_wandb_variant.py").read_text()
-    # Find the _maybe_apply_l6_patch_bias body
-    import ast
-    tree = ast.parse(src)
-    target = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_maybe_apply_l6_patch_bias":
-            target = ast.unparse(node) if hasattr(ast, "unparse") else None
-            break
-    if target is not None:
-        assert "_BIAS_INSTALLED" in target, (
-            "v17.3 _maybe_apply_l6_patch_bias must check _BIAS_INSTALLED "
-            "to short-circuit the post-fork call (avoid re-running self-test)"
-        )
-
+# ─── End-to-end logic test (deterministic, no nnU-Net) ──────────────────────
 
 def test_end_to_end_filter_clear_dedicated_pass():
     """Simulate the full dedicated-pass logic on a mock buffer and

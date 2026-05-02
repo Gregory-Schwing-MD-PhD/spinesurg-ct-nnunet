@@ -9,6 +9,22 @@
 #   bash tests/run_all_tests.sh
 #
 # Exit code: nonzero if any test fails.
+#
+# v18 (May 2026):
+#   - Removed test_patch_bias.py: tested _select_biased_index and
+#     _selftest_patch_bias from the np.random.choice monkey-patch
+#     mechanism. Both functions are gone in v18; the patch bias is now
+#     a clean class override (LSTVBiasedDataLoader3D).
+#   - Removed test_nnunet_call_site.py: tested where the np.random.choice
+#     intercept fired in nnU-Net's generate_train_batch. Irrelevant in
+#     v18: nothing intercepts np.random.choice anywhere.
+#   - Removed integration/test_real_nnunet_integration.py: real-nnU-Net
+#     version of the call-site test. Same rationale — replaced by the
+#     production loader tests in test_lstv_biased_dataloader.py
+#     (TestProductionLoader, which verifies MRO ordering, picklability,
+#     and method resolution against the actual nnUNetDataLoader3D).
+#   - Added test_lstv_biased_dataloader.py: pure-function tests + mixin
+#     tests + production loader tests for the new class override.
 
 set -euo pipefail
 
@@ -29,38 +45,41 @@ echo
 
 failed=0
 
-echo "-- tests/test_subtype_refinement.py --"
-"$PY" tests/test_subtype_refinement.py || failed=$((failed+1))
-echo
+run_one() {
+    local label="$1"; local path="$2"
+    if [[ ! -f "$path" ]]; then
+        echo "-- $label: SKIPPED (not found: $path) --"
+        echo
+        return 0
+    fi
+    echo "-- $label --"
+    if "$PY" "$path"; then
+        :
+    else
+        failed=$((failed+1))
+    fi
+    echo
+}
 
-echo "-- tests/test_patch_bias.py --"
-"$PY" tests/test_patch_bias.py || failed=$((failed+1))
-echo
+# ── Standalone tests (no nnU-Net required) ──────────────────────────────
+run_one "subtype refinement"     "tests/test_subtype_refinement.py"
+run_one "LSTV biased dataloader" "tests/test_lstv_biased_dataloader.py"
+run_one "LSTV dedicated val"     "tests/test_lstv_dedicated_val.py"
+run_one "hallucination metrics"  "tests/test_hallucination_metrics.py"
 
-echo "-- tests/test_lstv_dedicated_val.py --"
-"$PY" tests/test_lstv_dedicated_val.py || failed=$((failed+1))
-echo
-
-echo "-- tests/test_hallucination_metrics.py --"
-"$PY" tests/test_hallucination_metrics.py || failed=$((failed+1))
-echo
-
-# nnU-Net call-site smoke test only runs if nnunetv2 is importable.
+# ── Production loader tests (require nnU-Net) ───────────────────────────
+# The new test_lstv_biased_dataloader.py auto-skips its
+# TestProductionLoader class via @pytest.mark.skipif(not _NNUNET_AVAILABLE)
+# if nnunetv2 is not importable from the current env. Inside the container
+# (nnunetv2 IS importable), those tests run automatically as part of the
+# standalone invocation above — no separate gated section needed.
 if "$PY" -c "import nnunetv2" 2>/dev/null; then
-    echo "-- tests/test_nnunet_call_site.py (nnU-Net detected) --"
-    "$PY" tests/test_nnunet_call_site.py || failed=$((failed+1))
-    echo
-
-    echo "-- tests/integration/test_real_nnunet_integration.py (nnU-Net detected) --"
-    "$PY" tests/integration/test_real_nnunet_integration.py || failed=$((failed+1))
+    echo "-- nnU-Net detected in this env: TestProductionLoader cases above ran inline --"
 else
-    echo "-- tests/test_nnunet_call_site.py: SKIPPED (nnunetv2 not in this env) --"
-    echo "   To run inside container:"
-    echo "     singularity exec --nv \$CONTAINER /opt/conda/bin/python3 tests/test_nnunet_call_site.py"
-    echo
-    echo "-- tests/integration/test_real_nnunet_integration.py: SKIPPED (nnunetv2 not in this env) --"
-    echo "   To run inside container:"
-    echo "     singularity exec --nv \$CONTAINER /opt/conda/bin/python3 tests/integration/test_real_nnunet_integration.py"
+    echo "-- nnU-Net NOT in this env: TestProductionLoader cases were skipped --"
+    echo "   To run them inside the container:"
+    echo "     singularity exec --nv \$CONTAINER /opt/conda/bin/python3 \\"
+    echo "       tests/test_lstv_biased_dataloader.py"
 fi
 echo
 

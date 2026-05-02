@@ -1,47 +1,121 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v17.4)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v19.1)
 tools/nnunet_wandb_variant.py
 
-v17.4 — May 2026: hallucination metrics (specificity tracking).
+v19.1 — May 2026: CROSS-PROCESS BIAS COUNTERS.
+==============================================
+Per-epoch logging of patch-bias activity (force_fg calls served, L6
+forces emitted, sacrum forces emitted, uniform-fallback count). The
+counters live in multiprocessing.Value at module level in
+lstv_biased_dataloader.py — created at import time before nnU-Net's
+MultiThreadedAugmenter forks workers, so the shared-memory backing
+is inherited across fork. Workers increment, parent reads at epoch
+boundaries.
 
-Adds per-(subgroup, class) tracking of false-positive predictions on
-cases where the class is ABSENT in ground truth. Reports specificity
-(fraction of absent-cases with pred ≤ 100 voxels), mean predicted
-volume when absent, and headline numbers for clinically meaningful
-pairs:
+What you'll see in the SLURM log every epoch:
 
-    L5 specificity on sacralization     (L5 fused into sacrum, GT=0)
-    L5 specificity on sacr_count         (L5 absent, sacrum has 6 attachments)
-    L5 specificity on semisacralization  (L5 partially fused)
-    L6 specificity on normal             (no L6 in normal anatomy)
-    L6 specificity on sacralization      (no L6 in sacralization)
-    L6 specificity on semisacralization
-    L6 specificity on sacr_count
+    --- v19.1 patch bias activity (epoch 50) ---
+      this epoch: force_fg=14823, L6 forces=752, sacrum forces=237,
+                  uniform fallback=13834
+      rates: L6=5.07%, sacrum=1.60%, no-bias=93.33%
+      cumulative: force_fg=741150, L6=37600, sacrum=11850
 
-These complement the existing presence-dice (sensitivity) numbers to
-give a full sensitivity/specificity picture for each anatomy variant.
-Reviewers will ask "does the model hallucinate L5 on sacralization
-patients?" — v17.4 answers that question directly in every epoch log
-and W&B run.
+What you'll see in W&B:
 
-v17.3 — May 2026: PRE-FORK install of the global np.random.choice
-patch. v17.1 → v17.2 fixed the closure-over-instance bug by moving
-the patch to module scope, but the install was still happening AFTER
-super().on_train_start() — which calls get_dataloaders() which
-constructs NonDetMultiThreadedAugmenter which spawns 24 worker
-subprocesses via mp.Process(target=producer, ...). Linux fork copies
-the parent's memory image at fork time. Workers were forking from a
-parent whose np.random.choice was still the ORIGINAL numpy function;
-patching it after fork reached nobody. Cumulative bias-hook calls
-stayed at 0 across 52 epochs of fold 0 in production (job 35992462).
+    patch_bias/this_epoch/n_force_fg
+    patch_bias/this_epoch/n_l6_returned
+    patch_bias/this_epoch/n_sacrum_returned
+    patch_bias/this_epoch/l6_rate
+    patch_bias/this_epoch/sacrum_rate
+    patch_bias/cumulative/...
 
-Fix: install the patch BEFORE super().on_train_start() so that when
-get_dataloaders() spawns workers, they fork from a parent whose
-np.random.choice is ALREADY patched. _maybe_apply_l6_patch_bias is
-now called twice — once pre-super (loader=None branch installs the
-global hook) and once post-super (loader != None branch emits the
-diagnostic log line about which generator was located). The install
-itself is idempotent via the _BIAS_INSTALLED flag.
+If the counters stay at 0 across multiple epochs while training is
+otherwise progressing normally, the bias hook isn't firing — check
+the startup banner's "PATCH BIAS" section first to confirm the
+LSTVBiasedDataLoader3D substitution caught.
+
+Expected rates with default config (frac=0.25, L6_prob=0.6,
+sacrum_prob=0.5):
+  - lumb cases are ~34% of oversample pool, oversampled to 25% of queue
+    -> ~8.5% of force_fg calls match lumb signature
+    -> ~5% of force_fg calls return L6 (0.085 * 0.6)
+  - sacr_count cases are ~12% of pool -> 3% of queue -> ~1.5% sacrum rate
+
+If observed rates are within 30% of expected (e.g. L6 rate between
+3.5% and 6.5%), bias is firing correctly.
+
+v19 — May 2026: BIDIRECTIONAL CONFUSION TRACKING.
+=================================================
+Adds per-(subgroup, class) confusion logging in BOTH directions:
+
+  GT-direction: "for each voxel where GT == C, what did the model
+                 predict?" — answers "where do my L6 voxels go on
+                 lumbarization cases?" (Are they being called L5?
+                 Sacrum? Background?)
+
+  PRED-direction: "for each voxel where PRED == C, what was the GT?"
+                  — answers "when the model says L5 on a sacr_count
+                  case (where L5 should be ABSENT), what is it
+                  actually looking at?" (Is it sacrum? L4? Background?)
+
+The two views are complementary: GT-direction localizes where the
+correct anatomy is being misclassified TO, PRED-direction localizes
+where false predictions are coming FROM. Together with the v17.4
+specificity metrics they give a full picture of confusion landscape.
+
+Headline keys emitted:
+  val/headline/L6_GT_predicted_as_{name}_on_lumb        (GT direction)
+  val/headline/predicted_L5_actually_{name}_on_sacr_count (PRED direction)
+  val/headline/predicted_L6_actually_{name}_on_normal     (PRED direction)
+
+Per-subgroup detail keys for every (subgroup, GT class) pair with
+voxels are emitted in both directions; the headlines pull out the
+clinically interesting ones for the paper.
+
+v18 — May 2026: PATCH BIAS VIA CLASS OVERRIDE.
+==============================================
+The patch class biasing that v15-v17.x attempted via monkey-patching
+np.random.choice has been replaced by a proper subclass of
+nnUNetDataLoader3D (see tools/lstv_biased_dataloader.py).
+
+The new approach:
+  - LSTVBiasedDataLoader3D overrides get_bbox to set `overwrite_class`
+    when the case has L6 voxels (lumb signature) or L4-with-no-L5-with-
+    sacrum (sacr_count signature). nnU-Net's existing overwrite_class
+    parameter then deterministically crops around a voxel of the chosen
+    class.
+  - get_dataloaders in the LSTV mixin swaps the class for the duration
+    of super().get_dataloaders() so workers fork from a parent where
+    the symbol is already replaced — no monkey-patching across forks,
+    no frame inspection.
+  - Detection uses class_locations content alone (no JSON dependency,
+    no case_id lookup) — L6 voxels imply lumb, L4+sacrum-without-L5
+    imply sacr_count.
+
+Why this matters: the v15-v17.x monkey-patch never actually fired in
+worker processes — the bias was advertised in startup logs but in
+production we observed bias_call_count=0 across 64 epochs of fold 4
+in job 35993148, and the same in every prior production run. v18's
+class override is testable end-to-end (see
+tests/test_lstv_biased_dataloader.py) and verifiably active at
+training time (PATCH BIAS section in the startup diagnostics banner
+walks to the actual loader instance and reports its class name).
+
+Configuration knobs:
+  SPINESURG_LSTV_BIAS_ENABLED       (default 1; "0" disables)
+  SPINESURG_LSTV_BIAS_L6_PROB       (default 0.60)
+  SPINESURG_LSTV_BIAS_SACRUM_PROB   (default 0.50)
+
+v17.4 — hallucination metrics (specificity tracking on absent classes).
+v17.1-v17.3 — dedicated LSTV val pass (forces forward pass on every
+              LSTV val case each epoch instead of subsampling).
+v17 — oversample pool includes ambiguous; symmetric per-record subtype
+      demotion; verbose startup-diagnostic banner.
+v15-v16 — multiple attempts to make the np.random.choice monkey-patch
+          fire at the right call site. Superseded by v18.
+v9-v14 — 6-way subgroup binning, lstv_cases.json schema v3, CE weight
+         tensor sizing, oversample pool semantics, partial-annotation
+         contract. Preserved in v18.
 
 Design intent
 =============
@@ -53,12 +127,15 @@ Three-tier emphasis on LSTV anatomy, partial-annotation aware:
       to normal anatomy.
 
   (b) Headline-subtype emphasis via per-case patch sampling bias.
+      v18: implemented via LSTVBiasedDataLoader3D (class override,
+      not monkey patch).
+
       Lumb       -> L6  (class 6) @ 60%  (the class TS misses)
       sacr_count -> sacrum (cls 7) @ 50%  (L4/sacrum transition zone)
 
-      Detection (partial-annotation safe):
-        lumb       :  L6 in case's foreground class list
-        sacr_count :  sacrum in fg AND L5 NOT in fg AND L4 in fg
+      Detection from class_locations content alone:
+        lumb       :  L6 has voxels in this case
+        sacr_count :  L4 has voxels AND L5 does NOT AND sacrum has voxels
                       (the L4-in-fg constraint is what distinguishes
                        sacr_count from pelvic-only records, which lack
                        BOTH L5 and L4 because their lumbar region is
@@ -83,99 +160,6 @@ when configured, masking those voxels out of the gradient. Required:
   - This trainer's _IGNORE_LABEL = 10 must match
   - num_segmentation_heads from label_manager = 10 (the ignore label
     has no output head; it's purely a loss mask)
-
-Changes in v17 (May 2026)
-=========================
-1. Symmetric demotion (in convert_hf_to_nnunet.py): also demote
-   sacralization / semisacralization for spine_only views, mirroring
-   the lumb / sacr_count demotion for pelvic_native views. A record
-   only contributes to a subtype's stats / sampling if its defining
-   anatomy is supervised (not ignore=10) in that view.
-
-2. Oversample pool widened to ALL non-normal subtypes, including
-   ambiguous (was excluded as "n=4 too small"). Per Greg: even
-   ambiguous cases provide LSTV-like exposure that the model
-   wouldn't otherwise see.
-
-3. Comprehensive startup logging — each install phase emits
-   [STARTUP] prefixed lines for subtype_map, ce_reweight,
-   patch_bias, oversample, log_intercepts, wandb. Every probe
-   attempt, every fallback path, every decision is logged. BEGIN /
-   OK ✓ / FAILED ✗ sentinels frame each phase.
-
-4. Patch-bias install runs an end-to-end self-test BEFORE training:
-   constructs a fake function literally named `generate_train_batch`,
-   exercises the np.random.choice intercept, and confirms frame
-   inspection works in this Python. If the self-test fails, the
-   user sees it at startup instead of silently no-op'ing for hours.
-
-5. Oversample install reads back the keys list AFTER setattr to
-   verify the mutation actually took effect, counts LSTV duplicates
-   in the readback, and aborts if the readback doesn't match.
-
-6. Per-subgroup val dice prints individual L1-L6 + sacrum +
-   left_hip + right_hip dice on dedicated lines for ALL subtypes
-   (including normal). Was: one-line dump only for non-normal.
-
-Changes in v16 (May 2026 — CRITICAL fix, preserved)
-========================================
-PATCH-BIAS HOOK WAS DEAD. v15 patched stdlib `random.choice`, but
-nnU-Net v2's `nnUNetDataLoader{2D,3D}.generate_train_batch` calls
-`np.random.choice(len(eligible_classes_or_regions))` — a different
-function entirely. The "Patch-class bias: ENABLED" log line at startup
-was misleading: the wrapper installed cleanly but never intercepted
-anything, so all bias decisions came from the original sampler.
-
-Fix:
-  1. Patch `np.random.choice` (correct target)
-  2. Frame-inspect the caller to extract `eligible_classes_or_regions`
-     and confirm the call originates from `generate_train_batch`. This
-     avoids hijacking unrelated np.random.choice calls (e.g., the
-     subsequent `np.random.choice(len(voxels_of_that_class))` for
-     within-class voxel selection, or any np.random.choice in user
-     transforms or augmentations).
-  3. Return an INDEX into the eligible list, not the class id —
-     nnU-Net dereferences `eligible_classes_or_regions[idx]` to get
-     the class.
-  4. Skip tuple keys in eligible (the all-classes "any foreground"
-     region key) — only consider int single-class entries.
-  5. Diagnostic counters (`_bias_call_count`, `_bias_l6_returns`,
-     `_bias_sacrum_returns`) so the per-subgroup log shows whether
-     the hook is actually firing.
-  6. The selection logic is extracted as a module-level pure function
-     `_select_biased_index` so it can be unit-tested in isolation.
-
-Changes from v13/v14 (preserved)
-================================
-1. Patch-bias detection refined for partial-annotation labels: requires
-   L4 IN fg list to distinguish sacr_count from pelvic-only records.
-
-2. All LSTV subtypes (lumb, sacr_count, sacralization, semisacralization)
-   are oversampled. Only ambiguous excluded.
-
-3. JSON reader (`_read_lstv_cases_json`) ignores any stored
-   `lstv_oversample_pool` field; always recomputes from in-code
-   `_OVERSAMPLE_SUBTYPES`.
-
-Changes from v12 (preserved)
-============================
-- Generalized patch-class bias from L6-only to per-subtype rules.
-- Sacrum CE weight bumped 1.0 -> 2.0.
-
-Changes from v11 (preserved)
-============================
-- Fix per-subgroup dice logger numpy-truth-value bug.
-
-Changes from v10 (preserved)
-============================
-- Fix CE weight tensor sizing crash. Reads num_classes from
-  self.label_manager.num_segmentation_heads.
-
-Changes from v9 (preserved)
-===========================
-- 6-way LSTV subgroup binning (matches splits_5fold.json v6).
-- lstv_cases.json reader (schema v3).
-- Per-subgroup val tracking: 6 subgroups in W&B and stdout.
 
 Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
 """
@@ -202,6 +186,50 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.nnUNetTrainer.variants.training_length.nnUNetTrainer_Xepochs import (
     nnUNetTrainer_5epochs, nnUNetTrainer_100epochs,
 )
+
+
+# ── v18: LSTV-aware patch class biasing via dataloader subclass ────────────
+# Tries multiple import paths to support both installed-into-nnunetv2
+# layouts (the canonical case after copying tools/*.py into
+# /opt/conda/.../variants/) and source-tree layouts (running tests
+# from spinesurg-ct-nnunet/tools/).
+LSTVBiasedDataLoader3D = None
+_LSTV_LOADER_IMPORT_ERROR: Optional[str] = None
+# v19.1: cross-process shared-counter helpers. None when the loader
+# module isn't importable; trainer falls through gracefully.
+_read_shared_bias_counters: Optional[Callable] = None
+_reset_shared_bias_counters: Optional[Callable] = None
+try:
+    from nnunetv2.training.nnUNetTrainer.variants.lstv_biased_dataloader import (
+        LSTVBiasedDataLoader3D,
+        read_shared_bias_counters as _read_shared_bias_counters,
+        reset_shared_bias_counters as _reset_shared_bias_counters,
+    )
+except ImportError as _exc1:
+    try:
+        # Source-tree fallback (running from spinesurg-ct-nnunet/tools/)
+        from lstv_biased_dataloader import (  # type: ignore
+            LSTVBiasedDataLoader3D,
+            read_shared_bias_counters as _read_shared_bias_counters,
+            reset_shared_bias_counters as _reset_shared_bias_counters,
+        )
+    except ImportError as _exc2:
+        try:
+            # Sibling-package fallback
+            from .lstv_biased_dataloader import (  # type: ignore
+                LSTVBiasedDataLoader3D,
+                read_shared_bias_counters as _read_shared_bias_counters,
+                reset_shared_bias_counters as _reset_shared_bias_counters,
+            )
+        except (ImportError, ValueError) as _exc3:
+            LSTVBiasedDataLoader3D = None
+            _read_shared_bias_counters = None
+            _reset_shared_bias_counters = None
+            _LSTV_LOADER_IMPORT_ERROR = (
+                f"installed: {_exc1}; source: {_exc2}; sibling: {_exc3}"
+            )
+
+_LSTV_BIASED_LOADER_AVAILABLE = LSTVBiasedDataLoader3D is not None
 
 
 _METRIC_KEYS = (
@@ -502,6 +530,95 @@ def _per_case_voxel_counts_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor
 _HALLUC_VOXEL_THRESHOLD = 100
 
 
+# ── v19: bidirectional confusion helpers ───────────────────────────────────
+
+def _per_case_confusion_by_gt(pred_argmax: torch.Tensor, gt: torch.Tensor,
+                               num_classes: int = _DEFAULT_NUM_OUTPUT_CLASSES,
+                               ignore_label: int = _IGNORE_LABEL
+                               ) -> Dict[int, "np.ndarray"]:
+    """GT-direction confusion: for each GT class C present in this case,
+    return a length-num_classes vector where index k = count of voxels
+    with (gt==C, pred==k).
+
+    Returns {gt_class: confusion_vector}. Classes absent from GT
+    (gt_n == 0) are not in the dict — there's no GT-direction confusion
+    to compute when there are no GT voxels.
+
+    Voxels with gt == ignore_label are excluded entirely (matches the
+    dice / voxel-count helpers).
+
+    Use case: "where do GT-L6 voxels end up being predicted on lumb
+    cases?" — read confusion[L6] and inspect the per-pred-class fractions.
+    """
+    pred_argmax = pred_argmax.flatten()
+    gt = gt.flatten()
+    valid = gt != ignore_label
+    if not valid.any():
+        return {}
+    pred_argmax = pred_argmax[valid]
+    gt = gt[valid]
+
+    out: Dict[int, np.ndarray] = {}
+    for cid in _FG_CLASS_IDS:
+        gt_mask = gt == cid
+        if not gt_mask.any():
+            continue
+        pred_at_gt = pred_argmax[gt_mask].cpu().numpy().astype(np.int64)
+        # Clamp to [0, num_classes-1] in case of out-of-range values
+        # (shouldn't happen but defensive against unexpected pred values).
+        pred_at_gt = np.clip(pred_at_gt, 0, num_classes - 1)
+        out[cid] = np.bincount(pred_at_gt, minlength=num_classes).astype(np.int64)
+    return out
+
+
+def _per_case_confusion_by_pred(pred_argmax: torch.Tensor, gt: torch.Tensor,
+                                 num_classes: int = _DEFAULT_NUM_OUTPUT_CLASSES,
+                                 ignore_label: int = _IGNORE_LABEL
+                                 ) -> Dict[int, "np.ndarray"]:
+    """PRED-direction confusion: for each predicted class C with non-zero
+    voxels in this case, return a length-num_classes vector where index k
+    = count of voxels with (pred==C, gt==k).
+
+    Returns {pred_class: confusion_vector}. Classes absent from PRED
+    (pred_n == 0) are not in the dict.
+
+    Voxels with gt == ignore_label are excluded entirely.
+
+    Use case: "when the model predicts L5 on a sacr_count case (where
+    L5 should NOT exist), what is it actually looking at?" — read
+    confusion[L5] and inspect the per-gt-class fractions. Useful for
+    diagnosing "the model is calling sacrum tissue 'L5'" vs "the model
+    is calling background voxels 'L5'" — different fixes.
+    """
+    pred_argmax = pred_argmax.flatten()
+    gt = gt.flatten()
+    valid = gt != ignore_label
+    if not valid.any():
+        return {}
+    pred_argmax = pred_argmax[valid]
+    gt = gt[valid]
+
+    out: Dict[int, np.ndarray] = {}
+    for cid in _FG_CLASS_IDS:
+        pred_mask = pred_argmax == cid
+        if not pred_mask.any():
+            continue
+        gt_at_pred = gt[pred_mask].cpu().numpy().astype(np.int64)
+        gt_at_pred = np.clip(gt_at_pred, 0, num_classes - 1)
+        out[cid] = np.bincount(gt_at_pred, minlength=num_classes).astype(np.int64)
+    return out
+
+
+def _class_id_to_name(cid: int) -> str:
+    """Render a class id as a human-readable name for log/W&B keys.
+    Background = 0; foreground = 1..9; anything else = 'label{cid}'."""
+    if cid == 0:
+        return "background"
+    if 1 <= cid <= 9:
+        return _ANATOMY_NAMES[cid - 1]
+    return f"label{cid}"
+
+
 # =============================================================================
 # Class reweighting
 # =============================================================================
@@ -577,310 +694,6 @@ def _detect_num_output_classes(trainer) -> int:
 
 
 # =============================================================================
-# Patch-class bias selection logic (pure function — unit-testable)
-# =============================================================================
-
-def _select_biased_index(
-    eligible: Sequence,
-    rules: Dict[str, Tuple[int, str, float]],
-    rand: Callable[[], float],
-) -> Optional[int]:
-    """Decide whether to bias the next forced-FG selection.
-
-    Pure function with no side effects. Returns the INDEX into
-    ``eligible`` of the biased target class, or None if no bias rule
-    applies (in which case the caller should defer to the default
-    sampler).
-
-    Detection logic — partial-annotation safe:
-
-      lumb        => L6 (class 6) is in eligible. Only lumb cases have
-                     L6 annotated. Pelvic-only views of lumb patients
-                     do NOT have 6 in eligible (their lumbar region is
-                     all ignore=10 -> excluded from foreground class
-                     locations).
-
-      sacr_count  => sacrum (7) IS in eligible, L5 (5) is NOT, and L4
-                     (4) IS. The L4-in-fg check is critical — pelvic-
-                     only normal cases also lack L5 (it's ignore there)
-                     but they also lack L4. Only true sacr_count
-                     anatomy has L1-L4 + sacrum without L5.
-
-    Args:
-      eligible: the ``eligible_classes_or_regions`` list nnU-Net is
-        about to sample from. Entries are class ids (ints) or region
-        tuples. Tuple entries (e.g. the all-classes "any foreground"
-        key) are skipped during detection.
-      rules: mapping from subtype name to (target_class, env_var_name,
-        frac). Same shape as ``_PATCH_BIAS_RULES``. Only target_class
-        and frac are used here; env_var_name is informational.
-      rand: a function returning a float in [0, 1). Pass
-        ``random.random`` in production; pass a deterministic stub in
-        tests.
-
-    Returns:
-      The index ``i`` such that ``eligible[i]`` is the biased target
-      class, or None if no rule fires.
-    """
-    # Build a class_id -> index map, ignoring tuple/region entries.
-    int_keys: Dict[int, int] = {}
-    for i, x in enumerate(eligible):
-        if isinstance(x, (int, np.integer)):
-            int_keys[int(x)] = i
-        # Tuple entries (region keys) are intentionally skipped.
-
-    # Lumb takes priority: L6 is the most specific signal.
-    if _L6_LABEL_ID in int_keys:
-        rule = rules.get(_SUBTYPE_LUMB)
-        if rule is not None:
-            _, _, frac = rule
-            if rand() < frac:
-                return int_keys[_L6_LABEL_ID]
-        return None  # L6 present means this is a lumb case; do not fall
-                      # through to sacr_count heuristic (which checks L5
-                      # absent — irrelevant for a lumb spine view).
-
-    # sacr_count: sacrum present, L5 absent, L4 present.
-    if (_SACRUM_LABEL_ID in int_keys
-            and 5 not in int_keys
-            and 4 in int_keys):
-        rule = rules.get(_SUBTYPE_SACR_COUNT)
-        if rule is not None:
-            _, _, frac = rule
-            if rand() < frac:
-                return int_keys[_SACRUM_LABEL_ID]
-        return None
-
-    return None
-
-
-def _selftest_patch_bias(rules: Dict[str, Tuple[int, str, float]],
-                          n_trials: int = 200) -> Tuple[int, int, int]:
-    """End-to-end self-test of the np.random.choice intercept mechanism.
-
-    Constructs a fake function literally named ``generate_train_batch``,
-    sets up an ``eligible_classes_or_regions`` local exactly as nnU-Net
-    does, calls ``np.random.choice(len(eligible))``, and counts how many
-    times the bias fires.
-
-    The intercept relies on:
-      - patching np.random.choice (correct target — not stdlib random)
-      - Python's frame inspection (sys._getframe(1).f_code.co_name)
-      - reading f_locals["eligible_classes_or_regions"] from caller
-
-    If any of those break in this Python's runtime, the self-test
-    catches it at startup instead of silently no-op'ing for hours.
-
-    Returns: (n_trials_run, n_intercept_calls, n_l6_returns)
-      - n_intercept_calls should equal n_trials_run (intercept fires
-        on every call). If not, frame inspection is broken.
-      - n_l6_returns should be ~ n_trials * lumb_frac. If 0 with
-        non-zero frac, _select_biased_index is broken.
-    """
-    original_np_choice = np.random.choice
-
-    n_calls = 0
-    n_l6_returns = 0
-
-    def biased_test_choice(*args, **kwargs):
-        nonlocal n_calls, n_l6_returns
-        try:
-            if (len(args) == 1 and not kwargs
-                    and isinstance(args[0], (int, np.integer))):
-                frame = sys._getframe(1)
-                if frame.f_code.co_name == "generate_train_batch":
-                    eligible = frame.f_locals.get("eligible_classes_or_regions")
-                    if (eligible is not None
-                            and hasattr(eligible, "__len__")
-                            and len(eligible) == int(args[0])
-                            and len(eligible) > 1):
-                        n_calls += 1
-                        biased_idx = _select_biased_index(
-                            eligible, rules, random.random)
-                        if biased_idx is not None:
-                            cls = eligible[biased_idx]
-                            if (isinstance(cls, (int, np.integer))
-                                    and int(cls) == _L6_LABEL_ID):
-                                n_l6_returns += 1
-                            return biased_idx
-        except Exception:
-            pass
-        return original_np_choice(*args, **kwargs)
-
-    def generate_train_batch():
-        # Fake nnU-Net call site: same locals, same call shape.
-        eligible_classes_or_regions = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        return np.random.choice(len(eligible_classes_or_regions))
-
-    np.random.choice = biased_test_choice
-    try:
-        for _ in range(n_trials):
-            generate_train_batch()
-    finally:
-        np.random.choice = original_np_choice
-
-    return n_trials, n_calls, n_l6_returns
-
-
-# =============================================================================
-# Module-level bias-hook state (v17.2 fix for worker-fork bug)
-#
-# Why module-level instead of instance-level:
-#   nnU-Net v2's NonDetMultiThreadedAugmenter spawns worker processes
-#   that pickle (or fork-copy) the data loader. Patches on
-#   trainer-instance attributes don't reliably reach the workers, so
-#   the v15-v17 instance-level patch produced the right startup self-
-#   test signal but never actually fired during real training (visible
-#   as "bias hook (cumulative): calls=0" in every epoch log).
-#
-# Architecture:
-#   - On Linux fork (default for batchgenerators on Python<3.8 and on
-#     explicit fork-mode setups), child processes inherit the parent's
-#     entire memory image at fork time. If we replace ``np.random.choice``
-#     on the parent BEFORE workers fork, every worker sees the patched
-#     version — the patch lives in the np.random module's __dict__,
-#     which forks just like everything else.
-#   - On spawn mode, workers re-import nnunet_wandb_variant (it's in
-#     the import path) and the module-level state below is set during
-#     import. The trainer also replaces np.random.choice during
-#     initialize() before workers start, so spawned workers see the
-#     replacement after they finish importing this module.
-#   - Counters live in multiprocessing.Value so worker increments are
-#     visible to the parent. Without this, the parent's counter would
-#     stay at zero even with the patch firing in workers.
-#
-# Frame guard:
-#   The patch fires ONLY when called from a function literally named
-#   ``generate_train_batch`` AND when an ``eligible_classes_or_regions``
-#   local variable is present AND its length matches the int arg.
-#   Anything else (size=, p=, multi-arg, called from anywhere else)
-#   passes through to the original numpy implementation untouched.
-# =============================================================================
-
-_BIAS_RULES_FOR_WORKERS: Optional[Dict[str, Tuple[int, str, float]]] = None
-_BIAS_ORIGINAL_NP_CHOICE = None  # the real np.random.choice
-_BIAS_INSTALLED: bool = False    # idempotency
-_BIAS_CALL_COUNT = None          # multiprocessing.Value('i', 0)
-_BIAS_L6_RETURNS = None
-_BIAS_SACRUM_RETURNS = None
-
-
-def _ensure_bias_counters() -> None:
-    """Lazily initialize cross-process atomic counters.
-
-    Must be called BEFORE any worker fork. After fork, child processes
-    share the same ``Value`` objects as the parent (they live in shared
-    memory via the multiprocessing primitive)."""
-    global _BIAS_CALL_COUNT, _BIAS_L6_RETURNS, _BIAS_SACRUM_RETURNS
-    if _BIAS_CALL_COUNT is None:
-        _BIAS_CALL_COUNT     = _mp.Value("i", 0)
-        _BIAS_L6_RETURNS     = _mp.Value("i", 0)
-        _BIAS_SACRUM_RETURNS = _mp.Value("i", 0)
-
-
-def _read_bias_counters() -> Tuple[int, int, int]:
-    """Read the current values from the cross-process counters.
-    Returns (calls, l6_returns, sacrum_returns) as plain ints."""
-    if _BIAS_CALL_COUNT is None:
-        return 0, 0, 0
-    try:
-        return (int(_BIAS_CALL_COUNT.value),
-                int(_BIAS_L6_RETURNS.value),
-                int(_BIAS_SACRUM_RETURNS.value))
-    except Exception:
-        return 0, 0, 0
-
-
-def _global_biased_np_choice(*args, **kwargs):
-    """Module-level replacement for ``np.random.choice``.
-
-    Picklable, no closures over trainer instance state. Called from
-    both parent and worker processes. Increments shared
-    multiprocessing.Value counters when the bias fires.
-
-    Pass-through fallback ensures any unrelated np.random.choice call
-    (size=, p=, multi-arg, called from outside generate_train_batch)
-    behaves identically to the original numpy implementation.
-    """
-    try:
-        if (len(args) == 1
-                and not kwargs
-                and isinstance(args[0], (int, np.integer))):
-            frame = sys._getframe(1)
-            if frame.f_code.co_name == "generate_train_batch":
-                eligible = frame.f_locals.get("eligible_classes_or_regions")
-                if (eligible is not None
-                        and hasattr(eligible, "__len__")
-                        and len(eligible) == int(args[0])
-                        and len(eligible) > 1):
-                    rules = _BIAS_RULES_FOR_WORKERS
-                    if rules:
-                        # Atomic increment of shared call counter.
-                        if _BIAS_CALL_COUNT is not None:
-                            with _BIAS_CALL_COUNT.get_lock():
-                                _BIAS_CALL_COUNT.value += 1
-                        biased_idx = _select_biased_index(
-                            eligible, rules, random.random)
-                        if biased_idx is not None:
-                            cls = eligible[biased_idx]
-                            if isinstance(cls, (int, np.integer)):
-                                if int(cls) == _L6_LABEL_ID:
-                                    if _BIAS_L6_RETURNS is not None:
-                                        with _BIAS_L6_RETURNS.get_lock():
-                                            _BIAS_L6_RETURNS.value += 1
-                                elif int(cls) == _SACRUM_LABEL_ID:
-                                    if _BIAS_SACRUM_RETURNS is not None:
-                                        with _BIAS_SACRUM_RETURNS.get_lock():
-                                            _BIAS_SACRUM_RETURNS.value += 1
-                            return biased_idx
-    except Exception:
-        # Never let the intercept break training.
-        pass
-    # Pass-through to original numpy implementation.
-    if _BIAS_ORIGINAL_NP_CHOICE is not None:
-        return _BIAS_ORIGINAL_NP_CHOICE(*args, **kwargs)
-    # Should never happen — _BIAS_ORIGINAL_NP_CHOICE is set before
-    # the patch is installed. If it does, fall back to whatever's
-    # currently in np.random.choice (likely us, infinite recursion
-    # would be bad — so re-raise).
-    raise RuntimeError("bias hook fallback invoked before original captured")
-
-
-def _install_global_bias_hook(rules: Dict[str, Tuple[int, str, float]]) -> bool:
-    """Install the global np.random.choice patch.
-
-    Idempotent — safe to call multiple times. Returns True if the
-    install actually happened (or was already in place), False on
-    error. Must be called BEFORE workers fork.
-    """
-    global _BIAS_RULES_FOR_WORKERS, _BIAS_INSTALLED, _BIAS_ORIGINAL_NP_CHOICE
-    _BIAS_RULES_FOR_WORKERS = rules
-    _ensure_bias_counters()
-    if _BIAS_INSTALLED:
-        return True  # already patched (e.g., second fold in same proc)
-    try:
-        _BIAS_ORIGINAL_NP_CHOICE = np.random.choice
-        np.random.choice = _global_biased_np_choice
-        _BIAS_INSTALLED = True
-        return True
-    except Exception:
-        return False
-
-
-def _reset_bias_counters_for_new_fold() -> None:
-    """Reset shared counters (called per-fold to avoid carry-over when
-    the same parent process trains multiple folds)."""
-    if _BIAS_CALL_COUNT is None:
-        return
-    with _BIAS_CALL_COUNT.get_lock():
-        _BIAS_CALL_COUNT.value = 0
-    with _BIAS_L6_RETURNS.get_lock():
-        _BIAS_L6_RETURNS.value = 0
-    with _BIAS_SACRUM_RETURNS.get_lock():
-        _BIAS_SACRUM_RETURNS.value = 0
-
-
-# =============================================================================
 # W&B mixin (6-way subgroup tracking)
 # =============================================================================
 
@@ -902,18 +715,19 @@ class _WandBMixin:
     # to compute specificity / hallucination volume on cases where the
     # class is absent in GT.
     _val_subgroup_voxels: Dict[str, List[List[Tuple[int, int]]]] = None
+    # v19: bidirectional confusion buffers, parallel to _val_subgroup_dice.
+    # Each entry is a list-of-cases, where each case is a dict mapping
+    # class_id -> length-num_classes np.int64 vector.
+    #   _by_gt[sub][i][C][k]   = count of voxels with (gt==C, pred==k) in case i of subtype sub
+    #   _by_pred[sub][i][C][k] = count of voxels with (pred==C, gt==k) in case i of subtype sub
+    _val_subgroup_confusion_by_gt: Dict[str, List[Dict[int, "np.ndarray"]]] = None
+    _val_subgroup_confusion_by_pred: Dict[str, List[Dict[int, "np.ndarray"]]] = None
     _val_case_to_subtype: Optional[Dict[str, str]] = None
     _per_subgroup_logging_enabled: bool = True
-
-    _l6_patch_bias_enabled: bool = True
-    _l6_patch_bias_target_frac: float = 0.6
-    _lumb_case_id_set: Optional[Set[str]] = None
-
-    # Diagnostic counters — incremented by the np.random.choice intercept.
-    # Cumulative across the run (not reset per epoch).
-    _bias_call_count: int = 0
-    _bias_l6_returns: int = 0
-    _bias_sacrum_returns: int = 0
+    # v19.1: snapshot of cross-process bias counters at epoch start.
+    # Populated by on_train_epoch_start, diffed in on_epoch_end to
+    # produce per-epoch counts.
+    _bias_counters_at_epoch_start: Optional[Dict[str, int]] = None
 
     def _progress_json_path(self):
         out = getattr(self, "output_folder", None)
@@ -1071,227 +885,6 @@ class _WandBMixin:
                 f"INSTALL FAILED: {exc}; using default loss")
             self._phase_end("ce_reweight", ok=False, note=str(exc))
 
-    # ── Patch sampling bias (np.random.choice intercept) ───────────────
-
-    # Subtype -> (target class id, env var name, default frac).
-    # Lumb cases bias patches toward L6 (the class TS misses entirely).
-    # sacr_count cases bias patches toward sacrum (the L4/sacrum
-    # transition zone is where the missing-L5 morphology is visible).
-    _PATCH_BIAS_RULES = {
-        _SUBTYPE_LUMB:       (_L6_LABEL_ID,     "SPINESURG_L6_PATCH_BIAS_FRAC",     0.6),
-        _SUBTYPE_SACR_COUNT: (_SACRUM_LABEL_ID, "SPINESURG_SACRUM_PATCH_BIAS_FRAC", 0.5),
-    }
-    _patch_bias_targets: Optional[Dict[str, int]] = None  # cid -> target_class
-    _patch_bias_fracs:   Optional[Dict[str, float]] = None  # cid -> frac
-
-    def _maybe_apply_l6_patch_bias(self):
-        """Install per-class patch sampling bias on the dataloader.
-
-        Implementation: monkey-patch ``np.random.choice`` only while
-        ``generate_train_batch`` is executing. The intercept inspects
-        the caller's frame to find ``eligible_classes_or_regions``,
-        then applies ``_select_biased_index`` to decide whether to
-        override the choice.
-
-        Method name preserved (``_maybe_apply_l6_patch_bias``) for
-        backward compat with v10/v11 logs; the feature is broader than
-        L6 — see ``_PATCH_BIAS_RULES``.
-        """
-        self._phase_begin("patch_bias")
-        if not _env_truthy("SPINESURG_L6_PATCH_BIAS", default=True):
-            self._phase("patch_bias", "DISABLED via SPINESURG_L6_PATCH_BIAS=0")
-            self._phase_end("patch_bias", ok=True, note="disabled")
-            return
-
-        if self._val_case_to_subtype is None:
-            self._phase("patch_bias",
-                "subtype map not yet loaded; calling _maybe_load_subtype_map")
-            self._maybe_load_subtype_map()
-
-        # Resolve env-overridden fracs at install time so the intercept
-        # doesn't have to read env on every call.
-        rules: Dict[str, Tuple[int, str, float]] = {}
-        for sub, (target_cls, env_name, default_frac) in self._PATCH_BIAS_RULES.items():
-            try:
-                frac = max(0.0, min(0.95, _env_float(env_name, default_frac)))
-            except Exception:
-                frac = default_frac
-            rules[sub] = (target_cls, env_name, frac)
-            self._phase("patch_bias",
-                f"rule: {sub} -> class {target_cls} @ frac={frac:.2f} "
-                f"(env {env_name})")
-
-        # Build informational per-case maps (used only for the install-
-        # time log line; intercept itself is content-driven, not
-        # case-id-driven).
-        targets: Dict[str, int] = {}
-        fracs: Dict[str, float] = {}
-        per_subtype_count: Counter = Counter()
-        if self._val_case_to_subtype:
-            for cid, sub in self._val_case_to_subtype.items():
-                if sub in rules:
-                    target_cls, _, frac = rules[sub]
-                    targets[cid] = target_cls
-                    fracs[cid] = frac
-                    per_subtype_count[sub] += 1
-
-        self._patch_bias_targets = targets
-        self._patch_bias_fracs = fracs
-        self._patch_bias_rules_resolved = rules
-        self._l6_patch_bias_enabled = True
-
-        # Backward-compat alias (some downstream code may still read this)
-        self._lumb_case_id_set = {
-            cid for cid, t in targets.items() if t == _L6_LABEL_ID
-        }
-
-        self._phase("patch_bias",
-            f"informational pool: {dict(per_subtype_count)} "
-            f"({len(targets)} cases match a rule)")
-        if not targets:
-            self._phase("patch_bias",
-                "WARN: no cases match any bias rule. Bias will install "
-                "but never fire. Check subtype map loaded correctly.")
-
-        loader = getattr(self, "dataloader_train", None)
-        # v17.3: This method is called TWICE — once BEFORE super().on_train_start()
-        # to install the global numpy patch (so workers fork with it in their
-        # memory image), and once AFTER for the dataloader-located diagnostic
-        # log line. The pre-fork call has loader=None; we install the global
-        # patch and skip the diagnostic. The post-fork call sees loader != None
-        # and only emits the diagnostic (the global install is already done,
-        # so _install_global_bias_hook is a no-op via _BIAS_INSTALLED guard).
-        pre_fork = loader is None
-        self._phase("patch_bias",
-            f"phase: {'PRE-FORK install' if pre_fork else 'POST-FORK diagnostic'}; "
-            f"dataloader_train type: "
-            f"{type(loader).__name__ if loader is not None else None}")
-        underlying = loader
-        located_via = "dataloader_train" if loader is not None else "<none>"
-        if loader is not None:
-            for attr in ("generator", "data_loader", "_data_loader"):
-                if hasattr(underlying, attr):
-                    cand = getattr(underlying, attr)
-                    self._phase("patch_bias",
-                        f"  attr {attr}: type={type(cand).__name__}")
-                    if hasattr(cand, "generate_train_batch") or hasattr(cand, "_data"):
-                        underlying = cand
-                        located_via = f"dataloader_train.{attr}"
-                        break
-            if underlying is None or not hasattr(underlying, "generate_train_batch"):
-                self._phase("patch_bias",
-                    "WARN (post-fork): cannot locate generate_train_batch on "
-                    "dataloader. Diagnostic only — global patch already installed.")
-            else:
-                self._phase("patch_bias",
-                    f"located generate_train_batch via {located_via} "
-                    f"({type(underlying).__name__})")
-
-            # If we're in the post-fork phase and global hook is already
-            # installed, return early — no need to re-run rules build,
-            # self-test, or install. The pre-fork call did all that.
-            if _BIAS_INSTALLED:
-                self._phase_end("patch_bias", ok=True,
-                    note=f"post-fork diagnostic only ({located_via})")
-                return
-
-        # Run startup self-test BEFORE installing the real hook. Catches
-        # frame-inspection breakage in this Python (the v15 silent-no-op
-        # bug class) at startup instead of after hours of training.
-        self._phase("patch_bias", "running self-test (200 trials)...")
-        try:
-            n_trials, n_calls, n_l6 = _selftest_patch_bias(rules, n_trials=200)
-            self._phase("patch_bias",
-                f"self-test results: trials={n_trials} "
-                f"intercept_calls={n_calls} L6_returns={n_l6}")
-            if n_calls != n_trials:
-                self._phase("patch_bias",
-                    f"SELF-TEST FAILED: intercept fired only "
-                    f"{n_calls}/{n_trials}. Frame inspection may be "
-                    f"broken; bias hook will be a no-op.")
-            elif n_l6 < 30 or n_l6 > 170:
-                # Expected for lumb frac=0.6 -> ~120 returns. Wide window.
-                self._phase("patch_bias",
-                    f"SELF-TEST WARN: L6 returns {n_l6}/{n_trials} outside "
-                    f"plausible range [30,170] for frac=0.6.")
-            else:
-                self._phase("patch_bias", "self-test PASSED ✓")
-        except Exception as exc:
-            self._phase("patch_bias", f"self-test threw exception: {exc}")
-
-        # ─────────────────────────────────────────────────────────────────
-        # v17.2: install GLOBALLY at module scope, not on the loader instance.
-        #
-        # Background: nnU-Net v2's NonDetMultiThreadedAugmenter spawns
-        # worker processes that get a copy (via fork or pickle) of the
-        # data loader. Pre-v17.2 we set
-        # ``underlying.generate_train_batch = patched`` on the parent's
-        # instance — but the workers had their own already-constructed
-        # copies, so the patch never reached them. The startup self-test
-        # passed (parent process) but actual training never saw a single
-        # bias intercept (visible in every prior log as "calls=0" after
-        # 250 iterations × 5 epochs of generated batches).
-        #
-        # The fix: replace ``np.random.choice`` itself, at the np.random
-        # module level. Linux fork copies the parent's memory image, so
-        # workers spawned AFTER this assignment see the patched function
-        # automatically. Counters live in multiprocessing.Value so worker
-        # increments propagate back to the parent for diagnostic output.
-        #
-        # The frame-inspection guard inside _global_biased_np_choice
-        # ensures this only intercepts the specific
-        #   ``np.random.choice(len(eligible_classes_or_regions))``
-        # call inside nnU-Net's generate_train_batch — every other
-        # numpy random call in the worker passes through untouched.
-        # ─────────────────────────────────────────────────────────────────
-
-        # Reset cross-process counters for this fold.
-        _reset_bias_counters_for_new_fold()
-
-        # Snapshot rules into module-level state. Workers spawned via
-        # fork inherit this; spawn-mode workers re-import this module
-        # (its identity is preserved by Python's import system) and
-        # then read _BIAS_RULES_FOR_WORKERS at the time _global_biased_np_choice
-        # actually fires.
-        if not _install_global_bias_hook(rules):
-            self._phase("patch_bias",
-                "ABORT: global install failed (np.random.choice readonly?)")
-            self._l6_patch_bias_enabled = False
-            self._phase_end("patch_bias", ok=False, note="global install failed")
-            return
-
-        # Compatibility shim — older code paths in this file read
-        # self._bias_call_count etc. Wire those reads to the shared
-        # counters so existing log/payload logic just works.
-        # (Properties not used; we set plain ints periodically. To
-        # always read fresh, code that needs the live value should
-        # call _read_bias_counters() directly. The lines below also
-        # match what the v17 dataclass defaults declared.)
-        self._bias_call_count = 0
-        self._bias_l6_returns = 0
-        self._bias_sacrum_returns = 0
-
-        # First-batch diagnostic state — set on the trainer for the
-        # parent process; ``_log_first_batch_diagnostic`` runs there
-        # the first time we see a batch return back.
-        self._first_batch_logged = False
-
-        self._phase("patch_bias",
-            f"installed: np.random.choice wrapped GLOBALLY at module "
-            f"scope BEFORE super().on_train_start() — workers will inherit "
-            f"the patch when NonDetMultiThreadedAugmenter forks them")
-        self._phase_end("patch_bias", ok=True,
-            note=f"{len(targets)} cases match rules (pre-fork install)")
-
-    def _refresh_bias_counters_from_shared(self) -> None:
-        """Pull the latest cross-process counter values into the
-        instance attrs so existing read sites (log lines, W&B payload,
-        summary tables) continue to work without code changes."""
-        c, l6, sa = _read_bias_counters()
-        self._bias_call_count   = c
-        self._bias_l6_returns   = l6
-        self._bias_sacrum_returns = sa
-
     # ── Startup diagnostics ──────────────────────────────────────────────
 
     def _emit_startup_diagnostics(self) -> None:
@@ -1415,26 +1008,74 @@ class _WandBMixin:
             except Exception as exc:
                 log(f"    fold intersection diagnostic failed: {exc}")
 
+            # ── v18: PATCH BIAS section ──────────────────────────
             log("")
-            log("  PATCH-CLASS BIAS HOOK")
-            bias_enabled = getattr(self, "_l6_patch_bias_enabled", False)
-            log(f"    enabled: {bias_enabled}")
-            rules_resolved = getattr(self, "_patch_bias_rules_resolved", None)
-            if rules_resolved:
-                for sub, (target_cls, env_name, frac) in rules_resolved.items():
-                    target_name = (_ANATOMY_NAMES[target_cls - 1]
-                                   if 1 <= target_cls <= len(_ANATOMY_NAMES)
-                                   else f"label_{target_cls}")
-                    log(f"    rule: {sub:<20s} -> {target_name} "
-                        f"(label={target_cls}) @ frac={frac:.2f} "
-                        f"[env: {env_name}]")
+            log("  PATCH BIAS (v18 — class override, not monkey-patch)")
+            bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=True)
+            log(f"    enabled (env SPINESURG_LSTV_BIAS_ENABLED): {bias_enabled}")
+            if not _LSTV_BIASED_LOADER_AVAILABLE:
+                log(f"    ✗ LSTVBiasedDataLoader3D NOT IMPORTABLE")
+                log(f"      import error: {_LSTV_LOADER_IMPORT_ERROR}")
+                log(f"      bias is INACTIVE — nnU-Net default uniform sampling")
+            elif bias_enabled:
+                l6_prob = _env_float("SPINESURG_LSTV_BIAS_L6_PROB", 0.60)
+                sac_prob = _env_float("SPINESURG_LSTV_BIAS_SACRUM_PROB", 0.50)
+                log(f"    L6 prob (lumb cases):        {l6_prob:.2f}  "
+                    f"[env SPINESURG_LSTV_BIAS_L6_PROB]")
+                log(f"    sacrum prob (sacr_count):    {sac_prob:.2f}  "
+                    f"[env SPINESURG_LSTV_BIAS_SACRUM_PROB]")
+                log(f"    detection: from class_locations content alone "
+                    f"(no JSON/case_id lookup)")
+                # Walk to the underlying train loader to confirm class.
+                # If the get_dataloaders override worked, this will be
+                # LSTVBiasedDataLoader3D. If not, something is broken.
+                loader = getattr(self, "dataloader_train", None)
+                cls_name = "<no train loader>"
+                if loader is not None:
+                    underlying = loader
+                    for attr in ("generator", "data_loader", "_data_loader"):
+                        cand = getattr(underlying, attr, None)
+                        if cand is not None and (
+                            hasattr(cand, "generate_train_batch")
+                            or hasattr(cand, "_data")
+                        ):
+                            underlying = cand
+                            break
+                    cls_name = type(underlying).__name__
+                log(f"    train loader class: {cls_name}")
+                if cls_name == "LSTVBiasedDataLoader3D":
+                    log(f"    ✓ bias is ACTIVE — get_bbox will set "
+                        f"overwrite_class on lumb / sacr_count signatures")
+                else:
+                    log(f"    ✗ WARNING: train loader is {cls_name!r}, "
+                        f"expected LSTVBiasedDataLoader3D.")
+                    log(f"      bias is NOT active. Check that "
+                        f"_LSTVOversampleMixin.get_dataloaders ran "
+                        f"(it should have been called via MRO from "
+                        f"super().on_train_start()).")
+                # v19.1: report shared-counter status
+                if _read_shared_bias_counters is not None:
+                    try:
+                        startup_counters = _read_shared_bias_counters()
+                        if startup_counters:
+                            log(f"    shared bias counters at startup: "
+                                f"force_fg={startup_counters.get('n_force_fg', 0)}, "
+                                f"L6={startup_counters.get('n_l6_returned', 0)}, "
+                                f"sacrum={startup_counters.get('n_sacrum_returned', 0)}")
+                            log(f"      (non-zero values here indicate "
+                                f"resumed training; per-epoch deltas are "
+                                f"computed against epoch-start snapshots)")
+                        else:
+                            log(f"    shared counters: read returned empty "
+                                f"(multiprocessing.Value setup may have failed)")
+                    except Exception as exc:
+                        log(f"    shared counters: probe failed: {exc}")
+                else:
+                    log(f"    shared counters: not importable (per-epoch "
+                        f"counter logging will be silent)")
             else:
-                log("    no rules resolved (hook may have failed install)")
-            log(f"    counters: calls={self._bias_call_count} "
-                f"L6_returns={self._bias_l6_returns} "
-                f"sacrum_returns={self._bias_sacrum_returns}")
-            log("    NOTE: counters increment on first batch — see "
-                "FIRST-BATCH log below for confirmation.")
+                log(f"    bias DISABLED via env; "
+                    f"nnU-Net default uniform sampling")
 
             log("")
             log("  PER-SUBGROUP VAL DICE")
@@ -1561,56 +1202,6 @@ class _WandBMixin:
                 if cand and all(isinstance(k, str) for k in cand):
                     return cand
         return None
-
-    def _log_first_batch_diagnostic(self, batch_result) -> None:
-        """One-shot log fired the first time generate_train_batch is
-        entered. Confirms (a) the patched function was reached, (b)
-        what case keys are in the first batch, and (c) the bias-counter
-        state immediately after the first call."""
-        log = self.print_to_log_file
-        log("")
-        log("─" * 72)
-        log("FIRST BATCH DIAGNOSTIC (one-shot)")
-        log("─" * 72)
-        log("  ✓ patched generate_train_batch was called "
-            "(if you see this, the hook is plumbed)")
-        log(f"  bias counters after batch 0: "
-            f"calls={self._bias_call_count} "
-            f"L6_returns={self._bias_l6_returns} "
-            f"sacrum_returns={self._bias_sacrum_returns}")
-
-        keys = None
-        if isinstance(batch_result, dict):
-            for k in ("keys", "identifiers", "case_ids"):
-                if k in batch_result:
-                    cand = batch_result[k]
-                    try:
-                        keys = list(cand)
-                        break
-                    except Exception:
-                        pass
-        if keys:
-            log(f"  case keys in first batch (n={len(keys)}): {keys}")
-            if self._val_case_to_subtype:
-                subs = [self._val_case_to_subtype.get(str(k), "?") for k in keys]
-                log(f"  case subtypes:                       {subs}")
-            pool = getattr(self, "_lstv_case_ids", None) or set()
-            if pool:
-                hits = [str(k) in pool for k in keys]
-                log(f"  in oversample pool:                  {hits}  "
-                    f"({sum(hits)}/{len(hits)} are LSTV)")
-        else:
-            log("  (case keys not exposed by this nnU-Net build; "
-                "skipping per-key breakdown)")
-
-        if self._bias_call_count == 0:
-            log("  NOTE: bias_call_count=0 after first batch is normal "
-                "if oversample_foreground_percent < 1.0 — force_fg")
-            log("        patches are sampled probabilistically. Counter")
-            log("        should grow over the first epoch; check the")
-            log("        per-epoch summary log.")
-        log("─" * 72)
-        log("")
 
     # ── Dedicated LSTV validation pass (v17.1) ───────────────────────────
     # nnU-Net v2's regular val loop subsamples the val set
@@ -1924,6 +1515,9 @@ class _WandBMixin:
         self._val_subgroup_dice = {sub: [] for sub in _KNOWN_SUBTYPES}
         # v17.4: hallucination tracking buffer, parallel to dice buffer
         self._val_subgroup_voxels = {sub: [] for sub in _KNOWN_SUBTYPES}
+        # v19: bidirectional confusion buffers
+        self._val_subgroup_confusion_by_gt = {sub: [] for sub in _KNOWN_SUBTYPES}
+        self._val_subgroup_confusion_by_pred = {sub: [] for sub in _KNOWN_SUBTYPES}
 
     def _subtype_for_case(self, case_id: str) -> str:
         if not self._val_case_to_subtype: return _SUBTYPE_NORMAL
@@ -1968,8 +1562,17 @@ class _WandBMixin:
                 dice_per_cls = _per_case_dice_per_class(pred_b, gt_b)
                 # v17.4: also record voxel counts for hallucination tracking
                 voxels_per_cls = _per_case_voxel_counts_per_class(pred_b, gt_b)
+                # v19: bidirectional confusion vectors
+                confusion_by_gt = _per_case_confusion_by_gt(pred_b, gt_b)
+                confusion_by_pred = _per_case_confusion_by_pred(pred_b, gt_b)
                 self._val_subgroup_dice.setdefault(subtype, []).append(dice_per_cls)
                 self._val_subgroup_voxels.setdefault(subtype, []).append(voxels_per_cls)
+                if self._val_subgroup_confusion_by_gt is None:
+                    self._val_subgroup_confusion_by_gt = {s: [] for s in _KNOWN_SUBTYPES}
+                if self._val_subgroup_confusion_by_pred is None:
+                    self._val_subgroup_confusion_by_pred = {s: [] for s in _KNOWN_SUBTYPES}
+                self._val_subgroup_confusion_by_gt.setdefault(subtype, []).append(confusion_by_gt)
+                self._val_subgroup_confusion_by_pred.setdefault(subtype, []).append(confusion_by_pred)
         except Exception as exc:
             try: self.print_to_log_file(f"per-subgroup dice: batch failed: {exc}")
             except Exception: pass
@@ -2024,17 +1627,6 @@ class _WandBMixin:
             out["val/lstv_subgroup/any_sacralization/mean_fg_dice"] = float(np.mean(any_sacr_means))
             out["val/lstv_subgroup/any_sacralization/n_cases"] = float(len(any_sacr_means))
 
-        # Cumulative bias-hook diagnostic counters. Refresh from the
-        # cross-process multiprocessing.Value shared state so worker
-        # increments propagate into this payload (v17.2).
-        try:
-            self._refresh_bias_counters_from_shared()
-        except Exception:
-            pass
-        out["debug/bias_hook/total_calls"]   = float(self._bias_call_count)
-        out["debug/bias_hook/L6_picks"]      = float(self._bias_l6_returns)
-        out["debug/bias_hook/sacrum_picks"]  = float(self._bias_sacrum_returns)
-
         # v17.4: hallucination metrics (specificity / false-positive
         # tracking). Merge into the same payload dict.
         try:
@@ -2042,6 +1634,14 @@ class _WandBMixin:
             out.update(halluc_payload)
         except Exception as exc:
             try: self.print_to_log_file(f"hallucination aggregation: {exc}")
+            except Exception: pass
+        # v19: bidirectional confusion (where GT-class voxels go,
+        # where PRED-class voxels come from)
+        try:
+            confusion_payload = self._aggregate_subgroup_confusion()
+            out.update(confusion_payload)
+        except Exception as exc:
+            try: self.print_to_log_file(f"confusion aggregation: {exc}")
             except Exception: pass
         return out
 
@@ -2135,6 +1735,138 @@ class _WandBMixin:
                 out[f"val/headline/{headline_key}_mean_voxels"] = out[mean_key]
         return out
 
+    def _aggregate_subgroup_confusion(self) -> Dict[str, float]:
+        """v19: aggregate bidirectional confusion across cases per subgroup.
+
+        Emits two families of keys per (subgroup, class) pair that has
+        any voxels:
+
+          GT-DIRECTION ("where do voxels of this GT class get predicted?"):
+            val/lstv_subgroup/{sub}/conf_by_gt/{gt_name}/total_voxels
+            val/lstv_subgroup/{sub}/conf_by_gt/{gt_name}/as_{pred_name}_frac
+            val/lstv_subgroup/{sub}/conf_by_gt/{gt_name}/as_{pred_name}_voxels
+
+          PRED-DIRECTION ("when the model predicted this class, what
+          was the GT?"):
+            val/lstv_subgroup/{sub}/conf_by_pred/{pred_name}/total_voxels
+            val/lstv_subgroup/{sub}/conf_by_pred/{pred_name}/actually_{gt_name}_frac
+            val/lstv_subgroup/{sub}/conf_by_pred/{pred_name}/actually_{gt_name}_voxels
+
+        Headline keys (the clinically interesting ones for the paper):
+
+          GT-direction on lumb (where do L6 voxels go?):
+            val/headline/L6_GT_predicted_as_{name}_on_lumb
+            val/headline/L6_GT_total_voxels_on_lumb
+
+          PRED-direction on sacr_count (when model says L5 but L5 is
+          absent, what's actually there?):
+            val/headline/predicted_L5_actually_{name}_on_sacr_count
+            val/headline/predicted_L5_total_voxels_on_sacr_count
+
+          PRED-direction on normal (when model hallucinates L6 on a
+          normal patient, what's at that location?):
+            val/headline/predicted_L6_actually_{name}_on_normal
+            val/headline/predicted_L6_total_voxels_on_normal
+
+        Fractions are emitted only for predicted/actual classes with
+        non-zero voxel counts, so the W&B run doesn't explode with 100
+        zero-valued keys per epoch.
+        """
+        out: Dict[str, float] = {}
+        if (self._val_subgroup_confusion_by_gt is None
+                or self._val_subgroup_confusion_by_pred is None):
+            return out
+
+        # ── GT-direction aggregation ──────────────────────────────
+        for subtype, cases in self._val_subgroup_confusion_by_gt.items():
+            if not cases:
+                continue
+            # Sum per-case confusion vectors per GT class
+            summed_by_gt: Dict[int, np.ndarray] = {}
+            for case_dict in cases:
+                for gt_cid, vec in case_dict.items():
+                    if gt_cid not in summed_by_gt:
+                        summed_by_gt[gt_cid] = np.zeros_like(vec, dtype=np.int64)
+                    summed_by_gt[gt_cid] = summed_by_gt[gt_cid] + vec
+
+            for gt_cid, vec in summed_by_gt.items():
+                gt_name = _class_id_to_name(gt_cid)
+                total = int(vec.sum())
+                if total == 0:
+                    continue
+                base = f"val/lstv_subgroup/{subtype}/conf_by_gt/{gt_name}"
+                out[f"{base}/total_voxels"] = float(total)
+                for pred_cid in range(len(vec)):
+                    n = int(vec[pred_cid])
+                    if n == 0:
+                        continue
+                    pred_name = _class_id_to_name(pred_cid)
+                    out[f"{base}/as_{pred_name}_frac"] = n / total
+                    out[f"{base}/as_{pred_name}_voxels"] = float(n)
+
+        # ── PRED-direction aggregation ────────────────────────────
+        for subtype, cases in self._val_subgroup_confusion_by_pred.items():
+            if not cases:
+                continue
+            summed_by_pred: Dict[int, np.ndarray] = {}
+            for case_dict in cases:
+                for pred_cid, vec in case_dict.items():
+                    if pred_cid not in summed_by_pred:
+                        summed_by_pred[pred_cid] = np.zeros_like(vec, dtype=np.int64)
+                    summed_by_pred[pred_cid] = summed_by_pred[pred_cid] + vec
+
+            for pred_cid, vec in summed_by_pred.items():
+                pred_name = _class_id_to_name(pred_cid)
+                total = int(vec.sum())
+                if total == 0:
+                    continue
+                base = f"val/lstv_subgroup/{subtype}/conf_by_pred/{pred_name}"
+                out[f"{base}/total_voxels"] = float(total)
+                for gt_cid in range(len(vec)):
+                    n = int(vec[gt_cid])
+                    if n == 0:
+                        continue
+                    gt_name = _class_id_to_name(gt_cid)
+                    out[f"{base}/actually_{gt_name}_frac"] = n / total
+                    out[f"{base}/actually_{gt_name}_voxels"] = float(n)
+
+        # ── Headline: L6 GT-direction on lumbarization ────────────
+        # "Where do my L6 voxels end up being classified?"
+        gt_base_lumb = f"val/lstv_subgroup/{_SUBTYPE_LUMB}/conf_by_gt/L6"
+        total_l6 = out.get(f"{gt_base_lumb}/total_voxels")
+        if total_l6 is not None and total_l6 > 0:
+            out["val/headline/L6_GT_total_voxels_on_lumb"] = total_l6
+            for pred_name in ("background", *_ANATOMY_NAMES):
+                frac_key = f"{gt_base_lumb}/as_{pred_name}_frac"
+                if frac_key in out:
+                    out[f"val/headline/L6_GT_predicted_as_{pred_name}_on_lumb"] = out[frac_key]
+
+        # ── Headline: L5 PRED-direction on sacr_count ────────────
+        # "When the model predicts L5 on a sacr_count case (where L5
+        # should be ABSENT in GT), what is it actually looking at?"
+        pred_base_sc = f"val/lstv_subgroup/{_SUBTYPE_SACR_COUNT}/conf_by_pred/L5"
+        total_pred_l5_sc = out.get(f"{pred_base_sc}/total_voxels")
+        if total_pred_l5_sc is not None and total_pred_l5_sc > 0:
+            out["val/headline/predicted_L5_total_voxels_on_sacr_count"] = total_pred_l5_sc
+            for gt_name in ("background", *_ANATOMY_NAMES):
+                frac_key = f"{pred_base_sc}/actually_{gt_name}_frac"
+                if frac_key in out:
+                    out[f"val/headline/predicted_L5_actually_{gt_name}_on_sacr_count"] = out[frac_key]
+
+        # ── Headline: L6 PRED-direction on normal ────────────────
+        # "When the model predicts L6 on a normal patient (where L6
+        # doesn't exist anatomically), what's actually there?"
+        pred_base_n = f"val/lstv_subgroup/{_SUBTYPE_NORMAL}/conf_by_pred/L6"
+        total_pred_l6_n = out.get(f"{pred_base_n}/total_voxels")
+        if total_pred_l6_n is not None and total_pred_l6_n > 0:
+            out["val/headline/predicted_L6_total_voxels_on_normal"] = total_pred_l6_n
+            for gt_name in ("background", *_ANATOMY_NAMES):
+                frac_key = f"{pred_base_n}/actually_{gt_name}_frac"
+                if frac_key in out:
+                    out[f"val/headline/predicted_L6_actually_{gt_name}_on_normal"] = out[frac_key]
+
+        return out
+
     def _print_per_subgroup_summary(self, epoch, payload):
         try:
             self.print_to_log_file(f"--- LSTV per-subgroup val dice (epoch {epoch}) ---")
@@ -2197,17 +1929,166 @@ class _WandBMixin:
             if not any_halluc_line:
                 self.print_to_log_file("    (no eligible (subgroup, class) pairs this epoch)")
 
-            # Bias-hook diagnostic line. If total_calls is zero by epoch
-            # 1, the hook never fired and the install is broken.
-            calls = int(payload.get("debug/bias_hook/total_calls", 0))
-            l6p   = int(payload.get("debug/bias_hook/L6_picks", 0))
-            sp    = int(payload.get("debug/bias_hook/sacrum_picks", 0))
+            # v19: bidirectional confusion blocks. Show the three
+            # clinically headline (subgroup, class) pairs in both
+            # directions. Each block lists predicted-class fractions
+            # >= 1% so noise-level entries don't clutter the log.
             self.print_to_log_file(
-                f"  bias hook (cumulative): calls={calls}  L6_picks={l6p}  "
-                f"sacrum_picks={sp}")
+                "  --- v19 confusion (where misclassifications go / come from) ---"
+            )
+
+            def _print_distribution(header_line, total_key, frac_key_template):
+                """Helper: print a header and the > 1% fraction lines for a
+                given headline distribution. Returns True if anything was
+                printed."""
+                total = payload.get(total_key)
+                if total is None or int(total) == 0:
+                    return False
+                self.print_to_log_file(header_line.format(total=int(total)))
+                printed_any = False
+                for cls_name in ("background", *_ANATOMY_NAMES):
+                    frac = payload.get(frac_key_template.format(name=cls_name))
+                    if frac is None:
+                        continue
+                    if frac < 0.01:
+                        continue
+                    self.print_to_log_file(
+                        f"      {cls_name:<12s}: {frac*100:5.1f}%"
+                    )
+                    printed_any = True
+                if not printed_any:
+                    self.print_to_log_file("      (all predicted classes < 1%)")
+                return True
+
+            # Block 1: GT-direction on lumb. "Where do L6 GT voxels end up?"
+            shown = _print_distribution(
+                header_line="    L6 GT-voxels on lumb cases (total={total}, "
+                            "where do they end up classified?):",
+                total_key="val/headline/L6_GT_total_voxels_on_lumb",
+                frac_key_template="val/headline/L6_GT_predicted_as_{name}_on_lumb",
+            )
+            if not shown:
+                self.print_to_log_file(
+                    "    L6 GT-voxels on lumb cases: (no lumb cases this epoch)"
+                )
+
+            # Block 2: PRED-direction on sacr_count. "When model says L5
+            # on a sacr_count case (where L5 should be missing), what's
+            # actually there?"
+            shown = _print_distribution(
+                header_line="    Predicted-L5 voxels on sacr_count cases "
+                            "(total={total}, what's actually there in GT?):",
+                total_key="val/headline/predicted_L5_total_voxels_on_sacr_count",
+                frac_key_template="val/headline/predicted_L5_actually_{name}_on_sacr_count",
+            )
+            if not shown:
+                self.print_to_log_file(
+                    "    Predicted-L5 voxels on sacr_count cases: "
+                    "(no sacr_count cases this epoch, or model predicted no L5 there)"
+                )
+
+            # Block 3: PRED-direction on normal. "When model hallucinates
+            # L6 on a normal patient, what's at that location?"
+            shown = _print_distribution(
+                header_line="    Predicted-L6 voxels on normal cases "
+                            "(total={total}, what's actually there in GT?):",
+                total_key="val/headline/predicted_L6_total_voxels_on_normal",
+                frac_key_template="val/headline/predicted_L6_actually_{name}_on_normal",
+            )
+            if not shown:
+                self.print_to_log_file(
+                    "    Predicted-L6 voxels on normal cases: "
+                    "(model predicted no L6 on normals — good)"
+                )
         except Exception as exc:
             try: self.print_to_log_file(f"per-subgroup summary failed: {exc}")
             except Exception: pass
+
+    # ── v19.1: cross-process bias counter reporting ───────────────────────
+
+    def _collect_bias_counter_payload(self, epoch: int) -> Dict[str, float]:
+        """Read shared bias counters, diff against epoch-start snapshot,
+        emit per-epoch + cumulative numbers as a W&B payload dict, and
+        print a one-block summary to the SLURM log.
+
+        Counters are populated from worker processes via shared memory
+        in lstv_biased_dataloader. If the read returns nothing (e.g.
+        the bias loader isn't installed, or shared counters failed at
+        import time), this method silently returns an empty dict —
+        callers should not crash when bias logging is unavailable.
+
+        Returns the W&B payload dict (caller .update()s payload with it).
+        """
+        out: Dict[str, float] = {}
+        if _read_shared_bias_counters is None:
+            return out
+        try:
+            now = _read_shared_bias_counters()
+        except Exception as exc:
+            try: self.print_to_log_file(f"v19.1 read shared counters: {exc}")
+            except Exception: pass
+            return out
+        if not now:
+            return out
+
+        start = self._bias_counters_at_epoch_start or {}
+
+        # Per-epoch deltas
+        n_fg_e = now.get("n_force_fg", 0) - start.get("n_force_fg", 0)
+        n_l6_e = now.get("n_l6_returned", 0) - start.get("n_l6_returned", 0)
+        n_sac_e = now.get("n_sacrum_returned", 0) - start.get("n_sacrum_returned", 0)
+        n_uf_e = now.get("n_uniform_fallback", 0) - start.get("n_uniform_fallback", 0)
+
+        out["patch_bias/this_epoch/n_force_fg"]         = float(n_fg_e)
+        out["patch_bias/this_epoch/n_l6_returned"]      = float(n_l6_e)
+        out["patch_bias/this_epoch/n_sacrum_returned"]  = float(n_sac_e)
+        out["patch_bias/this_epoch/n_uniform_fallback"] = float(n_uf_e)
+
+        # Per-epoch rates (only meaningful if force_fg fired at all
+        # this epoch; otherwise the denominator is zero).
+        if n_fg_e > 0:
+            out["patch_bias/this_epoch/l6_rate"] = n_l6_e / n_fg_e
+            out["patch_bias/this_epoch/sacrum_rate"] = n_sac_e / n_fg_e
+            out["patch_bias/this_epoch/uniform_fallback_rate"] = n_uf_e / n_fg_e
+
+        # Cumulative numbers
+        out["patch_bias/cumulative/n_force_fg"]         = float(now.get("n_force_fg", 0))
+        out["patch_bias/cumulative/n_l6_returned"]      = float(now.get("n_l6_returned", 0))
+        out["patch_bias/cumulative/n_sacrum_returned"]  = float(now.get("n_sacrum_returned", 0))
+        out["patch_bias/cumulative/n_uniform_fallback"] = float(now.get("n_uniform_fallback", 0))
+
+        # Print a compact summary block to SLURM log. Same conventions
+        # as the other per-epoch summaries.
+        try:
+            self.print_to_log_file(
+                f"--- v19.1 patch bias activity (epoch {epoch}) ---"
+            )
+            if n_fg_e == 0:
+                self.print_to_log_file(
+                    "  this epoch: force_fg=0 (no force-foreground patches "
+                    "served — check that bias is enabled and oversample mixin ran)"
+                )
+            else:
+                self.print_to_log_file(
+                    f"  this epoch: force_fg={n_fg_e}, "
+                    f"L6 forces={n_l6_e}, sacrum forces={n_sac_e}, "
+                    f"uniform fallback={n_uf_e}"
+                )
+                self.print_to_log_file(
+                    f"  rates: L6={(n_l6_e/n_fg_e)*100:.2f}%, "
+                    f"sacrum={(n_sac_e/n_fg_e)*100:.2f}%, "
+                    f"no-bias={(n_uf_e/n_fg_e)*100:.2f}%"
+                )
+            self.print_to_log_file(
+                f"  cumulative since training start: "
+                f"force_fg={int(now.get('n_force_fg', 0))}, "
+                f"L6={int(now.get('n_l6_returned', 0))}, "
+                f"sacrum={int(now.get('n_sacrum_returned', 0))}"
+            )
+        except Exception:
+            pass
+
+        return out
 
     # ── train_step / validation_step ─────────────────────────────────────
 
@@ -2278,9 +2159,13 @@ class _WandBMixin:
             "subgroups": list(_KNOWN_SUBTYPES),
             "oversample_subtypes": list(_OVERSAMPLE_SUBTYPES),
             "ce_reweight": _env_truthy("SPINESURG_CE_REWEIGHT", default=True),
-            "l6_patch_bias": _env_truthy("SPINESURG_L6_PATCH_BIAS", default=True),
-            "l6_patch_bias_frac": _env_float("SPINESURG_L6_PATCH_BIAS_FRAC", 0.6),
             "lstv_oversample_frac": _env_float("LSTV_OVERSAMPLE_FRAC", 0.25),
+            # v18: patch bias config recorded so W&B runs are
+            # comparable across different bias settings.
+            "patch_bias_enabled": _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=True),
+            "patch_bias_l6_prob": _env_float("SPINESURG_LSTV_BIAS_L6_PROB", 0.60),
+            "patch_bias_sacrum_prob": _env_float("SPINESURG_LSTV_BIAS_SACRUM_PROB", 0.50),
+            "patch_bias_loader_available": _LSTV_BIASED_LOADER_AVAILABLE,
         }
         for attr, getter in [
             ("dataset", lambda: self.plans_manager.dataset_name),
@@ -2350,45 +2235,16 @@ class _WandBMixin:
     def on_train_start(self):
         try: _install_perf_tuning()
         except Exception as exc: print(f"[perf] {exc}", flush=True)
-        # ────────────────────────────────────────────────────────────────
-        # v17.3: PRE-FORK INSTALL of the global np.random.choice patch.
-        #
-        # The bug we're fixing: nnUNetTrainer.on_train_start (super())
-        # calls self.get_dataloaders() at line 903, which constructs the
-        # NonDetMultiThreadedAugmenter at line 686-690. That augmenter
-        # internally spawns 24 worker subprocesses via mp.Process(target=
-        # producer, ...). On Linux, those forked workers inherit a COPY
-        # of the parent's memory image at the time of fork.
-        #
-        # In v17.2, we installed the bias patch at line 2114 — AFTER
-        # super().on_train_start() returned. By then, all 24 workers had
-        # already forked from a parent whose np.random.choice was still
-        # the original numpy function. The patch in the parent reached
-        # nobody. Cumulative bias-hook calls stayed at 0 across 52+
-        # epochs.
-        #
-        # The fix: install BEFORE super(). Subtype map must be loaded
-        # first so we know which cases get which rules. Then super()
-        # calls get_dataloaders(), which forks workers — and workers
-        # fork from a parent whose np.random.choice is ALREADY patched.
-        # No worker ever sees the original.
-        # ────────────────────────────────────────────────────────────────
         try: self._maybe_load_subtype_map()
         except Exception as exc: self.print_to_log_file(f"subtype map (pre-fork): {exc}")
-        try: self._maybe_apply_l6_patch_bias()  # PRE-FORK install (loader=None branch)
-        except Exception as exc: self.print_to_log_file(f"L6 patch bias (pre-fork): {exc}")
 
-        super().on_train_start()  # ← workers fork HERE with patch already installed
+        super().on_train_start()
 
         try: _install_nnunet_warning_filter()
         except Exception: pass
         # _maybe_load_subtype_map already ran above; second call is a no-op.
         try: self._maybe_apply_ce_reweighting()
         except Exception as exc: self.print_to_log_file(f"CE reweight: {exc}")
-        # POST-FORK: re-call to emit the dataloader-found diagnostic line
-        # (the install is idempotent via _BIAS_INSTALLED guard).
-        try: self._maybe_apply_l6_patch_bias()
-        except Exception as exc: self.print_to_log_file(f"L6 patch bias (post-fork): {exc}")
         try: self._install_log_intercepts()
         except Exception: pass
         try: self._init_wandb()
@@ -2397,6 +2253,18 @@ class _WandBMixin:
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
         self._reset_subgroup_dice_buffer()
+        # v19.1: snapshot cross-process bias counters at epoch start so
+        # we can diff at epoch end and report per-epoch counts. The
+        # counters themselves live in lstv_biased_dataloader and are
+        # cumulative across the training run.
+        if _read_shared_bias_counters is not None:
+            try:
+                self._bias_counters_at_epoch_start = _read_shared_bias_counters()
+            except Exception as exc:
+                self._bias_counters_at_epoch_start = {}
+                try: self.print_to_log_file(
+                    f"v19.1 bias counter snapshot at epoch start: {exc}")
+                except Exception: pass
 
     def on_epoch_end(self):
         super().on_epoch_end()
@@ -2455,6 +2323,13 @@ class _WandBMixin:
                 self._print_per_subgroup_summary(epoch, sg)
             except Exception as exc:
                 self.print_to_log_file(f"subgroup aggregation: {exc}")
+            # v19.1: read shared bias counters, diff vs epoch-start
+            # snapshot, log per-epoch and cumulative numbers.
+            try:
+                bias_payload = self._collect_bias_counter_payload(epoch)
+                payload.update(bias_payload)
+            except Exception as exc:
+                self.print_to_log_file(f"v19.1 bias counter logging: {exc}")
             self._log_wandb(payload, step=epoch)
         except Exception as exc:
             self.print_to_log_file(f"on_epoch_end: {exc}")
@@ -2479,10 +2354,6 @@ class _WandBMixin:
                         if not np.isnan(vf): seq.append(vf)
                     if seq and ci < len(_ANATOMY_NAMES):
                         summary[f"summary/best_dice/{_ANATOMY_NAMES[ci]}"] = max(seq)
-            # Lifetime bias-hook stats
-            summary["summary/bias_hook_total_calls"]  = float(self._bias_call_count)
-            summary["summary/bias_hook_L6_picks"]     = float(self._bias_l6_returns)
-            summary["summary/bias_hook_sacrum_picks"] = float(self._bias_sacrum_returns)
             if summary: self._log_wandb(summary)
         except Exception: pass
         super().on_train_end()
@@ -2504,11 +2375,14 @@ def _as_float(x):
 
 
 # =============================================================================
-# LSTV oversampling mixin (queue-level, 6-way)
+# LSTV oversampling mixin (queue-level, 6-way) + v18 patch-bias install
 # =============================================================================
 
 class _LSTVOversampleMixin:
-    """Oversample all 5 LSTV variant subtypes at the dataloader queue level.
+    """Oversample all 5 LSTV variant subtypes at the dataloader queue level,
+    AND substitute LSTVBiasedDataLoader3D for nnU-Net's default loader so
+    force_fg patches on lumb / sacr_count cases bias toward the headline
+    anatomy (L6 / sacrum respectively).
 
     Pool composition (5 of 6 subtypes; 'normal' is the majority and
     by definition not oversampled):
@@ -2523,6 +2397,10 @@ class _LSTVOversampleMixin:
     are rare (n<5 each) — they can only be over-represented through
     duplication, which is acceptable given the alternative (the model
     rarely sees them at all during training).
+
+    v18: get_dataloaders is overridden to substitute the biased loader
+    class. This replaces the v15-v17.x np.random.choice monkey-patch
+    that never fired in worker processes.
     """
     _lstv_case_ids: Optional[Set[str]] = None
     _lstv_subtype_counts: Optional[Counter] = None
@@ -2658,13 +2536,87 @@ class _LSTVOversampleMixin:
         if avg_dup > 25:
             self.print_to_log_file(f"LSTV oversample: WARNING avg_dup={avg_dup:.0f}x -> overfitting risk")
 
+    # ── v18: substitute the biased loader class via get_dataloaders ──────
+
+    def get_dataloaders(self):
+        """v18: substitute LSTVBiasedDataLoader3D for nnU-Net's default
+        nnUNetDataLoader3D so that force_fg patches on lumb / sacr_count
+        cases bias toward the headline anatomy (L6 / sacrum).
+
+        nnU-Net's nnUNetTrainer.get_dataloaders builds dataloaders by
+        instantiating nnUNetDataLoader3D as referenced in the trainer
+        module's namespace. To swap our subclass in, we rebind that
+        symbol for the duration of super().get_dataloaders() and
+        restore it after. This survives fork/spawn cleanly because
+        workers fork AFTER the substitution and pickle the substituted
+        class.
+
+        Disable via SPINESURG_LSTV_BIAS_ENABLED=0 — the substitution
+        is skipped and nnU-Net's default uniform foreground sampling
+        is used. The biased loader itself also reads the env var, so
+        even if substitution happens but bias_enabled=False, the
+        loader behaves identically to the parent.
+        """
+        bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=True)
+
+        # Short-circuit: bias disabled OR loader class missing -> no swap
+        if not bias_enabled:
+            self.print_to_log_file(
+                "LSTV patch bias: disabled via SPINESURG_LSTV_BIAS_ENABLED=0; "
+                "using nnU-Net default loader.")
+            return super().get_dataloaders()
+
+        if not _LSTV_BIASED_LOADER_AVAILABLE:
+            self.print_to_log_file(
+                f"LSTV patch bias: LSTVBiasedDataLoader3D not importable "
+                f"({_LSTV_LOADER_IMPORT_ERROR}); using nnU-Net default loader. "
+                f"Install lstv_biased_dataloader.py alongside this trainer "
+                f"to enable bias.")
+            return super().get_dataloaders()
+
+        # Locate the trainer module (where nnUNetDataLoader3D is imported)
+        # so we can rebind that symbol. nnU-Net's nnUNetTrainer.get_dataloaders
+        # uses an unqualified `nnUNetDataLoader3D(...)` call which Python
+        # resolves at runtime against the module's globals, so rebinding
+        # in the module namespace is sufficient.
+        try:
+            import nnunetv2.training.nnUNetTrainer.nnUNetTrainer as _trainer_mod
+        except ImportError as exc:
+            self.print_to_log_file(
+                f"LSTV patch bias: cannot import trainer module ({exc}); "
+                f"using nnU-Net default loader.")
+            return super().get_dataloaders()
+
+        original_3d = getattr(_trainer_mod, 'nnUNetDataLoader3D', None)
+        if original_3d is None:
+            self.print_to_log_file(
+                "LSTV patch bias: nnUNetDataLoader3D symbol not found in "
+                "trainer module; using nnU-Net default loader. "
+                "(This indicates a nnU-Net layout change incompatible with v18.)")
+            return super().get_dataloaders()
+
+        l6_p = _env_float("SPINESURG_LSTV_BIAS_L6_PROB", 0.60)
+        sac_p = _env_float("SPINESURG_LSTV_BIAS_SACRUM_PROB", 0.50)
+        self.print_to_log_file(
+            f"LSTV patch bias: substituting nnUNetDataLoader3D -> "
+            f"LSTVBiasedDataLoader3D for get_dataloaders() "
+            f"(L6 prob={l6_p:.2f}, sacrum prob={sac_p:.2f})")
+
+        _trainer_mod.nnUNetDataLoader3D = LSTVBiasedDataLoader3D
+        try:
+            return super().get_dataloaders()
+        finally:
+            _trainer_mod.nnUNetDataLoader3D = original_3d
+
     def on_train_start(self):
         super().on_train_start()
         try: self._apply_lstv_sampler()
         except Exception as exc: self.print_to_log_file(f"LSTV oversample: {exc}")
-        # Banner runs LAST so it captures post-sampler pool composition.
+        # Banner runs LAST so it captures post-sampler pool composition
+        # AND can verify the train loader's class is LSTVBiasedDataLoader3D.
         # super().on_train_start() above ran _WandBMixin's setup
-        # (subtype map, CE reweight, patch-bias hook, W&B init);
+        # (subtype map, CE reweight, get_dataloaders [which our override
+        # intercepted to swap the loader class], W&B init);
         # _apply_lstv_sampler then duplicated keys to hit the target
         # frac. Now dump everything as one grep-able block.
         try: self._emit_startup_diagnostics()
@@ -2709,44 +2661,33 @@ class nnUNetTrainerWandB_1000ep_500iter(_WandBMixin, nnUNetTrainer):
 class nnUNetTrainerWandB_500ep_LSTVOversample(
     _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
 ):
-    """500 epochs + LSTV queue oversample + L6 patch bias + CE reweight.
-    DEFAULT for the SpineSurg-CT paper run.
+    """500 epochs + LSTV queue oversample + class-override patch bias
+    + CE reweight. DEFAULT for the SpineSurg-CT paper run.
 
-    v17.2: Two production-bug fixes.
-         (1) Patch-bias hook installed at module level (np.random.choice
-             replaced globally with frame-inspection guard) instead of
-             on the trainer instance. The v15-v17.1 instance-level
-             install passed startup self-test in the parent process but
-             never fired in worker processes spawned by
-             NonDetMultiThreadedAugmenter — visible as "calls=0" every
-             epoch in every fold's log. v17.2 patches via module state
-             that survives fork/spawn. Counters via multiprocessing.Value
-             so worker increments propagate to the parent.
-         (2) Dedicated LSTV val pass: handle the case where the loader's
-             keys attribute is a method (e.g., dict.keys) rather than
-             a settable list. v17.1 raised "method object is not iterable"
-             and silently no-op'd. v17.2 detects this at probe time,
-             logs the actual attribute name + kind in the startup
-             banner, and skips the forced override (which would replace
-             the method with a list and break subsequent callers).
-    v17.1: Dedicated LSTV validation pass — runs forward pass on every
+    v18 (May 2026): Patch class biasing now via LSTVBiasedDataLoader3D
+         subclass, not np.random.choice monkey-patching. The previous
+         monkey-patch never fired in worker processes (verified
+         bias_call_count=0 across 64 epochs of fold 4 in production
+         job 35993148, and in every prior production run). v18's class
+         override is testable end-to-end (see
+         tests/test_lstv_biased_dataloader.py) and verifiably active
+         at training time (see PATCH BIAS section in startup
+         diagnostics banner).
+    v17.4: Hallucination metrics (specificity tracking on absent classes).
+    v17.1-v17.3: Dedicated LSTV val pass — forces forward pass on every
          LSTV case in this fold's val set every epoch, regardless of
          whether the regular val sampler caught them in its
          num_val_iterations subsample. Eliminates n=0 LSTV val epochs
-         that silenced the headline metric. Adds ~30s/epoch (8 cases
-         × bs 2 forward passes on H200). Configurable via
-         SPINESURG_LSTV_DEDICATED_VAL{,_EVERY} env vars.
+         that silenced the headline metric.
     v17: Oversample pool now includes all 5 LSTV variants (added
          ambiguous, n=4). Symmetric per-record subtype refinement at
          convert time: spine_only demotes pelvis-region subtypes
          (sacralization, semisacralization), pelvic_native demotes
          lumbar-region subtypes (lumb, sacr_count). Verbose
          startup-diagnostic banner emitted via
-         _emit_startup_diagnostics. First-batch diagnostic confirms
-         hook + queue plumbing on the first generate_train_batch call.
-    v16: Patch-bias hook now patches np.random.choice (was patching
-         stdlib random.choice — wrong target, hook was a no-op).
-         Added bias_call_count / L6_picks / sacrum_picks counters.
+         _emit_startup_diagnostics.
+    v15-v16: Multiple attempts to make the np.random.choice monkey-patch
+         fire at the right call site. Superseded by v18.
     v12: Per-subgroup dice logger no longer crashes on numpy keys array
          (was using truthy fallback chain that numpy rejects).
     v11: CE weight tensor sized to actual network output (was 11; should
