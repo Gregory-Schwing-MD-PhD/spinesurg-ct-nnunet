@@ -1,6 +1,25 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v17)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v17.3)
 tools/nnunet_wandb_variant.py
+
+v17.3 — May 2026: PRE-FORK install of the global np.random.choice
+patch. v17.1 → v17.2 fixed the closure-over-instance bug by moving
+the patch to module scope, but the install was still happening AFTER
+super().on_train_start() — which calls get_dataloaders() which
+constructs NonDetMultiThreadedAugmenter which spawns 24 worker
+subprocesses via mp.Process(target=producer, ...). Linux fork copies
+the parent's memory image at fork time. Workers were forking from a
+parent whose np.random.choice was still the ORIGINAL numpy function;
+patching it after fork reached nobody. Cumulative bias-hook calls
+stayed at 0 across 52 epochs of fold 0 in production (job 35992462).
+
+Fix: install the patch BEFORE super().on_train_start() so that when
+get_dataloaders() spawns workers, they fork from a parent whose
+np.random.choice is ALREADY patched. _maybe_apply_l6_patch_bias is
+now called twice — once pre-super (loader=None branch installs the
+global hook) and once post-super (loader != None branch emits the
+diagnostic log line about which generator was located). The install
+itself is idempotent via the _BIAS_INSTALLED flag.
 
 Design intent
 =============
@@ -1060,32 +1079,46 @@ class _WandBMixin:
                 "but never fire. Check subtype map loaded correctly.")
 
         loader = getattr(self, "dataloader_train", None)
+        # v17.3: This method is called TWICE — once BEFORE super().on_train_start()
+        # to install the global numpy patch (so workers fork with it in their
+        # memory image), and once AFTER for the dataloader-located diagnostic
+        # log line. The pre-fork call has loader=None; we install the global
+        # patch and skip the diagnostic. The post-fork call sees loader != None
+        # and only emits the diagnostic (the global install is already done,
+        # so _install_global_bias_hook is a no-op via _BIAS_INSTALLED guard).
+        pre_fork = loader is None
         self._phase("patch_bias",
+            f"phase: {'PRE-FORK install' if pre_fork else 'POST-FORK diagnostic'}; "
             f"dataloader_train type: "
             f"{type(loader).__name__ if loader is not None else None}")
         underlying = loader
-        located_via = "dataloader_train"
-        for attr in ("generator", "data_loader", "_data_loader"):
-            if hasattr(underlying, attr):
-                cand = getattr(underlying, attr)
+        located_via = "dataloader_train" if loader is not None else "<none>"
+        if loader is not None:
+            for attr in ("generator", "data_loader", "_data_loader"):
+                if hasattr(underlying, attr):
+                    cand = getattr(underlying, attr)
+                    self._phase("patch_bias",
+                        f"  attr {attr}: type={type(cand).__name__}")
+                    if hasattr(cand, "generate_train_batch") or hasattr(cand, "_data"):
+                        underlying = cand
+                        located_via = f"dataloader_train.{attr}"
+                        break
+            if underlying is None or not hasattr(underlying, "generate_train_batch"):
                 self._phase("patch_bias",
-                    f"  attr {attr}: type={type(cand).__name__}")
-                if hasattr(cand, "generate_train_batch") or hasattr(cand, "_data"):
-                    underlying = cand
-                    located_via = f"dataloader_train.{attr}"
-                    break
-        if underlying is None or not hasattr(underlying, "generate_train_batch"):
-            self._phase("patch_bias",
-                "ABORT: cannot locate generate_train_batch on dataloader. "
-                "nnU-Net internals may have changed.")
-            self._l6_patch_bias_enabled = False
-            self._phase_end("patch_bias", ok=False,
-                note="generate_train_batch not found")
-            return
+                    "WARN (post-fork): cannot locate generate_train_batch on "
+                    "dataloader. Diagnostic only — global patch already installed.")
+            else:
+                self._phase("patch_bias",
+                    f"located generate_train_batch via {located_via} "
+                    f"({type(underlying).__name__})")
 
-        self._phase("patch_bias",
-            f"located generate_train_batch via {located_via} "
-            f"({type(underlying).__name__})")
+            # If we're in the post-fork phase and global hook is already
+            # installed, return early — no need to re-run rules build,
+            # self-test, or install. The pre-fork call did all that.
+            if _BIAS_INSTALLED:
+                self._phase_end("patch_bias", ok=True,
+                    note=f"post-fork diagnostic only ({located_via})")
+                return
 
         # Run startup self-test BEFORE installing the real hook. Catches
         # frame-inspection breakage in this Python (the v15 silent-no-op
@@ -1170,9 +1203,10 @@ class _WandBMixin:
 
         self._phase("patch_bias",
             f"installed: np.random.choice wrapped GLOBALLY at module "
-            f"scope (worker forks inherit the patch via copy-on-write)")
+            f"scope BEFORE super().on_train_start() — workers will inherit "
+            f"the patch when NonDetMultiThreadedAugmenter forks them")
         self._phase_end("patch_bias", ok=True,
-            note=f"{len(targets)} cases match rules")
+            note=f"{len(targets)} cases match rules (pre-fork install)")
 
     def _refresh_bias_counters_from_shared(self) -> None:
         """Pull the latest cross-process counter values into the
@@ -2104,15 +2138,45 @@ class _WandBMixin:
     def on_train_start(self):
         try: _install_perf_tuning()
         except Exception as exc: print(f"[perf] {exc}", flush=True)
-        super().on_train_start()
+        # ────────────────────────────────────────────────────────────────
+        # v17.3: PRE-FORK INSTALL of the global np.random.choice patch.
+        #
+        # The bug we're fixing: nnUNetTrainer.on_train_start (super())
+        # calls self.get_dataloaders() at line 903, which constructs the
+        # NonDetMultiThreadedAugmenter at line 686-690. That augmenter
+        # internally spawns 24 worker subprocesses via mp.Process(target=
+        # producer, ...). On Linux, those forked workers inherit a COPY
+        # of the parent's memory image at the time of fork.
+        #
+        # In v17.2, we installed the bias patch at line 2114 — AFTER
+        # super().on_train_start() returned. By then, all 24 workers had
+        # already forked from a parent whose np.random.choice was still
+        # the original numpy function. The patch in the parent reached
+        # nobody. Cumulative bias-hook calls stayed at 0 across 52+
+        # epochs.
+        #
+        # The fix: install BEFORE super(). Subtype map must be loaded
+        # first so we know which cases get which rules. Then super()
+        # calls get_dataloaders(), which forks workers — and workers
+        # fork from a parent whose np.random.choice is ALREADY patched.
+        # No worker ever sees the original.
+        # ────────────────────────────────────────────────────────────────
+        try: self._maybe_load_subtype_map()
+        except Exception as exc: self.print_to_log_file(f"subtype map (pre-fork): {exc}")
+        try: self._maybe_apply_l6_patch_bias()  # PRE-FORK install (loader=None branch)
+        except Exception as exc: self.print_to_log_file(f"L6 patch bias (pre-fork): {exc}")
+
+        super().on_train_start()  # ← workers fork HERE with patch already installed
+
         try: _install_nnunet_warning_filter()
         except Exception: pass
-        try: self._maybe_load_subtype_map()
-        except Exception as exc: self.print_to_log_file(f"subtype map: {exc}")
+        # _maybe_load_subtype_map already ran above; second call is a no-op.
         try: self._maybe_apply_ce_reweighting()
         except Exception as exc: self.print_to_log_file(f"CE reweight: {exc}")
+        # POST-FORK: re-call to emit the dataloader-found diagnostic line
+        # (the install is idempotent via _BIAS_INSTALLED guard).
         try: self._maybe_apply_l6_patch_bias()
-        except Exception as exc: self.print_to_log_file(f"L6 patch bias: {exc}")
+        except Exception as exc: self.print_to_log_file(f"L6 patch bias (post-fork): {exc}")
         try: self._install_log_intercepts()
         except Exception: pass
         try: self._init_wandb()
