@@ -1,165 +1,122 @@
 """
-SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v19.1)
+SpineSurg-CT -- nnU-Net v2 trainers with W&B logging (v20)
 tools/nnunet_wandb_variant.py
 
-v19.1 — May 2026: CROSS-PROCESS BIAS COUNTERS.
-==============================================
-Per-epoch logging of patch-bias activity (force_fg calls served, L6
-forces emitted, sacrum forces emitted, uniform-fallback count). The
-counters live in multiprocessing.Value at module level in
-lstv_biased_dataloader.py — created at import time before nnU-Net's
-MultiThreadedAugmenter forks workers, so the shared-memory backing
-is inherited across fork. Workers increment, parent reads at epoch
-boundaries.
+v20 — May 2026: MERGED LAST_LUMBAR + FOCUSED CONFUSION OUTPUT.
+==============================================================
+Two coupled changes for Dataset803 (SpineSurgCTFullMerged):
 
-What you'll see in the SLURM log every epoch:
+(1) MERGED LAST_LUMBAR. The L5/L6 distinction is removed at the
+    network's training target. Source NIfTIs have their L6 voxels
+    remapped to label 5 (now called "last_lumbar") by
+    convert_hf_to_nnunet.py before nnU-Net ever sees them. All other
+    labels are shifted down by one to maintain contiguous label
+    values (sacrum 7→6, left_hip 8→7, right_hip 9→8, ignore 10→9).
 
-    --- v19.1 patch bias activity (epoch 50) ---
-      this epoch: force_fg=14823, L6 forces=752, sacrum forces=237,
-                  uniform fallback=13834
-      rates: L6=5.07%, sacrum=1.60%, no-bias=93.33%
-      cumulative: force_fg=741150, L6=37600, sacrum=11850
+    This eliminates the v19.1 class-collision failure mode where
+    85-95% of GT-L6 voxels were misclassified as L5 across all 5
+    folds (verified in jobs 35994118-35994122). Direct multi-class
+    semantic segmentation cannot solve transitional vertebra labeling
+    because the disambiguating signal is non-local (vertebra count
+    from cervical or sacral landmarks). We follow the same approach
+    Möller 2026 (VERIDAH §2.2) uses: train against a merged
+    last_lumbar / last_thoracic class, then recover individual labels
+    downstream via instance post-processing or VERIDAH's constrained
+    sequence predictor.
 
-What you'll see in W&B:
+    With this change, the patch bias dataloader (v18) is functionally
+    obsolete — there is no L6 class to bias toward. SET
+    SPINESURG_LSTV_BIAS_ENABLED=0 in your SLURM script to bypass it.
+    The case-level LSTV oversampling (queue duplication for non-normal
+    subtypes) is preserved at 25% target queue fraction (matches
+    Möller's 4× per-case oversampling for anomalous cases).
 
-    patch_bias/this_epoch/n_force_fg
-    patch_bias/this_epoch/n_l6_returned
-    patch_bias/this_epoch/n_sacrum_returned
-    patch_bias/this_epoch/l6_rate
-    patch_bias/this_epoch/sacrum_rate
-    patch_bias/cumulative/...
+(2) FOCUSED CONFUSION OUTPUT. The v19 bidirectional confusion logging
+    emitted hundreds of W&B keys per epoch (one per subtype × GT class
+    × predicted class for every direction). The v20 confusion logger
+    emits only the three clinically-meaningful headline blocks plus
+    one specificity number, totaling ~14 keys per epoch instead of
+    ~1000+:
 
-If the counters stay at 0 across multiple epochs while training is
-otherwise progressing normally, the bias hook isn't firing — check
-the startup banner's "PATCH BIAS" section first to confirm the
-LSTVBiasedDataLoader3D substitution caught.
+      Block 1 — last_lumbar GT on lumb cases (where do they end up?)
+        Want: high fraction predicted as last_lumbar (the merge
+        worked). Concerning: fractions to sacrum / L4 / background
+        indicate boundary failures the post-processor will inherit.
+          val/headline/last_lumbar_GT_on_lumb/total_voxels
+          val/headline/last_lumbar_GT_on_lumb/as_last_lumbar_frac
+          val/headline/last_lumbar_GT_on_lumb/as_sacrum_frac
+          val/headline/last_lumbar_GT_on_lumb/as_L4_frac
+          val/headline/last_lumbar_GT_on_lumb/as_background_frac
 
-Expected rates with default config (frac=0.25, L6_prob=0.6,
-sacrum_prob=0.5):
-  - lumb cases are ~34% of oversample pool, oversampled to 25% of queue
-    -> ~8.5% of force_fg calls match lumb signature
-    -> ~5% of force_fg calls return L6 (0.085 * 0.6)
-  - sacr_count cases are ~12% of pool -> 3% of queue -> ~1.5% sacrum rate
+      Block 2 — L4 GT on sacr_count cases (where do they end up?)
+        Want: high fraction predicted as L4 (no class collision in
+        the new direction). Concerning: any fraction predicted as
+        last_lumbar means the model still has the "bottom-most lumbar
+        is always last_lumbar" prior, just relocated to the L4/L5
+        boundary instead of the L5/L6 boundary.
+          val/headline/L4_GT_on_sacr_count/total_voxels
+          val/headline/L4_GT_on_sacr_count/as_L4_frac
+          val/headline/L4_GT_on_sacr_count/as_last_lumbar_frac
+          val/headline/L4_GT_on_sacr_count/as_sacrum_frac
+          val/headline/L4_GT_on_sacr_count/as_background_frac
 
-If observed rates are within 30% of expected (e.g. L6 rate between
-3.5% and 6.5%), bias is firing correctly.
+      Block 3 — predicted last_lumbar on sacr_count cases (what's
+      actually there in GT?). On sacr_count cases the network should
+      not predict last_lumbar at all (4-lumbar anatomy means the
+      last_lumbar class is absent from GT). When it does, what is it
+      pointing at?
+          val/headline/pred_last_lumbar_on_sacr_count/total_voxels
+          val/headline/pred_last_lumbar_on_sacr_count/actually_L4_frac
+          val/headline/pred_last_lumbar_on_sacr_count/actually_sacrum_frac
+          val/headline/pred_last_lumbar_on_sacr_count/actually_background_frac
 
-v19 — May 2026: BIDIRECTIONAL CONFUSION TRACKING.
-=================================================
-Adds per-(subgroup, class) confusion logging in BOTH directions:
+      Specificity headline (one scalar per epoch):
+          val/headline/last_lumbar_specificity_on_sacr_count
+          val/headline/last_lumbar_specificity_on_sacr_count_n_cases
 
-  GT-direction: "for each voxel where GT == C, what did the model
-                 predict?" — answers "where do my L6 voxels go on
-                 lumbarization cases?" (Are they being called L5?
-                 Sacrum? Background?)
+    Standard per-class dice metrics (val/dice/L1, val/dice/L2, …,
+    val/dice/last_lumbar, val/dice/sacrum, val/dice/left_hip,
+    val/dice/right_hip, mean_lumbar, mean_pelvis, mean_foreground)
+    and per-subgroup dice (val/lstv_subgroup/{sub}/dice/{class}) are
+    UNCHANGED — these are still cheap and valuable.
 
-  PRED-direction: "for each voxel where PRED == C, what was the GT?"
-                  — answers "when the model says L5 on a sacr_count
-                  case (where L5 should be ABSENT), what is it
-                  actually looking at?" (Is it sacrum? L4? Background?)
+    The new headline metric is val/headline/last_lumbar_dice_on_lumbarization
+    (replaces the old L6_dice_on_lumbarization). Under the merged
+    scheme this should reach the same range as the network's other
+    well-segmented vertebrae (~0.85+) because the class collision is
+    gone.
 
-The two views are complementary: GT-direction localizes where the
-correct anatomy is being misclassified TO, PRED-direction localizes
-where false predictions are coming FROM. Together with the v17.4
-specificity metrics they give a full picture of confusion landscape.
-
-Headline keys emitted:
-  val/headline/L6_GT_predicted_as_{name}_on_lumb        (GT direction)
-  val/headline/predicted_L5_actually_{name}_on_sacr_count (PRED direction)
-  val/headline/predicted_L6_actually_{name}_on_normal     (PRED direction)
-
-Per-subgroup detail keys for every (subgroup, GT class) pair with
-voxels are emitted in both directions; the headlines pull out the
-clinically interesting ones for the paper.
-
-v18 — May 2026: PATCH BIAS VIA CLASS OVERRIDE.
-==============================================
-The patch class biasing that v15-v17.x attempted via monkey-patching
-np.random.choice has been replaced by a proper subclass of
-nnUNetDataLoader3D (see tools/lstv_biased_dataloader.py).
-
-The new approach:
-  - LSTVBiasedDataLoader3D overrides get_bbox to set `overwrite_class`
-    when the case has L6 voxels (lumb signature) or L4-with-no-L5-with-
-    sacrum (sacr_count signature). nnU-Net's existing overwrite_class
-    parameter then deterministically crops around a voxel of the chosen
-    class.
-  - get_dataloaders in the LSTV mixin swaps the class for the duration
-    of super().get_dataloaders() so workers fork from a parent where
-    the symbol is already replaced — no monkey-patching across forks,
-    no frame inspection.
-  - Detection uses class_locations content alone (no JSON dependency,
-    no case_id lookup) — L6 voxels imply lumb, L4+sacrum-without-L5
-    imply sacr_count.
-
-Why this matters: the v15-v17.x monkey-patch never actually fired in
-worker processes — the bias was advertised in startup logs but in
-production we observed bias_call_count=0 across 64 epochs of fold 4
-in job 35993148, and the same in every prior production run. v18's
-class override is testable end-to-end (see
-tests/test_lstv_biased_dataloader.py) and verifiably active at
-training time (PATCH BIAS section in the startup diagnostics banner
-walks to the actual loader instance and reports its class name).
-
-Configuration knobs:
-  SPINESURG_LSTV_BIAS_ENABLED       (default 1; "0" disables)
-  SPINESURG_LSTV_BIAS_L6_PROB       (default 0.60)
-  SPINESURG_LSTV_BIAS_SACRUM_PROB   (default 0.50)
-
-v17.4 — hallucination metrics (specificity tracking on absent classes).
-v17.1-v17.3 — dedicated LSTV val pass (forces forward pass on every
-              LSTV val case each epoch instead of subsampling).
-v17 — oversample pool includes ambiguous; symmetric per-record subtype
-      demotion; verbose startup-diagnostic banner.
-v15-v16 — multiple attempts to make the np.random.choice monkey-patch
-          fire at the right call site. Superseded by v18.
-v9-v14 — 6-way subgroup binning, lstv_cases.json schema v3, CE weight
-         tensor sizing, oversample pool semantics, partial-annotation
-         contract. Preserved in v18.
-
-Design intent
-=============
-Three-tier emphasis on LSTV anatomy, partial-annotation aware:
-
-  (a) Class-imbalance correction via queue-level oversampling.
-      Applied uniformly to ALL LSTV subtypes except 'ambiguous'.
-      Without this, LSTV is ~4% of training and the model defaults
-      to normal anatomy.
-
-  (b) Headline-subtype emphasis via per-case patch sampling bias.
-      v18: implemented via LSTVBiasedDataLoader3D (class override,
-      not monkey patch).
-
-      Lumb       -> L6  (class 6) @ 60%  (the class TS misses)
-      sacr_count -> sacrum (cls 7) @ 50%  (L4/sacrum transition zone)
-
-      Detection from class_locations content alone:
-        lumb       :  L6 has voxels in this case
-        sacr_count :  L4 has voxels AND L5 does NOT AND sacrum has voxels
-                      (the L4-in-fg constraint is what distinguishes
-                       sacr_count from pelvic-only records, which lack
-                       BOTH L5 and L4 because their lumbar region is
-                       all ignore=10)
-
-  (c) Class-level loss reweighting via CE weights.
-        L6     = 4.0
-        sacrum = 2.0
-      Background = 0.5; rest = 1.0.
+History
+-------
+v19.1 — May 2026: Cross-process bias counters (multiprocessing.Value)
+        for per-epoch patch-bias activity logging.
+v19   — May 2026: Bidirectional confusion tracking (GT→pred and
+        pred→GT). Replaced by v20's focused 3-block headline output.
+v18   — May 2026: Patch class biasing via LSTVBiasedDataLoader3D
+        subclass instead of np.random.choice monkey-patching.
+v17.4 — Hallucination metrics (specificity tracking on absent
+        classes). v20 retains only one specificity headline
+        (last_lumbar on sacr_count).
+v17.1-v17.3 — Dedicated LSTV val pass.
+v17   — Symmetric per-record subtype demotion; ambiguous in oversample
+        pool; verbose startup banner.
+v15-v16 — Multiple monkey-patch attempts (superseded by v18).
+v9-v14 — 6-way subgroup binning; lstv_cases.json schema v3; CE
+         weight tensor sizing; partial-annotation contract.
 
 Partial-annotation contract
 ===========================
 Some training cases (separate-mode spine-only and pelvic-only) have
-labels with value 10 = IGNORE in regions outside the present
-annotator's domain. nnU-Net v2's DC_and_CE_loss respects ignore_label
-when configured, masking those voxels out of the gradient. Required:
+labels with value 9 (was 10 in source NIfTIs; renumbered by the
+convert script) = IGNORE in regions outside the present annotator's
+domain. nnU-Net v2's DC_and_CE_loss respects ignore_label when
+configured, masking those voxels out of the gradient. Required:
 
-  - dataset.json must have "ignore": 10 in its labels dict
+  - dataset.json must have "ignore": 9 in its labels dict
     (set by convert_hf_to_nnunet.py:LABEL_NAMES, May 2026)
-  - export_hf.py:merge_labels writes value 10 in un-annotated regions
-    of partial-mode cases (May 2026)
-  - This trainer's _IGNORE_LABEL = 10 must match
-  - num_segmentation_heads from label_manager = 10 (the ignore label
-    has no output head; it's purely a loss mask)
+  - export_hf.py:merge_labels writes value 10 in source NIfTIs;
+    convert_hf_to_nnunet.py remaps that to 9 for nnU-Net consumption
+  - This trainer's _IGNORE_LABEL = 9 must match the converted dataset
 
 Author: Gregory Schwing, MD-PhD  |  Wayne State University / DMC
 """
@@ -189,14 +146,12 @@ from nnunetv2.training.nnUNetTrainer.variants.training_length.nnUNetTrainer_Xepo
 
 
 # ── v18: LSTV-aware patch class biasing via dataloader subclass ────────────
-# Tries multiple import paths to support both installed-into-nnunetv2
-# layouts (the canonical case after copying tools/*.py into
-# /opt/conda/.../variants/) and source-tree layouts (running tests
-# from spinesurg-ct-nnunet/tools/).
+# Functionally obsolete in v20 (no L6 class to bias toward); set
+# SPINESURG_LSTV_BIAS_ENABLED=0 to disable. The import path is kept
+# so the env-controlled bypass works on systems where the dataloader
+# is no longer present alongside the trainer.
 LSTVBiasedDataLoader3D = None
 _LSTV_LOADER_IMPORT_ERROR: Optional[str] = None
-# v19.1: cross-process shared-counter helpers. None when the loader
-# module isn't importable; trainer falls through gracefully.
 _read_shared_bias_counters: Optional[Callable] = None
 _reset_shared_bias_counters: Optional[Callable] = None
 try:
@@ -207,7 +162,6 @@ try:
     )
 except ImportError as _exc1:
     try:
-        # Source-tree fallback (running from spinesurg-ct-nnunet/tools/)
         from lstv_biased_dataloader import (  # type: ignore
             LSTVBiasedDataLoader3D,
             read_shared_bias_counters as _read_shared_bias_counters,
@@ -215,7 +169,6 @@ except ImportError as _exc1:
         )
     except ImportError as _exc2:
         try:
-            # Sibling-package fallback
             from .lstv_biased_dataloader import (  # type: ignore
                 LSTVBiasedDataLoader3D,
                 read_shared_bias_counters as _read_shared_bias_counters,
@@ -238,22 +191,30 @@ _METRIC_KEYS = (
     "epoch_start_timestamps", "epoch_end_timestamps",
 )
 
-_ANATOMY_NAMES = ["L1", "L2", "L3", "L4", "L5", "L6",
+# ── Anatomy constants (Dataset803 — merged last_lumbar, contiguous IDs) ────
+# Foreground class IDs are 1..8 (8 classes). _ANATOMY_NAMES is parallel
+# to _FG_CLASS_IDS so that _ANATOMY_NAMES[cid - 1] yields the human-
+# readable name for the foreground class with ID cid.
+_ANATOMY_NAMES = ["L1", "L2", "L3", "L4", "last_lumbar",
                    "sacrum", "left_hip", "right_hip"]
 
-_FG_CLASS_IDS    = list(range(1, 10))
-_LUMBAR_IDS      = list(range(1, 7))
-_PELVIS_IDS      = list(range(7, 10))
-_L6_LABEL_ID     = 6
-_SACRUM_LABEL_ID = 7
-_IGNORE_LABEL    = 10
+_FG_CLASS_IDS    = [1, 2, 3, 4, 5, 6, 7, 8]
+_LUMBAR_IDS      = [1, 2, 3, 4, 5]   # L1..last_lumbar
+_PELVIS_IDS      = [6, 7, 8]         # sacrum, left_hip, right_hip
+
+# Semantic label-ID aliases used by the headline logic.
+_L4_LABEL_ID          = 4   # bottom anatomical lumbar in sacr_count cases
+_LAST_LUMBAR_LABEL_ID = 5   # merged former-L5 + former-L6 (was 5 / 6)
+_SACRUM_LABEL_ID      = 6   # was 7 in unmerged scheme
+_IGNORE_LABEL         = 9   # was 10 in unmerged scheme
+
 _VALID_CONFIGS   = ("fused", "spine_only", "pelvic_native")
 
-# Network output channel count under the standard SpineSurg-CT label
-# schema (background + 9 foreground; ignore is masked, not classified).
-_DEFAULT_NUM_OUTPUT_CLASSES = 10
+# Network output channel count under the Dataset803 label schema:
+# background + 8 foreground classes (ignore is masked, not classified).
+_DEFAULT_NUM_OUTPUT_CLASSES = 9
 
-# 6-way taxonomy
+# 6-way LSTV taxonomy (unchanged from v17+).
 _SUBTYPE_NORMAL     = "normal"
 _SUBTYPE_LUMB       = "lumb"
 _SUBTYPE_SACR_COUNT = "sacr_count"
@@ -264,16 +225,15 @@ _KNOWN_SUBTYPES = (
     _SUBTYPE_NORMAL, _SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT,
     _SUBTYPE_SEMI, _SUBTYPE_SACR, _SUBTYPE_AMBIG,
 )
-# v17: ALL non-normal subtypes are oversampled. Previously
-# excluded: ambiguous (n=4) on memorization concerns. v17 includes
-# it per Greg's request — the downside of memorization on a tiny
-# group is acceptable; the upside is the model sees rare LSTV
-# anatomy more often.
 _OVERSAMPLE_SUBTYPES = tuple(s for s in _KNOWN_SUBTYPES if s != _SUBTYPE_NORMAL)
-# Equivalent: (lumb, sacr_count, semisacralization, sacralization, ambiguous)
 
 LSTV_CASES_SCHEMA_MIN = 1
 LSTV_CASES_SCHEMA_MAX = 3
+
+# Hallucination threshold: a per-class predicted-voxel count above which
+# we consider the prediction a "meaningful hallucination" rather than
+# noise at a boundary. ~1 cc at typical CT spacing of ~0.8 mm³/voxel.
+_HALLUC_VOXEL_THRESHOLD = 100
 
 
 def _install_nnunet_warning_filter() -> None:
@@ -351,10 +311,6 @@ def _read_lstv_cases_json(json_path: Path
             canon = _canonicalize_subtype_str(sub)
             case_to_subtype[cid] = canon
             all_case_ids.add(cid)
-        # Always recompute pool from in-code _OVERSAMPLE_SUBTYPES.
-        # The JSON's lstv_oversample_pool field, if present, reflects
-        # whatever decision was current when the JSON was written and
-        # is ignored on read. Single source of truth: this .py file.
         oversample_pool = sorted(
             cid for cid, sub in case_to_subtype.items()
             if sub in _OVERSAMPLE_SUBTYPES
@@ -446,7 +402,19 @@ def _read_lstv_records_from_manifest(hf_export_dir: Path
     return (all_case_ids, subtypes, case_to_sub, oversample_pool) if all_case_ids else None
 
 
-def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
+def _scan_lstv_case_ids_by_last_lumbar_voxels(labels_dir: str) -> Set[str]:
+    """Legacy fallback: identify lumb-candidate cases by scanning for
+    last_lumbar voxels (label 5).
+
+    Note that under the v20 merged-label scheme this is a much weaker
+    signal than the v19 L6-voxel scan was: every spine has last_lumbar
+    voxels (L5 in normals, last_lumbar=5 in lumb cases). This fallback
+    therefore returns ALL cases with any lumbar annotation, which makes
+    it useless for distinguishing lumb from normal. It exists only for
+    backwards compatibility with extreme-fallback paths; in practice
+    the lstv_cases.json or HF manifest path always succeeds and is
+    used preferentially.
+    """
     import nibabel as nib
     out: Set[str] = set()
     if not os.path.isdir(labels_dir): return out
@@ -454,16 +422,24 @@ def _scan_lstv_case_ids_by_l6_voxels(labels_dir: str) -> Set[str]:
         if not fn.endswith(".nii.gz"): continue
         try:
             arr = np.asarray(nib.load(join(labels_dir, fn)).dataobj).astype(np.int16)
-            if np.any(arr == _L6_LABEL_ID):
+            if np.any(arr == _LAST_LUMBAR_LABEL_ID):
                 out.add(fn[:-len(".nii.gz")])
         except Exception: continue
     return out
 
 
-# ── Per-case dice for subgroup logger ──────────────────────────────────────
+# ── Per-case dice / voxel-count helpers ──────────────────────────────────────
 
 def _per_case_dice_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor,
                               ignore_label: int = _IGNORE_LABEL) -> List[Optional[float]]:
+    """Per-class Dice on a single case. Returns a list of length
+    len(_FG_CLASS_IDS); entry i corresponds to class _FG_CLASS_IDS[i].
+    None means the class is absent from this case's GT (Dice undefined).
+
+    Voxels with gt == ignore_label are masked out of both numerator
+    and denominator so partial-annotation cases don't get punished
+    for unannotated regions.
+    """
     pred_argmax = pred_argmax.flatten()
     gt = gt.flatten()
     valid = gt != ignore_label
@@ -489,25 +465,17 @@ def _per_case_voxel_counts_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor
                                       ) -> List[Tuple[int, int]]:
     """Return (gt_n, pred_n) per class, including classes where gt_n == 0.
 
-    v17.4: hallucination tracking. When gt_n == 0, the case is in the
-    "should not predict" condition for that class. pred_n is the number
-    of voxels the model wrongly emitted. We accumulate these per
-    subgroup so we can report:
-
-        - Hallucination rate: fraction of "absent" cases where pred_n
-          exceeds a clinically-meaningful threshold
-        - Mean/max predicted volume when GT is absent
-        - Specificity: 1 - (hallucination rate)
+    Used for hallucination tracking — when gt_n == 0, the case is in
+    the "should not predict" condition for that class; pred_n is then
+    the number of voxels the model wrongly emitted.
 
     Voxels with gt == ignore_label are excluded from BOTH gt_n and
     pred_n, matching the standard dice computation. This means a
-    pelvic-only case (which has ignore=10 in the lumbar region) won't
-    contribute spurious "L6 hallucination" stats from its uninformative
-    region.
+    pelvic-only case (which has ignore in the lumbar region) won't
+    contribute spurious "last_lumbar hallucination" stats.
 
     Returns a list of (gt_n, pred_n) integer tuples in the same order
-    as _FG_CLASS_IDS — so the caller can index parallel to the dice
-    list.
+    as _FG_CLASS_IDS.
     """
     pred_argmax = pred_argmax.flatten()
     gt = gt.flatten()
@@ -524,31 +492,20 @@ def _per_case_voxel_counts_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor
     return out
 
 
-# Hallucination threshold: a per-class predicted-voxel count above which
-# we consider the prediction a "meaningful hallucination" rather than
-# noise at a boundary. ~1 cc at typical CT spacing of ~0.8 mm³/voxel.
-_HALLUC_VOXEL_THRESHOLD = 100
-
-
-# ── v19: bidirectional confusion helpers ───────────────────────────────────
+# ── Bidirectional confusion (v19 unchanged; v20 only changes the
+#    aggregation/emission to focus on three headline blocks) ─────────────────
 
 def _per_case_confusion_by_gt(pred_argmax: torch.Tensor, gt: torch.Tensor,
                                num_classes: int = _DEFAULT_NUM_OUTPUT_CLASSES,
                                ignore_label: int = _IGNORE_LABEL
                                ) -> Dict[int, "np.ndarray"]:
-    """GT-direction confusion: for each GT class C present in this case,
-    return a length-num_classes vector where index k = count of voxels
-    with (gt==C, pred==k).
+    """GT-direction confusion: for each GT class C present in this
+    case, return a length-num_classes vector where index k = count of
+    voxels with (gt==C, pred==k).
 
     Returns {gt_class: confusion_vector}. Classes absent from GT
-    (gt_n == 0) are not in the dict — there's no GT-direction confusion
-    to compute when there are no GT voxels.
-
-    Voxels with gt == ignore_label are excluded entirely (matches the
-    dice / voxel-count helpers).
-
-    Use case: "where do GT-L6 voxels end up being predicted on lumb
-    cases?" — read confusion[L6] and inspect the per-pred-class fractions.
+    (gt_n == 0) are not in the dict. Voxels with gt == ignore_label
+    are excluded entirely.
     """
     pred_argmax = pred_argmax.flatten()
     gt = gt.flatten()
@@ -564,8 +521,6 @@ def _per_case_confusion_by_gt(pred_argmax: torch.Tensor, gt: torch.Tensor,
         if not gt_mask.any():
             continue
         pred_at_gt = pred_argmax[gt_mask].cpu().numpy().astype(np.int64)
-        # Clamp to [0, num_classes-1] in case of out-of-range values
-        # (shouldn't happen but defensive against unexpected pred values).
         pred_at_gt = np.clip(pred_at_gt, 0, num_classes - 1)
         out[cid] = np.bincount(pred_at_gt, minlength=num_classes).astype(np.int64)
     return out
@@ -575,20 +530,13 @@ def _per_case_confusion_by_pred(pred_argmax: torch.Tensor, gt: torch.Tensor,
                                  num_classes: int = _DEFAULT_NUM_OUTPUT_CLASSES,
                                  ignore_label: int = _IGNORE_LABEL
                                  ) -> Dict[int, "np.ndarray"]:
-    """PRED-direction confusion: for each predicted class C with non-zero
-    voxels in this case, return a length-num_classes vector where index k
-    = count of voxels with (pred==C, gt==k).
+    """PRED-direction confusion: for each predicted class C with
+    non-zero voxels in this case, return a length-num_classes vector
+    where index k = count of voxels with (pred==C, gt==k).
 
     Returns {pred_class: confusion_vector}. Classes absent from PRED
-    (pred_n == 0) are not in the dict.
-
-    Voxels with gt == ignore_label are excluded entirely.
-
-    Use case: "when the model predicts L5 on a sacr_count case (where
-    L5 should NOT exist), what is it actually looking at?" — read
-    confusion[L5] and inspect the per-gt-class fractions. Useful for
-    diagnosing "the model is calling sacrum tissue 'L5'" vs "the model
-    is calling background voxels 'L5'" — different fixes.
+    (pred_n == 0) are not in the dict. Voxels with gt == ignore_label
+    are excluded entirely.
     """
     pred_argmax = pred_argmax.flatten()
     gt = gt.flatten()
@@ -611,12 +559,71 @@ def _per_case_confusion_by_pred(pred_argmax: torch.Tensor, gt: torch.Tensor,
 
 def _class_id_to_name(cid: int) -> str:
     """Render a class id as a human-readable name for log/W&B keys.
-    Background = 0; foreground = 1..9; anything else = 'label{cid}'."""
+
+    Background = 0; foreground class IDs map via _ANATOMY_NAMES[cid-1].
+    Unknown IDs render as 'label{cid}' (defensive against unexpected
+    network output values).
+    """
     if cid == 0:
         return "background"
-    if 1 <= cid <= 9:
+    if 1 <= cid <= len(_ANATOMY_NAMES):
         return _ANATOMY_NAMES[cid - 1]
     return f"label{cid}"
+
+
+# ── v20 confusion-headline keys (single source of truth for tests) ──────────
+# A "confusion key spec" describes one entry in a headline block. The
+# block aggregator looks up `(direction, anchor_class, target_class,
+# subgroup)`, computes the appropriate fraction, and emits W&B keys
+# named `val/headline/{block_id}/{leaf}`.
+#
+# We name them out here (not deep inside the aggregator) so the test
+# suite can assert the full set of keys is emitted on a synthetic
+# fixture, and so the print-summary code uses the SAME spec to format
+# the SLURM-log block.
+#
+# Direction:
+#   "by_gt"   — anchor on GT class; ask "where do those voxels go in
+#               prediction?" (frac = pred_class_count / gt_class_total)
+#   "by_pred" — anchor on PRED class; ask "what was actually there in
+#               GT?" (frac = gt_class_count / pred_class_total)
+#
+# anchor_class: the class we hold fixed (GT side or PRED side).
+# target_classes: which classes to emit fractions for. We deliberately
+# emit only L4, last_lumbar, sacrum, and background so the W&B run
+# stays uncluttered. Other classes (L1-L3, hips) would be near-zero
+# noise on the relevant subgroups anyway.
+
+_HEADLINE_TARGETS_LL_GT_ON_LUMB = (
+    ("last_lumbar", _LAST_LUMBAR_LABEL_ID, "as_last_lumbar_frac",
+     "good — merged class predicted correctly"),
+    ("sacrum",      _SACRUM_LABEL_ID,      "as_sacrum_frac",
+     "concerning — bottom lumbar predicted as sacrum"),
+    ("L4",          _L4_LABEL_ID,          "as_L4_frac",
+     "concerning — bottom lumbar predicted as L4 (count truncated)"),
+    ("background",  0,                     "as_background_frac",
+     "concerning — lumbar voxel predicted as background"),
+)
+
+_HEADLINE_TARGETS_L4_GT_ON_SACR_COUNT = (
+    ("L4",          _L4_LABEL_ID,          "as_L4_frac",
+     "good — L4 predicted correctly"),
+    ("last_lumbar", _LAST_LUMBAR_LABEL_ID, "as_last_lumbar_frac",
+     "concerning — model still calls bottom lumbar 'last_lumbar' even with 4-lumbar count"),
+    ("sacrum",      _SACRUM_LABEL_ID,      "as_sacrum_frac",
+     "concerning — L4 predicted as sacrum"),
+    ("background",  0,                     "as_background_frac",
+     "concerning — L4 predicted as background"),
+)
+
+_HEADLINE_TARGETS_PRED_LL_ON_SACR_COUNT = (
+    ("L4",          _L4_LABEL_ID,          "actually_L4_frac",
+     "predicted last_lumbar at L4 anatomy (the failure mode)"),
+    ("sacrum",      _SACRUM_LABEL_ID,      "actually_sacrum_frac",
+     "predicted last_lumbar at sacrum anatomy"),
+    ("background",  0,                     "actually_background_frac",
+     "predicted last_lumbar in noise"),
+)
 
 
 # =============================================================================
@@ -627,9 +634,23 @@ def _build_ce_class_weights(num_classes: int) -> Optional[torch.Tensor]:
     """Build a CE weight tensor of shape (num_classes,).
 
     `num_classes` MUST equal the number of output channels of the
-    network — typically 10 here (background + 9 foreground). The
-    ignore label is NOT a class in the network output (it's masked via
-    ignore_index) and therefore has no entry in this weight tensor.
+    network — typically 9 here (background + 8 foreground). The
+    ignore label is NOT a class in the network output (it's masked
+    via ignore_index) and therefore has no entry in this weight tensor.
+
+    v20 CE weights, with rationale:
+      bg=0.5         — downweight; large area, easy to learn
+      L1-L4=1.0      — baseline
+      last_lumbar=1.5 — modest boost; class is no longer rare (was
+                       L5+L6 combined), but it still benefits from a
+                       small upweight because mis-labeling the bottom
+                       lumbar is the clinically-important error
+      sacrum=2.0     — emphasized for sacr_count and Castellvi
+                       morphologies where the L5/sacrum boundary is
+                       the discriminative feature
+      hips=1.0       — baseline
+
+    The L6=4.0 boost from v19 is GONE — there is no L6 channel.
     """
     if not _env_truthy("SPINESURG_CE_REWEIGHT", default=True):
         return None
@@ -637,19 +658,22 @@ def _build_ce_class_weights(num_classes: int) -> Optional[torch.Tensor]:
         return None
 
     # Per-class weights keyed by the class index in the network output.
-    # Indices 0-9: background, L1-L6, sacrum, left_hip, right_hip.
-    # Do NOT add an entry for the ignore label (10) — the network does
-    # not emit a channel for it.
+    # Indices 0-8: background, L1-L4, last_lumbar, sacrum, left_hip,
+    # right_hip. (No entry for ignore=9; ignore is masked.)
     weights = {
         0: 0.5,  # background
-        1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0,
-        6: 4.0,  # L6 — emphasized for lumbarization recovery
-        7: 2.0,  # sacrum — emphasized for sacr_count (missing-L5) and Castellvi
-        8: 1.0, 9: 1.0,
+        1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0,  # L1-L4
+        5: 1.5,  # last_lumbar (merged former L5 + former L6)
+        6: 2.0,  # sacrum
+        7: 1.0, 8: 1.0,  # hips
     }
-    name_to_id = {"background": 0, "L1": 1, "L2": 2, "L3": 3, "L4": 4,
-                   "L5": 5, "L6": 6, "sacrum": 7,
-                   "left_hip": 8, "right_hip": 9}
+    name_to_id = {
+        "background":  0,
+        "L1":          1, "L2": 2, "L3": 3, "L4": 4,
+        "last_lumbar": 5,
+        "sacrum":      6,
+        "left_hip":    7, "right_hip": 8,
+    }
     overrides = os.environ.get("SPINESURG_CE_WEIGHTS", "").strip()
     if overrides:
         for spec in overrides.split(","):
@@ -675,7 +699,7 @@ def _detect_num_output_classes(trainer) -> int:
     Resolution order:
       1. trainer.label_manager.num_segmentation_heads (canonical nnU-Net v2)
       2. count of dataset_json['labels'] excluding any 'ignore' entry
-      3. _DEFAULT_NUM_OUTPUT_CLASSES (10) as final fallback
+      3. _DEFAULT_NUM_OUTPUT_CLASSES (9) as final fallback
     """
     try:
         n = int(getattr(trainer.label_manager, "num_segmentation_heads"))
@@ -694,7 +718,90 @@ def _detect_num_output_classes(trainer) -> int:
 
 
 # =============================================================================
-# W&B mixin (6-way subgroup tracking)
+# v20 confusion aggregation — focused headline blocks
+# =============================================================================
+
+def _aggregate_block_by_gt(
+    confusion_buffers: Dict[str, List[Dict[int, np.ndarray]]],
+    subtype: str,
+    anchor_gt_cid: int,
+    target_specs: Tuple[Tuple[str, int, str, str], ...],
+    block_id: str,
+    out: Dict[str, float],
+) -> None:
+    """Aggregate one 'GT-direction' confusion block into `out`.
+
+    For the given `subtype`, sums per-case confusion vectors anchored
+    on GT class `anchor_gt_cid` across all val cases of that subtype.
+    Then emits W&B keys under `val/headline/{block_id}/...`:
+
+      - {block_id}/total_voxels
+      - {block_id}/{leaf}  for each (name, target_cid, leaf, _) in
+        target_specs, where the value is target_voxels / total_voxels
+
+    If no cases exist or the anchor class has no GT voxels in any
+    case, no keys are emitted (caller can detect via missing keys).
+    """
+    cases = confusion_buffers.get(subtype, [])
+    if not cases:
+        return
+    summed: Optional[np.ndarray] = None
+    for case_dict in cases:
+        vec = case_dict.get(anchor_gt_cid)
+        if vec is None:
+            continue
+        if summed is None:
+            summed = np.zeros_like(vec, dtype=np.int64)
+        summed = summed + vec
+    if summed is None:
+        return
+    total = int(summed.sum())
+    if total == 0:
+        return
+    base = f"val/headline/{block_id}"
+    out[f"{base}/total_voxels"] = float(total)
+    for name, target_cid, leaf, _rationale in target_specs:
+        if 0 <= target_cid < len(summed):
+            out[f"{base}/{leaf}"] = float(int(summed[target_cid]) / total)
+
+
+def _aggregate_block_by_pred(
+    confusion_buffers: Dict[str, List[Dict[int, np.ndarray]]],
+    subtype: str,
+    anchor_pred_cid: int,
+    target_specs: Tuple[Tuple[str, int, str, str], ...],
+    block_id: str,
+    out: Dict[str, float],
+) -> None:
+    """Aggregate one 'PRED-direction' confusion block. Symmetric to
+    _aggregate_block_by_gt but anchored on a predicted class — emits
+    `actually_{name}_frac` under `val/headline/{block_id}/...`.
+    """
+    cases = confusion_buffers.get(subtype, [])
+    if not cases:
+        return
+    summed: Optional[np.ndarray] = None
+    for case_dict in cases:
+        vec = case_dict.get(anchor_pred_cid)
+        if vec is None:
+            continue
+        if summed is None:
+            summed = np.zeros_like(vec, dtype=np.int64)
+        summed = summed + vec
+    if summed is None:
+        return
+    total = int(summed.sum())
+    if total == 0:
+        return
+    base = f"val/headline/{block_id}"
+    out[f"{base}/total_voxels"] = float(total)
+    for name, target_cid, leaf, _rationale in target_specs:
+        if 0 <= target_cid < len(summed):
+            out[f"{base}/{leaf}"] = float(int(summed[target_cid]) / total)
+
+
+# =============================================================================
+# W&B mixin (6-way subgroup tracking + v20 focused confusion)
 # =============================================================================
 
 class _WandBMixin:
@@ -708,25 +815,11 @@ class _WandBMixin:
     _channels_last_active = False
 
     _val_subgroup_dice: Dict[str, List[List[Optional[float]]]] = None
-    # v17.4: parallel buffer of (gt_n, pred_n) tuples per case, per class.
-    # Same outer shape as _val_subgroup_dice (subtype -> list-of-cases ->
-    # list-of-classes), but each per-class entry is a (int, int) tuple
-    # instead of an Optional[float]. Used by _aggregate_subgroup_hallucination
-    # to compute specificity / hallucination volume on cases where the
-    # class is absent in GT.
     _val_subgroup_voxels: Dict[str, List[List[Tuple[int, int]]]] = None
-    # v19: bidirectional confusion buffers, parallel to _val_subgroup_dice.
-    # Each entry is a list-of-cases, where each case is a dict mapping
-    # class_id -> length-num_classes np.int64 vector.
-    #   _by_gt[sub][i][C][k]   = count of voxels with (gt==C, pred==k) in case i of subtype sub
-    #   _by_pred[sub][i][C][k] = count of voxels with (pred==C, gt==k) in case i of subtype sub
     _val_subgroup_confusion_by_gt: Dict[str, List[Dict[int, "np.ndarray"]]] = None
     _val_subgroup_confusion_by_pred: Dict[str, List[Dict[int, "np.ndarray"]]] = None
     _val_case_to_subtype: Optional[Dict[str, str]] = None
     _per_subgroup_logging_enabled: bool = True
-    # v19.1: snapshot of cross-process bias counters at epoch start.
-    # Populated by on_train_epoch_start, diffed in on_epoch_end to
-    # produce per-epoch counts.
     _bias_counters_at_epoch_start: Optional[Dict[str, int]] = None
 
     def _progress_json_path(self):
@@ -741,11 +834,9 @@ class _WandBMixin:
             return data if isinstance(data, dict) else {}
         except Exception: return {}
 
-    # ── Phase logging helpers (v17 startup tracing) ──────────────────────
+    # ── Phase logging helpers ────────────────────────────────────────────
 
     def _phase(self, phase: str, msg: str) -> None:
-        """Single phase log line. Every line is prefixed with
-        [STARTUP] <phase>: ... so logs are grep-friendly."""
         try:
             self.print_to_log_file(f"[STARTUP] {phase}: {msg}")
         except Exception:
@@ -888,18 +979,11 @@ class _WandBMixin:
     # ── Startup diagnostics ──────────────────────────────────────────────
 
     def _emit_startup_diagnostics(self) -> None:
-        """Dump every relevant configuration value, pool composition,
-        env-var override, and hook-install status as a single banner.
-
-        Output is intentionally verbose: we want one grep-able block
-        in the SLURM log that confirms whether oversampling, patch
-        bias, CE reweighting, and per-subgroup tracking are each live.
-        """
         log = self.print_to_log_file
         try:
             log("")
             log("=" * 72)
-            log("SPINESURG-CT TRAINER STARTUP DIAGNOSTICS")
+            log("SPINESURG-CT TRAINER STARTUP DIAGNOSTICS (v20)")
             log("=" * 72)
 
             log(f"  trainer class:    {type(self).__name__}")
@@ -907,6 +991,9 @@ class _WandBMixin:
             except Exception: ds_name = "<unknown>"
             log(f"  dataset:          {ds_name}")
             log(f"  fold:             {getattr(self, 'fold', '?')}")
+            log(f"  label scheme:     v20 merged (last_lumbar = former L5+L6)")
+            log(f"  num_fg_classes:   {len(_FG_CLASS_IDS)}  ({_ANATOMY_NAMES})")
+            log(f"  ignore_label:     {_IGNORE_LABEL}")
             try:
                 log(f"  num_epochs:       {self.num_epochs}")
                 log(f"  iters/epoch:      {getattr(self, 'num_iterations_per_epoch', '?')}")
@@ -953,7 +1040,7 @@ class _WandBMixin:
             except Exception as exc:
                 log(f"    candidate-path enumeration failed: {exc}")
             if not json_found:
-                log("    -> no JSON found; will fall back to manifests/L6 scan")
+                log("    -> no JSON found; will fall back to manifests/last_lumbar scan")
 
             log("")
             log("  OVERSAMPLE POOL")
@@ -1008,27 +1095,20 @@ class _WandBMixin:
             except Exception as exc:
                 log(f"    fold intersection diagnostic failed: {exc}")
 
-            # ── v18: PATCH BIAS section ──────────────────────────
+            # ── PATCH BIAS section (functionally obsolete in v20) ──────
             log("")
-            log("  PATCH BIAS (v18 — class override, not monkey-patch)")
-            bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=True)
+            log("  PATCH BIAS (v18 — functionally obsolete in v20)")
+            bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=False)
             log(f"    enabled (env SPINESURG_LSTV_BIAS_ENABLED): {bias_enabled}")
-            if not _LSTV_BIASED_LOADER_AVAILABLE:
+            log(f"    NOTE: under v20 merged labels, the bias loader's "
+                f"L6-detection logic is no-op (no L6 voxels in dataset).")
+            log(f"    Default in v20: DISABLED. Re-enable only for "
+                f"experiments on legacy unmerged datasets.")
+            if bias_enabled and not _LSTV_BIASED_LOADER_AVAILABLE:
                 log(f"    ✗ LSTVBiasedDataLoader3D NOT IMPORTABLE")
                 log(f"      import error: {_LSTV_LOADER_IMPORT_ERROR}")
                 log(f"      bias is INACTIVE — nnU-Net default uniform sampling")
             elif bias_enabled:
-                l6_prob = _env_float("SPINESURG_LSTV_BIAS_L6_PROB", 0.60)
-                sac_prob = _env_float("SPINESURG_LSTV_BIAS_SACRUM_PROB", 0.50)
-                log(f"    L6 prob (lumb cases):        {l6_prob:.2f}  "
-                    f"[env SPINESURG_LSTV_BIAS_L6_PROB]")
-                log(f"    sacrum prob (sacr_count):    {sac_prob:.2f}  "
-                    f"[env SPINESURG_LSTV_BIAS_SACRUM_PROB]")
-                log(f"    detection: from class_locations content alone "
-                    f"(no JSON/case_id lookup)")
-                # Walk to the underlying train loader to confirm class.
-                # If the get_dataloaders override worked, this will be
-                # LSTVBiasedDataLoader3D. If not, something is broken.
                 loader = getattr(self, "dataloader_train", None)
                 cls_name = "<no train loader>"
                 if loader is not None:
@@ -1043,39 +1123,6 @@ class _WandBMixin:
                             break
                     cls_name = type(underlying).__name__
                 log(f"    train loader class: {cls_name}")
-                if cls_name == "LSTVBiasedDataLoader3D":
-                    log(f"    ✓ bias is ACTIVE — get_bbox will set "
-                        f"overwrite_class on lumb / sacr_count signatures")
-                else:
-                    log(f"    ✗ WARNING: train loader is {cls_name!r}, "
-                        f"expected LSTVBiasedDataLoader3D.")
-                    log(f"      bias is NOT active. Check that "
-                        f"_LSTVOversampleMixin.get_dataloaders ran "
-                        f"(it should have been called via MRO from "
-                        f"super().on_train_start()).")
-                # v19.1: report shared-counter status
-                if _read_shared_bias_counters is not None:
-                    try:
-                        startup_counters = _read_shared_bias_counters()
-                        if startup_counters:
-                            log(f"    shared bias counters at startup: "
-                                f"force_fg={startup_counters.get('n_force_fg', 0)}, "
-                                f"L6={startup_counters.get('n_l6_returned', 0)}, "
-                                f"sacrum={startup_counters.get('n_sacrum_returned', 0)}")
-                            log(f"      (non-zero values here indicate "
-                                f"resumed training; per-epoch deltas are "
-                                f"computed against epoch-start snapshots)")
-                        else:
-                            log(f"    shared counters: read returned empty "
-                                f"(multiprocessing.Value setup may have failed)")
-                    except Exception as exc:
-                        log(f"    shared counters: probe failed: {exc}")
-                else:
-                    log(f"    shared counters: not importable (per-epoch "
-                        f"counter logging will be silent)")
-            else:
-                log(f"    bias DISABLED via env; "
-                    f"nnU-Net default uniform sampling")
 
             log("")
             log("  PER-SUBGROUP VAL DICE")
@@ -1085,15 +1132,12 @@ class _WandBMixin:
                 map_counts = Counter(self._val_case_to_subtype.values())
                 log(f"    subtype distribution: {dict(map_counts)}")
             log(f"    classes tracked: {_ANATOMY_NAMES}")
-            # v17.1: dedicated LSTV val pass status
             try:
                 ddv_enabled, ddv_every = self._resolve_lstv_dedicated_val_settings()
                 ddv_str = f"every {ddv_every} epoch(s)" if ddv_enabled else "DISABLED"
                 log(f"    dedicated LSTV val pass: {ddv_str} "
                     f"(env: SPINESURG_LSTV_DEDICATED_VAL, "
                     f"SPINESURG_LSTV_DEDICATED_VAL_EVERY)")
-                # Show which val cases would be hit (best-effort; some
-                # frameworks don't expose val keys at banner time).
                 if ddv_enabled:
                     result = self._find_underlying_val_loader()
                     if (isinstance(result, tuple)
@@ -1125,16 +1169,14 @@ class _WandBMixin:
                                 if is_callable:
                                     log("    NOTE: keys attr is a method; "
                                         "dedicated pass will run in "
-                                        "pass-through mode (regular val "
-                                        "sampler still produces metrics).")
+                                        "pass-through mode.")
                             else:
                                 log("    LSTV val cases this fold: 0 "
                                     "(dedicated pass will be a no-op)")
                         except Exception as exc:
                             log(f"    val keys probe failed: {exc}")
                     else:
-                        log("    val keys probe: no usable list found "
-                            "(dedicated pass will be a no-op)")
+                        log("    val keys probe: no usable list found")
             except Exception as exc:
                 log(f"    dedicated-val settings resolve failed: {exc}")
 
@@ -1144,17 +1186,13 @@ class _WandBMixin:
                 log("  CE CLASS REWEIGHTING")
                 try:
                     ce_str = ", ".join(
-                        f"{_ANATOMY_NAMES[i-1] if 1 <= i <= 9 else 'bg' if i==0 else f'lab{i}'}"
+                        f"{_ANATOMY_NAMES[i-1] if 1 <= i <= len(_ANATOMY_NAMES) else 'bg' if i==0 else f'lab{i}'}"
                         f"={float(w):.2f}"
                         for i, w in enumerate(ce_w)
                     )
                     log(f"    weights: [{ce_str}]")
                 except Exception:
                     log(f"    weights: {ce_w}")
-            else:
-                log("")
-                log("  CE CLASS REWEIGHTING: not visible at banner time "
-                    "(check the 'CE reweighting: ENABLED' line earlier in log)")
 
             log("")
             log("  WANDB")
@@ -1178,9 +1216,6 @@ class _WandBMixin:
 
     @staticmethod
     def _extract_loader_keys_for_diagnostic(loader) -> Optional[List[str]]:
-        """Best-effort key extraction; returns None if framework
-        internals don't expose a key list. Mirrors the attribute-walk
-        used by `_apply_lstv_sampler`."""
         if loader is None: return None
         for path in (("generator", "_data", "identifiers"),
                       ("generator", "_data", "keys"),
@@ -1203,53 +1238,16 @@ class _WandBMixin:
                     return cand
         return None
 
-    # ── Dedicated LSTV validation pass (v17.1) ───────────────────────────
-    # nnU-Net v2's regular val loop subsamples the val set
-    # (num_val_iterations_per_epoch × batch_size = 100 cases by default,
-    # vs ~190 in a fold's val set). For the dataset's natural ~3% LSTV
-    # base rate, this means many epochs see zero LSTV val cases by luck
-    # of the draw — the per-subgroup metric is silenced when it's
-    # supposed to be the headline. The dedicated pass below runs ONE
-    # extra forward pass on every LSTV case in this fold's val set,
-    # every epoch (configurable via SPINESURG_LSTV_DEDICATED_VAL_EVERY).
-    #
-    # Cost: ~N_lstv_val * batch_size * forward_time. For 8 LSTV cases
-    # and bs=2 on H200 with the 256x320x320 patch, ≈30s per epoch.
-    # Cheaper than bumping num_val_iterations_per_epoch to cover the
-    # full fold (~70s extra) since most of those extra cases are
-    # normals we already have plenty of.
-    #
-    # The dedicated pass REPLACES (not appends to) any LSTV results
-    # the regular sampler may have caught this epoch — clears LSTV
-    # subtype slots in the buffer first, then forward-passes each
-    # LSTV case once. Normal results from the regular sampler are
-    # preserved untouched.
+    # ── Dedicated LSTV validation pass ──────────────────────────────────
 
     _lstv_dedicated_val_enabled: bool = True
 
     def _resolve_lstv_dedicated_val_settings(self) -> Tuple[bool, int]:
-        """Return (enabled, every_n_epochs). Read once per epoch."""
         enabled = _env_truthy("SPINESURG_LSTV_DEDICATED_VAL", default=True)
         every = max(1, _env_int("SPINESURG_LSTV_DEDICATED_VAL_EVERY", 1))
         return enabled, every
 
     def _find_underlying_val_loader(self):
-        """Walk through dataloader_val's wrappers to find the actual
-        sampling list. Returns (underlying_loader, keys_owner,
-        keys_attr_name, is_callable) or (None, None, None, False) if
-        not found.
-
-        v17.2 changes from v17.1:
-          - Prefer ``loader.indices`` and ``loader.list_of_keys`` over
-            ``loader._data.identifiers`` / ``_data.keys``. The former are
-            what nnUNetDataLoader3D actually samples from in
-            ``get_indices()``; modifying them constrains the sampler.
-            Modifying ``_data.identifiers`` after construction may
-            be a no-op if the loader already snapshotted the list.
-          - Returns an extra ``is_callable`` flag so callers know
-            whether ``getattr(keys_owner, keys_attr)`` returns a
-            method (call it) or a value (use directly).
-        """
         loader = getattr(self, "dataloader_val", None)
         if loader is None: return None, None, None, False
         underlying = loader
@@ -1262,17 +1260,10 @@ class _WandBMixin:
         if underlying is None or not hasattr(underlying, "generate_train_batch"):
             return None, None, None, False
 
-        # Try in order: attributes the loader itself uses for sampling
-        # (these are the right place to modify), then the dataset's
-        # identifier list (modify-then-sample only works if the loader
-        # re-reads on each batch — usually not the case, but try as
-        # last resort).
         candidates: List[Tuple[object, str]] = []
-        # Loader-level sample lists (highest priority).
         for ka in ("indices", "list_of_keys", "_indices"):
             if hasattr(underlying, ka):
                 candidates.append((underlying, ka))
-        # Dataset-level identifier lists (lower priority).
         data_attr = getattr(underlying, "_data", None)
         if data_attr is not None:
             for ka in ("identifiers", "keys"):
@@ -1298,20 +1289,12 @@ class _WandBMixin:
         return underlying, None, None, False
 
     def _validate_lstv_dedicated(self) -> None:
-        """Forward-pass every LSTV case in this fold's val set and record
-        per-case dice into _val_subgroup_dice. Called from on_epoch_end
-        AFTER the regular val loop completes and BEFORE per-subgroup
-        aggregation — so the buffer reflects the dedicated-pass results
-        when _aggregate_subgroup_dice runs.
-        """
         if not self._per_subgroup_logging_enabled: return
         enabled, every = self._resolve_lstv_dedicated_val_settings()
         if not enabled: return
 
         epoch = getattr(self, "current_epoch", 0)
         if (epoch % every) != 0:
-            # Skip this epoch — leave whatever the regular sampler
-            # caught (may be n=0; that's the price of skipping).
             return
 
         if self._val_case_to_subtype is None:
@@ -1322,8 +1305,7 @@ class _WandBMixin:
         result = self._find_underlying_val_loader()
         if not isinstance(result, tuple) or len(result) != 4:
             self.print_to_log_file(
-                "LSTV dedicated val: _find_underlying_val_loader returned "
-                "unexpected shape; skipping.")
+                "LSTV dedicated val: unexpected probe shape; skipping.")
             return
         underlying, keys_owner, keys_attr, is_callable = result
         if underlying is None or keys_owner is None:
@@ -1332,9 +1314,6 @@ class _WandBMixin:
                 "skipping (regular val sampler still active).")
             return
 
-        # v17.2: read the keys list, handling both attribute and method
-        # cases. The is_callable flag came from _find_underlying_val_loader
-        # which already validated the read works.
         try:
             raw = getattr(keys_owner, keys_attr)
             if is_callable:
@@ -1345,23 +1324,14 @@ class _WandBMixin:
             self.print_to_log_file(f"LSTV dedicated val: keys read failed: {exc}")
             return
 
-        # Filter val keys to LSTV pool members only
         lstv_subtypes = set(_OVERSAMPLE_SUBTYPES)
         lstv_in_val = [
             k for k in full_keys
             if self._val_case_to_subtype.get(k, _SUBTYPE_NORMAL) in lstv_subtypes
         ]
         if not lstv_in_val:
-            # No LSTV cases in this fold's val set — silently no-op
-            # (no point logging every epoch on folds without LSTV val).
             return
 
-        # If the keys attribute is a method (e.g., dict.keys), we
-        # cannot safely setattr to constrain it to one case — that
-        # would replace the method with a list and break subsequent
-        # callers. Skip the dedicated forward pass and just log a
-        # diagnostic. The normal val sampler still produces metrics
-        # (sub-sampled).
         if is_callable:
             self.print_to_log_file(
                 f"LSTV dedicated val: keys attribute "
@@ -1372,9 +1342,6 @@ class _WandBMixin:
                 f"catch some). Pass-through mode.")
             return
 
-        # Clear LSTV slots — the dedicated pass replaces the regular
-        # sampler's contribution for these subtypes. Normal slot
-        # untouched.
         for sub in lstv_subtypes:
             self._val_subgroup_dice[sub] = []
 
@@ -1385,9 +1352,6 @@ class _WandBMixin:
             return
         device = getattr(self, "device", torch.device("cuda"))
 
-        # For each LSTV case, force the loader to see only that case
-        # then pull one batch — which will be batch_size patches all
-        # cropped from the same case. Forward-pass and record.
         n_attempted = 0
         n_succeeded = 0
         was_training = net.training
@@ -1402,7 +1366,6 @@ class _WandBMixin:
                         continue
                     data = batch["data"]
                     if not isinstance(data, torch.Tensor):
-                        # Numpy → Tensor
                         try: data = torch.as_tensor(data)
                         except Exception: continue
                     if data.device != device:
@@ -1413,8 +1376,6 @@ class _WandBMixin:
                             enabled=True
                         ):
                             output = net(data)
-                    # Force the batch's keys list to this case so the
-                    # per-subgroup logger tags the dice correctly.
                     batch["keys"] = [cid] * (data.shape[0] if data.dim() >= 1 else 1)
                     self._record_per_case_dice(batch, output)
                     n_succeeded += 1
@@ -1424,7 +1385,6 @@ class _WandBMixin:
                             f"LSTV dedicated val: case {cid} failed: {exc}")
                     except Exception: pass
         finally:
-            # Always restore full key list even if something raised
             try:
                 setattr(keys_owner, keys_attr, full_keys)
             except Exception: pass
@@ -1495,13 +1455,11 @@ class _WandBMixin:
             self._phase_end("subtype_map", ok=False, note="no map found")
             return
 
-        # Show oversample-pool composition.
         n_oversample = sum(1 for s in case_to_sub.values()
                             if s in _OVERSAMPLE_SUBTYPES)
         self._phase("subtype_map",
             f"oversample-pool size: {n_oversample} cases "
             f"(eligible subtypes: {sorted(_OVERSAMPLE_SUBTYPES)})")
-        # Show a few example case_ids per subtype for sanity-checking.
         for sub in _KNOWN_SUBTYPES:
             ids_for_sub = [cid for cid, s in case_to_sub.items() if s == sub]
             if ids_for_sub:
@@ -1513,9 +1471,7 @@ class _WandBMixin:
 
     def _reset_subgroup_dice_buffer(self):
         self._val_subgroup_dice = {sub: [] for sub in _KNOWN_SUBTYPES}
-        # v17.4: hallucination tracking buffer, parallel to dice buffer
         self._val_subgroup_voxels = {sub: [] for sub in _KNOWN_SUBTYPES}
-        # v19: bidirectional confusion buffers
         self._val_subgroup_confusion_by_gt = {sub: [] for sub in _KNOWN_SUBTYPES}
         self._val_subgroup_confusion_by_pred = {sub: [] for sub in _KNOWN_SUBTYPES}
 
@@ -1530,11 +1486,6 @@ class _WandBMixin:
             pred_logits = output[0] if isinstance(output, (list, tuple)) else output
             gt = batch.get("target")
             if isinstance(gt, (list, tuple)): gt = gt[0]
-            # Explicit None checks: batch["keys"] / batch["identifier"]
-            # may be numpy arrays, and `arr or fallback` raises
-            # "truth value of an array with more than one element is
-            # ambiguous". The previous chained `or` worked only when
-            # batch.get returned a Python list.
             keys_raw = batch.get("keys")
             if keys_raw is None:
                 keys_raw = batch.get("identifier")
@@ -1553,6 +1504,7 @@ class _WandBMixin:
                 pred_argmax = pred_logits.argmax(dim=1)
             B = pred_argmax.size(0)
             if len(keys) != B: return
+            num_classes = pred_logits.size(1)
             for b in range(B):
                 cid = str(keys[b])
                 cid_lookup = cid[:-5] if cid.endswith("_0000") else cid
@@ -1560,11 +1512,11 @@ class _WandBMixin:
                 pred_b = pred_argmax[b].cpu().to(torch.int16)
                 gt_b   = gt[b].cpu().to(torch.int16)
                 dice_per_cls = _per_case_dice_per_class(pred_b, gt_b)
-                # v17.4: also record voxel counts for hallucination tracking
                 voxels_per_cls = _per_case_voxel_counts_per_class(pred_b, gt_b)
-                # v19: bidirectional confusion vectors
-                confusion_by_gt = _per_case_confusion_by_gt(pred_b, gt_b)
-                confusion_by_pred = _per_case_confusion_by_pred(pred_b, gt_b)
+                confusion_by_gt = _per_case_confusion_by_gt(
+                    pred_b, gt_b, num_classes=num_classes)
+                confusion_by_pred = _per_case_confusion_by_pred(
+                    pred_b, gt_b, num_classes=num_classes)
                 self._val_subgroup_dice.setdefault(subtype, []).append(dice_per_cls)
                 self._val_subgroup_voxels.setdefault(subtype, []).append(voxels_per_cls)
                 if self._val_subgroup_confusion_by_gt is None:
@@ -1578,6 +1530,20 @@ class _WandBMixin:
             except Exception: pass
 
     def _aggregate_subgroup_dice(self) -> Dict[str, float]:
+        """Aggregate per-class dice across val cases per subgroup.
+
+        Emits the standard per-(subgroup, class) dice keys
+        (val/lstv_subgroup/{sub}/dice/{name}) and per-subgroup roll-ups
+        (mean_lumbar, mean_pelvis, mean_fg). Also emits the v20 headline
+        metrics:
+
+          val/headline/last_lumbar_dice_on_lumbarization
+          val/headline/last_lumbar_n_lumbarization_cases
+          val/headline/L4_dice_on_sacr_count
+          val/headline/L4_n_sacr_count_cases
+
+        Then merges in v20 hallucination + confusion payloads.
+        """
         out: Dict[str, float] = {}
         if not self._per_subgroup_logging_enabled or self._val_subgroup_dice is None:
             return out
@@ -1600,14 +1566,33 @@ class _WandBMixin:
             if pelvis_means: out[f"val/lstv_subgroup/{subtype}/mean_pelvis_dice"] = float(np.mean(pelvis_means))
             if fg_means:     out[f"val/lstv_subgroup/{subtype}/mean_fg_dice"] = float(np.mean(fg_means))
 
+        # ── v20 headline: last_lumbar dice on lumbarization ──────────
+        # Replaces the v19 L6_dice_on_lumbarization headline. Under
+        # the merged scheme this should reach ~0.85+ (similar to L4 on
+        # normals) once the class collision is resolved.
         lumb_cases = self._val_subgroup_dice.get(_SUBTYPE_LUMB, [])
         if lumb_cases:
-            l6_idx = _FG_CLASS_IDS.index(_L6_LABEL_ID)
-            l6_vals = [c[l6_idx] for c in lumb_cases if c[l6_idx] is not None]
-            if l6_vals:
-                out["val/headline/L6_dice_on_lumbarization"] = float(np.mean(l6_vals))
-                out["val/headline/L6_n_lumbarization_cases"] = float(len(l6_vals))
+            ll_idx = _FG_CLASS_IDS.index(_LAST_LUMBAR_LABEL_ID)
+            ll_vals = [c[ll_idx] for c in lumb_cases if c[ll_idx] is not None]
+            if ll_vals:
+                out["val/headline/last_lumbar_dice_on_lumbarization"] = float(np.mean(ll_vals))
+                out["val/headline/last_lumbar_n_lumbarization_cases"] = float(len(ll_vals))
 
+        # ── v20 headline: L4 dice on sacr_count ──────────────────────
+        # Symmetric counterpart: on 4-lumbar cases, L4 is the bottom
+        # vertebra. We want this dice to be high. A drop here paired
+        # with predicted-last_lumbar voxels appearing in Block 3 is
+        # the new manifestation of the "bottom-most lumbar is always
+        # last_lumbar" prior.
+        sc_cases = self._val_subgroup_dice.get(_SUBTYPE_SACR_COUNT, [])
+        if sc_cases:
+            l4_idx = _FG_CLASS_IDS.index(_L4_LABEL_ID)
+            l4_vals = [c[l4_idx] for c in sc_cases if c[l4_idx] is not None]
+            if l4_vals:
+                out["val/headline/L4_dice_on_sacr_count"] = float(np.mean(l4_vals))
+                out["val/headline/L4_n_sacr_count_cases"] = float(len(l4_vals))
+
+        # ── any-LSTV roll-up (unchanged) ─────────────────────────────
         lstv_means: List[float] = []
         for sub in (_SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT, _SUBTYPE_SEMI,
                      _SUBTYPE_SACR, _SUBTYPE_AMBIG):
@@ -1627,16 +1612,13 @@ class _WandBMixin:
             out["val/lstv_subgroup/any_sacralization/mean_fg_dice"] = float(np.mean(any_sacr_means))
             out["val/lstv_subgroup/any_sacralization/n_cases"] = float(len(any_sacr_means))
 
-        # v17.4: hallucination metrics (specificity / false-positive
-        # tracking). Merge into the same payload dict.
+        # ── v20 hallucination + confusion ────────────────────────────
         try:
             halluc_payload = self._aggregate_subgroup_hallucination()
             out.update(halluc_payload)
         except Exception as exc:
             try: self.print_to_log_file(f"hallucination aggregation: {exc}")
             except Exception: pass
-        # v19: bidirectional confusion (where GT-class voxels go,
-        # where PRED-class voxels come from)
         try:
             confusion_payload = self._aggregate_subgroup_confusion()
             out.update(confusion_payload)
@@ -1646,224 +1628,90 @@ class _WandBMixin:
         return out
 
     def _aggregate_subgroup_hallucination(self) -> Dict[str, float]:
-        """v17.4: compute specificity and hallucination volume per
-        (subgroup, class) pair from the voxel-count buffer.
+        """v20: Single specificity headline.
 
-        For each subgroup S and each foreground class C, partition cases
-        into "absent" (gt_n == 0) and "present" (gt_n > 0). Then for
-        absent cases compute:
+        Under the merged-label scheme, last_lumbar is the only
+        foreground class GUARANTEED ABSENT in any subtype's GT —
+        specifically, on sacr_count cases (4 lumbar, no last_lumbar).
+        Other LSTV subtypes (sacralization, semisacralization) have
+        last_lumbar present in GT (they have 5 lumbar vertebrae with
+        anomalous lumbosacral morphology, not a missing vertebra).
 
-            n_absent              : how many cases had no voxels of C in GT
-            n_strict_halluc       : of those, how many had pred_n > 0
-            n_meaningful_halluc   : of those, how many had pred_n > THRESHOLD
-            mean_pred_when_absent : mean predicted voxel count over absent
-            max_pred_when_absent  : max predicted voxel count over absent
-            specificity           : 1 - n_meaningful_halluc / n_absent
+        We compute one specificity number — fraction of sacr_count
+        val cases where the model emitted ≤ _HALLUC_VOXEL_THRESHOLD
+        voxels of last_lumbar — and emit it under
+        val/headline/last_lumbar_specificity_on_sacr_count.
 
-        Specificity is the headline number: "given the class is NOT
-        present in this anatomy variant, did the model correctly
-        predict zero voxels (or noise-level voxels) of it?"
-
-        Headline derived metrics (clinically curated):
-            val/headline/L5_specificity_on_sacralization
-            val/headline/L5_specificity_on_sacr_count
-            val/headline/L5_specificity_on_semisacralization
-            val/headline/L6_specificity_on_normal
-            val/headline/L6_specificity_on_sacralization
-            val/headline/L6_specificity_on_semisacralization
-            val/headline/L6_specificity_on_sacr_count
+        Higher is better; 1.0 means no meaningful hallucination of
+        last_lumbar on any sacr_count val case.
         """
         out: Dict[str, float] = {}
         if self._val_subgroup_voxels is None:
             return out
+        cases = self._val_subgroup_voxels.get(_SUBTYPE_SACR_COUNT, [])
+        if not cases:
+            return out
         threshold = _HALLUC_VOXEL_THRESHOLD
-
-        for subtype, cases in self._val_subgroup_voxels.items():
-            if not cases:
-                continue
-            for ci, cls_id in enumerate(_FG_CLASS_IDS):
-                cls_name = _ANATOMY_NAMES[ci]
-                # Pull (gt_n, pred_n) for this class across all cases
-                # in the subgroup.
-                pairs = [c[ci] for c in cases]
-                # Partition by GT presence.
-                absent_preds = [p for (g, p) in pairs if g == 0]
-                present_preds = [(g, p) for (g, p) in pairs if g > 0]
-
-                # Per-class absent/present counts (always emitted; useful
-                # for sanity-checking the partition in W&B).
-                k = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}"
-                out[f"{k}/n_absent"]  = float(len(absent_preds))
-                out[f"{k}/n_present"] = float(len(present_preds))
-
-                if not absent_preds:
-                    # Class is always present in GT for this subgroup —
-                    # no specificity defined. Skip.
-                    continue
-
-                n_strict = sum(1 for p in absent_preds if p > 0)
-                n_meaningful = sum(1 for p in absent_preds if p > threshold)
-                mean_pred = float(np.mean(absent_preds)) if absent_preds else 0.0
-                max_pred = float(max(absent_preds)) if absent_preds else 0.0
-                specificity = 1.0 - (n_meaningful / len(absent_preds))
-
-                out[f"{k}/n_strict_halluc"]      = float(n_strict)
-                out[f"{k}/n_meaningful_halluc"]  = float(n_meaningful)
-                out[f"{k}/mean_pred_when_absent"] = mean_pred
-                out[f"{k}/max_pred_when_absent"]  = max_pred
-                out[f"{k}/specificity"]          = specificity
-
-        # ── Headline metrics: clinically meaningful (subgroup, class)
-        # pairs where the class SHOULD NOT be present in GT. These are
-        # the numbers that go into the paper table.
-        headline_pairs = [
-            ("L5", _SUBTYPE_SACR,        "L5_specificity_on_sacralization"),
-            ("L5", _SUBTYPE_SACR_COUNT,  "L5_specificity_on_sacr_count"),
-            ("L5", _SUBTYPE_SEMI,        "L5_specificity_on_semisacralization"),
-            ("L6", _SUBTYPE_NORMAL,      "L6_specificity_on_normal"),
-            ("L6", _SUBTYPE_SACR,        "L6_specificity_on_sacralization"),
-            ("L6", _SUBTYPE_SEMI,        "L6_specificity_on_semisacralization"),
-            ("L6", _SUBTYPE_SACR_COUNT,  "L6_specificity_on_sacr_count"),
-        ]
-        for cls_name, subtype, headline_key in headline_pairs:
-            spec_key = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}/specificity"
-            n_abs_key = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}/n_absent"
-            mean_key = f"val/lstv_subgroup/{subtype}/halluc/{cls_name}/mean_pred_when_absent"
-            if spec_key in out:
-                out[f"val/headline/{headline_key}"] = out[spec_key]
-                out[f"val/headline/{headline_key}_n_cases"] = out[n_abs_key]
-                out[f"val/headline/{headline_key}_mean_voxels"] = out[mean_key]
+        ll_idx = _FG_CLASS_IDS.index(_LAST_LUMBAR_LABEL_ID)
+        absent_preds = [c[ll_idx][1] for c in cases if c[ll_idx][0] == 0]
+        if not absent_preds:
+            return out
+        n_meaningful = sum(1 for p in absent_preds if p > threshold)
+        specificity = 1.0 - (n_meaningful / len(absent_preds))
+        out["val/headline/last_lumbar_specificity_on_sacr_count"] = specificity
+        out["val/headline/last_lumbar_specificity_on_sacr_count_n_cases"] = float(len(absent_preds))
+        out["val/headline/last_lumbar_specificity_on_sacr_count_mean_pred_voxels"] = (
+            float(np.mean(absent_preds)) if absent_preds else 0.0
+        )
         return out
 
     def _aggregate_subgroup_confusion(self) -> Dict[str, float]:
-        """v19: aggregate bidirectional confusion across cases per subgroup.
+        """v20: focused 3-block confusion output.
 
-        Emits two families of keys per (subgroup, class) pair that has
-        any voxels:
+        Replaces v19's verbose per-(subtype, class, direction) emission
+        (~1000 keys) with three clinically-meaningful headline blocks
+        anchored on L4 / last_lumbar transitions:
 
-          GT-DIRECTION ("where do voxels of this GT class get predicted?"):
-            val/lstv_subgroup/{sub}/conf_by_gt/{gt_name}/total_voxels
-            val/lstv_subgroup/{sub}/conf_by_gt/{gt_name}/as_{pred_name}_frac
-            val/lstv_subgroup/{sub}/conf_by_gt/{gt_name}/as_{pred_name}_voxels
+          last_lumbar_GT_on_lumb       — Block 1, GT-direction
+          L4_GT_on_sacr_count          — Block 2, GT-direction
+          pred_last_lumbar_on_sacr_count — Block 3, PRED-direction
 
-          PRED-DIRECTION ("when the model predicted this class, what
-          was the GT?"):
-            val/lstv_subgroup/{sub}/conf_by_pred/{pred_name}/total_voxels
-            val/lstv_subgroup/{sub}/conf_by_pred/{pred_name}/actually_{gt_name}_frac
-            val/lstv_subgroup/{sub}/conf_by_pred/{pred_name}/actually_{gt_name}_voxels
-
-        Headline keys (the clinically interesting ones for the paper):
-
-          GT-direction on lumb (where do L6 voxels go?):
-            val/headline/L6_GT_predicted_as_{name}_on_lumb
-            val/headline/L6_GT_total_voxels_on_lumb
-
-          PRED-direction on sacr_count (when model says L5 but L5 is
-          absent, what's actually there?):
-            val/headline/predicted_L5_actually_{name}_on_sacr_count
-            val/headline/predicted_L5_total_voxels_on_sacr_count
-
-          PRED-direction on normal (when model hallucinates L6 on a
-          normal patient, what's at that location?):
-            val/headline/predicted_L6_actually_{name}_on_normal
-            val/headline/predicted_L6_total_voxels_on_normal
-
-        Fractions are emitted only for predicted/actual classes with
-        non-zero voxel counts, so the W&B run doesn't explode with 100
-        zero-valued keys per epoch.
+        Each block emits one total-voxels key plus 3-4 fraction keys.
         """
         out: Dict[str, float] = {}
         if (self._val_subgroup_confusion_by_gt is None
                 or self._val_subgroup_confusion_by_pred is None):
             return out
 
-        # ── GT-direction aggregation ──────────────────────────────
-        for subtype, cases in self._val_subgroup_confusion_by_gt.items():
-            if not cases:
-                continue
-            # Sum per-case confusion vectors per GT class
-            summed_by_gt: Dict[int, np.ndarray] = {}
-            for case_dict in cases:
-                for gt_cid, vec in case_dict.items():
-                    if gt_cid not in summed_by_gt:
-                        summed_by_gt[gt_cid] = np.zeros_like(vec, dtype=np.int64)
-                    summed_by_gt[gt_cid] = summed_by_gt[gt_cid] + vec
+        # Block 1: last_lumbar GT on lumb cases
+        _aggregate_block_by_gt(
+            self._val_subgroup_confusion_by_gt,
+            subtype=_SUBTYPE_LUMB,
+            anchor_gt_cid=_LAST_LUMBAR_LABEL_ID,
+            target_specs=_HEADLINE_TARGETS_LL_GT_ON_LUMB,
+            block_id="last_lumbar_GT_on_lumb",
+            out=out,
+        )
 
-            for gt_cid, vec in summed_by_gt.items():
-                gt_name = _class_id_to_name(gt_cid)
-                total = int(vec.sum())
-                if total == 0:
-                    continue
-                base = f"val/lstv_subgroup/{subtype}/conf_by_gt/{gt_name}"
-                out[f"{base}/total_voxels"] = float(total)
-                for pred_cid in range(len(vec)):
-                    n = int(vec[pred_cid])
-                    if n == 0:
-                        continue
-                    pred_name = _class_id_to_name(pred_cid)
-                    out[f"{base}/as_{pred_name}_frac"] = n / total
-                    out[f"{base}/as_{pred_name}_voxels"] = float(n)
+        # Block 2: L4 GT on sacr_count cases
+        _aggregate_block_by_gt(
+            self._val_subgroup_confusion_by_gt,
+            subtype=_SUBTYPE_SACR_COUNT,
+            anchor_gt_cid=_L4_LABEL_ID,
+            target_specs=_HEADLINE_TARGETS_L4_GT_ON_SACR_COUNT,
+            block_id="L4_GT_on_sacr_count",
+            out=out,
+        )
 
-        # ── PRED-direction aggregation ────────────────────────────
-        for subtype, cases in self._val_subgroup_confusion_by_pred.items():
-            if not cases:
-                continue
-            summed_by_pred: Dict[int, np.ndarray] = {}
-            for case_dict in cases:
-                for pred_cid, vec in case_dict.items():
-                    if pred_cid not in summed_by_pred:
-                        summed_by_pred[pred_cid] = np.zeros_like(vec, dtype=np.int64)
-                    summed_by_pred[pred_cid] = summed_by_pred[pred_cid] + vec
-
-            for pred_cid, vec in summed_by_pred.items():
-                pred_name = _class_id_to_name(pred_cid)
-                total = int(vec.sum())
-                if total == 0:
-                    continue
-                base = f"val/lstv_subgroup/{subtype}/conf_by_pred/{pred_name}"
-                out[f"{base}/total_voxels"] = float(total)
-                for gt_cid in range(len(vec)):
-                    n = int(vec[gt_cid])
-                    if n == 0:
-                        continue
-                    gt_name = _class_id_to_name(gt_cid)
-                    out[f"{base}/actually_{gt_name}_frac"] = n / total
-                    out[f"{base}/actually_{gt_name}_voxels"] = float(n)
-
-        # ── Headline: L6 GT-direction on lumbarization ────────────
-        # "Where do my L6 voxels end up being classified?"
-        gt_base_lumb = f"val/lstv_subgroup/{_SUBTYPE_LUMB}/conf_by_gt/L6"
-        total_l6 = out.get(f"{gt_base_lumb}/total_voxels")
-        if total_l6 is not None and total_l6 > 0:
-            out["val/headline/L6_GT_total_voxels_on_lumb"] = total_l6
-            for pred_name in ("background", *_ANATOMY_NAMES):
-                frac_key = f"{gt_base_lumb}/as_{pred_name}_frac"
-                if frac_key in out:
-                    out[f"val/headline/L6_GT_predicted_as_{pred_name}_on_lumb"] = out[frac_key]
-
-        # ── Headline: L5 PRED-direction on sacr_count ────────────
-        # "When the model predicts L5 on a sacr_count case (where L5
-        # should be ABSENT in GT), what is it actually looking at?"
-        pred_base_sc = f"val/lstv_subgroup/{_SUBTYPE_SACR_COUNT}/conf_by_pred/L5"
-        total_pred_l5_sc = out.get(f"{pred_base_sc}/total_voxels")
-        if total_pred_l5_sc is not None and total_pred_l5_sc > 0:
-            out["val/headline/predicted_L5_total_voxels_on_sacr_count"] = total_pred_l5_sc
-            for gt_name in ("background", *_ANATOMY_NAMES):
-                frac_key = f"{pred_base_sc}/actually_{gt_name}_frac"
-                if frac_key in out:
-                    out[f"val/headline/predicted_L5_actually_{gt_name}_on_sacr_count"] = out[frac_key]
-
-        # ── Headline: L6 PRED-direction on normal ────────────────
-        # "When the model predicts L6 on a normal patient (where L6
-        # doesn't exist anatomically), what's actually there?"
-        pred_base_n = f"val/lstv_subgroup/{_SUBTYPE_NORMAL}/conf_by_pred/L6"
-        total_pred_l6_n = out.get(f"{pred_base_n}/total_voxels")
-        if total_pred_l6_n is not None and total_pred_l6_n > 0:
-            out["val/headline/predicted_L6_total_voxels_on_normal"] = total_pred_l6_n
-            for gt_name in ("background", *_ANATOMY_NAMES):
-                frac_key = f"{pred_base_n}/actually_{gt_name}_frac"
-                if frac_key in out:
-                    out[f"val/headline/predicted_L6_actually_{gt_name}_on_normal"] = out[frac_key]
+        # Block 3: predicted last_lumbar on sacr_count cases
+        _aggregate_block_by_pred(
+            self._val_subgroup_confusion_by_pred,
+            subtype=_SUBTYPE_SACR_COUNT,
+            anchor_pred_cid=_LAST_LUMBAR_LABEL_ID,
+            target_specs=_HEADLINE_TARGETS_PRED_LL_ON_SACR_COUNT,
+            block_id="pred_last_lumbar_on_sacr_count",
+            out=out,
+        )
 
         return out
 
@@ -1891,133 +1739,99 @@ class _WandBMixin:
                     v = payload.get(f"val/lstv_subgroup/{sub}/dice/{cn}")
                     cls_parts.append(f"{cn}={v:.2f}" if v is not None else f"{cn}=---")
                 self.print_to_log_file(f"  {sub} per-class: [{', '.join(cls_parts)}]")
-            l6 = payload.get("val/headline/L6_dice_on_lumbarization")
-            l6n = payload.get("val/headline/L6_n_lumbarization_cases")
-            if l6 is not None and l6n is not None:
-                self.print_to_log_file(
-                    f"  HEADLINE: L6 dice on lumbarization cases = {l6:.3f}  (n={int(l6n)})")
 
-            # v17.4: hallucination headline lines. Specificity = fraction
-            # of cases where class is absent in GT and model correctly
-            # predicted ≤ 100 voxels of it (clinically: noise floor).
-            # Higher is better; 1.0 = no hallucination.
+            # ── v20 headline metrics ──────────────────────────────────
+            ll_dice = payload.get("val/headline/last_lumbar_dice_on_lumbarization")
+            ll_n    = payload.get("val/headline/last_lumbar_n_lumbarization_cases")
+            if ll_dice is not None and ll_n is not None:
+                self.print_to_log_file(
+                    f"  HEADLINE: last_lumbar dice on lumbarization cases "
+                    f"= {ll_dice:.3f}  (n={int(ll_n)})")
+            l4_dice = payload.get("val/headline/L4_dice_on_sacr_count")
+            l4_n    = payload.get("val/headline/L4_n_sacr_count_cases")
+            if l4_dice is not None and l4_n is not None:
+                self.print_to_log_file(
+                    f"  HEADLINE: L4 dice on sacr_count cases "
+                    f"= {l4_dice:.3f}  (n={int(l4_n)})")
+
+            # ── v20 specificity headline ──────────────────────────────
+            spec = payload.get("val/headline/last_lumbar_specificity_on_sacr_count")
+            spec_n = payload.get("val/headline/last_lumbar_specificity_on_sacr_count_n_cases")
+            spec_mean = payload.get("val/headline/last_lumbar_specificity_on_sacr_count_mean_pred_voxels")
+            if spec is not None and spec_n is not None:
+                mean_str = (f", mean_pred={spec_mean:.0f} voxels"
+                            if spec_mean is not None else "")
+                self.print_to_log_file(
+                    f"  HEADLINE: last_lumbar specificity on sacr_count "
+                    f"= {spec:.3f}  (n_absent={int(spec_n)}{mean_str})  "
+                    f"[higher is better; 1.0 = no hallucination]")
+
+            # ── v20 confusion blocks (3 focused) ──────────────────────
             self.print_to_log_file(
-                f"  --- v17.4 hallucination (specificity = fraction of "
-                f"absent-cases with pred ≤ 100 voxels) ---")
-            halluc_headlines = [
-                ("L5_specificity_on_sacralization",       "L5 on sacralization     "),
-                ("L5_specificity_on_sacr_count",          "L5 on sacr_count        "),
-                ("L5_specificity_on_semisacralization",   "L5 on semisacralization "),
-                ("L6_specificity_on_normal",              "L6 on normal            "),
-                ("L6_specificity_on_sacralization",       "L6 on sacralization     "),
-                ("L6_specificity_on_semisacralization",   "L6 on semisacralization "),
-                ("L6_specificity_on_sacr_count",          "L6 on sacr_count        "),
-            ]
-            any_halluc_line = False
-            for key, label in halluc_headlines:
-                spec = payload.get(f"val/headline/{key}")
-                n = payload.get(f"val/headline/{key}_n_cases")
-                mean_vox = payload.get(f"val/headline/{key}_mean_voxels")
-                if spec is None or n is None or int(n) == 0:
-                    continue
-                any_halluc_line = True
-                mean_str = (f", mean_pred={mean_vox:.0f} voxels"
-                            if mean_vox is not None else "")
-                self.print_to_log_file(
-                    f"    {label} specificity={spec:.3f}  "
-                    f"(n_absent={int(n)}{mean_str})")
-            if not any_halluc_line:
-                self.print_to_log_file("    (no eligible (subgroup, class) pairs this epoch)")
-
-            # v19: bidirectional confusion blocks. Show the three
-            # clinically headline (subgroup, class) pairs in both
-            # directions. Each block lists predicted-class fractions
-            # >= 1% so noise-level entries don't clutter the log.
-            self.print_to_log_file(
-                "  --- v19 confusion (where misclassifications go / come from) ---"
+                "  --- v20 confusion blocks (L4 / last_lumbar focus) ---")
+            self._print_confusion_block(
+                payload,
+                block_id="last_lumbar_GT_on_lumb",
+                header="    last_lumbar GT-voxels on lumb cases "
+                       "(total={total}, where do they end up classified?):",
+                target_specs=_HEADLINE_TARGETS_LL_GT_ON_LUMB,
+                empty_msg="    last_lumbar GT-voxels on lumb cases: "
+                          "(no lumb cases this epoch)",
             )
-
-            def _print_distribution(header_line, total_key, frac_key_template):
-                """Helper: print a header and the > 1% fraction lines for a
-                given headline distribution. Returns True if anything was
-                printed."""
-                total = payload.get(total_key)
-                if total is None or int(total) == 0:
-                    return False
-                self.print_to_log_file(header_line.format(total=int(total)))
-                printed_any = False
-                for cls_name in ("background", *_ANATOMY_NAMES):
-                    frac = payload.get(frac_key_template.format(name=cls_name))
-                    if frac is None:
-                        continue
-                    if frac < 0.01:
-                        continue
-                    self.print_to_log_file(
-                        f"      {cls_name:<12s}: {frac*100:5.1f}%"
-                    )
-                    printed_any = True
-                if not printed_any:
-                    self.print_to_log_file("      (all predicted classes < 1%)")
-                return True
-
-            # Block 1: GT-direction on lumb. "Where do L6 GT voxels end up?"
-            shown = _print_distribution(
-                header_line="    L6 GT-voxels on lumb cases (total={total}, "
-                            "where do they end up classified?):",
-                total_key="val/headline/L6_GT_total_voxels_on_lumb",
-                frac_key_template="val/headline/L6_GT_predicted_as_{name}_on_lumb",
+            self._print_confusion_block(
+                payload,
+                block_id="L4_GT_on_sacr_count",
+                header="    L4 GT-voxels on sacr_count cases "
+                       "(total={total}, where do they end up classified?):",
+                target_specs=_HEADLINE_TARGETS_L4_GT_ON_SACR_COUNT,
+                empty_msg="    L4 GT-voxels on sacr_count cases: "
+                          "(no sacr_count cases this epoch)",
             )
-            if not shown:
-                self.print_to_log_file(
-                    "    L6 GT-voxels on lumb cases: (no lumb cases this epoch)"
-                )
-
-            # Block 2: PRED-direction on sacr_count. "When model says L5
-            # on a sacr_count case (where L5 should be missing), what's
-            # actually there?"
-            shown = _print_distribution(
-                header_line="    Predicted-L5 voxels on sacr_count cases "
-                            "(total={total}, what's actually there in GT?):",
-                total_key="val/headline/predicted_L5_total_voxels_on_sacr_count",
-                frac_key_template="val/headline/predicted_L5_actually_{name}_on_sacr_count",
+            self._print_confusion_block(
+                payload,
+                block_id="pred_last_lumbar_on_sacr_count",
+                header="    Predicted-last_lumbar voxels on sacr_count cases "
+                       "(total={total}, what's actually there in GT?):",
+                target_specs=_HEADLINE_TARGETS_PRED_LL_ON_SACR_COUNT,
+                empty_msg="    Predicted-last_lumbar voxels on sacr_count cases: "
+                          "(no sacr_count cases this epoch, or model "
+                          "predicted no last_lumbar there — good)",
             )
-            if not shown:
-                self.print_to_log_file(
-                    "    Predicted-L5 voxels on sacr_count cases: "
-                    "(no sacr_count cases this epoch, or model predicted no L5 there)"
-                )
-
-            # Block 3: PRED-direction on normal. "When model hallucinates
-            # L6 on a normal patient, what's at that location?"
-            shown = _print_distribution(
-                header_line="    Predicted-L6 voxels on normal cases "
-                            "(total={total}, what's actually there in GT?):",
-                total_key="val/headline/predicted_L6_total_voxels_on_normal",
-                frac_key_template="val/headline/predicted_L6_actually_{name}_on_normal",
-            )
-            if not shown:
-                self.print_to_log_file(
-                    "    Predicted-L6 voxels on normal cases: "
-                    "(model predicted no L6 on normals — good)"
-                )
         except Exception as exc:
             try: self.print_to_log_file(f"per-subgroup summary failed: {exc}")
             except Exception: pass
 
-    # ── v19.1: cross-process bias counter reporting ───────────────────────
+    def _print_confusion_block(self, payload: Dict[str, float],
+                                block_id: str, header: str,
+                                target_specs: Tuple, empty_msg: str) -> None:
+        """Print one v20 confusion headline block. If the block has no
+        total voxels (no eligible cases this epoch), print the
+        empty_msg fallback line.
+        """
+        total = payload.get(f"val/headline/{block_id}/total_voxels")
+        if total is None or int(total) == 0:
+            self.print_to_log_file(empty_msg)
+            return
+        self.print_to_log_file(header.format(total=int(total)))
+        for name, _target_cid, leaf, rationale in target_specs:
+            frac = payload.get(f"val/headline/{block_id}/{leaf}")
+            if frac is None:
+                continue
+            # Marker visually distinguishes "good" from "concerning" lines.
+            marker = "✓" if "good" in rationale.lower() else " "
+            self.print_to_log_file(
+                f"      {marker} {name:<12s}: {frac*100:5.1f}%   ({rationale})"
+            )
+
+    # ── v19.1: cross-process bias counter reporting (kept; quiet under v20) ──
 
     def _collect_bias_counter_payload(self, epoch: int) -> Dict[str, float]:
         """Read shared bias counters, diff against epoch-start snapshot,
-        emit per-epoch + cumulative numbers as a W&B payload dict, and
-        print a one-block summary to the SLURM log.
+        emit per-epoch + cumulative numbers as a W&B payload dict.
 
-        Counters are populated from worker processes via shared memory
-        in lstv_biased_dataloader. If the read returns nothing (e.g.
-        the bias loader isn't installed, or shared counters failed at
-        import time), this method silently returns an empty dict —
-        callers should not crash when bias logging is unavailable.
-
-        Returns the W&B payload dict (caller .update()s payload with it).
+        Under v20 (bias disabled), counters typically stay at 0 and
+        this method is a near-no-op. Kept for parity with legacy runs
+        and to support optional re-enabling on legacy datasets.
         """
         out: Dict[str, float] = {}
         if _read_shared_bias_counters is None:
@@ -2033,60 +1847,45 @@ class _WandBMixin:
 
         start = self._bias_counters_at_epoch_start or {}
 
-        # Per-epoch deltas
         n_fg_e = now.get("n_force_fg", 0) - start.get("n_force_fg", 0)
         n_l6_e = now.get("n_l6_returned", 0) - start.get("n_l6_returned", 0)
         n_sac_e = now.get("n_sacrum_returned", 0) - start.get("n_sacrum_returned", 0)
         n_uf_e = now.get("n_uniform_fallback", 0) - start.get("n_uniform_fallback", 0)
 
-        out["patch_bias/this_epoch/n_force_fg"]         = float(n_fg_e)
-        out["patch_bias/this_epoch/n_l6_returned"]      = float(n_l6_e)
-        out["patch_bias/this_epoch/n_sacrum_returned"]  = float(n_sac_e)
-        out["patch_bias/this_epoch/n_uniform_fallback"] = float(n_uf_e)
+        # Only emit per-epoch keys if the bias loader actually fired.
+        # On v20 (bias disabled) the values stay at 0 and we suppress
+        # the keys to keep the W&B run tidy.
+        if n_fg_e > 0 or n_l6_e > 0 or n_sac_e > 0 or n_uf_e > 0:
+            out["patch_bias/this_epoch/n_force_fg"]         = float(n_fg_e)
+            out["patch_bias/this_epoch/n_l6_returned"]      = float(n_l6_e)
+            out["patch_bias/this_epoch/n_sacrum_returned"]  = float(n_sac_e)
+            out["patch_bias/this_epoch/n_uniform_fallback"] = float(n_uf_e)
+            if n_fg_e > 0:
+                out["patch_bias/this_epoch/l6_rate"] = n_l6_e / n_fg_e
+                out["patch_bias/this_epoch/sacrum_rate"] = n_sac_e / n_fg_e
+                out["patch_bias/this_epoch/uniform_fallback_rate"] = n_uf_e / n_fg_e
+            out["patch_bias/cumulative/n_force_fg"]         = float(now.get("n_force_fg", 0))
+            out["patch_bias/cumulative/n_l6_returned"]      = float(now.get("n_l6_returned", 0))
+            out["patch_bias/cumulative/n_sacrum_returned"]  = float(now.get("n_sacrum_returned", 0))
+            out["patch_bias/cumulative/n_uniform_fallback"] = float(now.get("n_uniform_fallback", 0))
 
-        # Per-epoch rates (only meaningful if force_fg fired at all
-        # this epoch; otherwise the denominator is zero).
-        if n_fg_e > 0:
-            out["patch_bias/this_epoch/l6_rate"] = n_l6_e / n_fg_e
-            out["patch_bias/this_epoch/sacrum_rate"] = n_sac_e / n_fg_e
-            out["patch_bias/this_epoch/uniform_fallback_rate"] = n_uf_e / n_fg_e
-
-        # Cumulative numbers
-        out["patch_bias/cumulative/n_force_fg"]         = float(now.get("n_force_fg", 0))
-        out["patch_bias/cumulative/n_l6_returned"]      = float(now.get("n_l6_returned", 0))
-        out["patch_bias/cumulative/n_sacrum_returned"]  = float(now.get("n_sacrum_returned", 0))
-        out["patch_bias/cumulative/n_uniform_fallback"] = float(now.get("n_uniform_fallback", 0))
-
-        # Print a compact summary block to SLURM log. Same conventions
-        # as the other per-epoch summaries.
-        try:
-            self.print_to_log_file(
-                f"--- v19.1 patch bias activity (epoch {epoch}) ---"
-            )
-            if n_fg_e == 0:
+            try:
                 self.print_to_log_file(
-                    "  this epoch: force_fg=0 (no force-foreground patches "
-                    "served — check that bias is enabled and oversample mixin ran)"
+                    f"--- patch bias activity (epoch {epoch}) ---"
                 )
-            else:
                 self.print_to_log_file(
                     f"  this epoch: force_fg={n_fg_e}, "
                     f"L6 forces={n_l6_e}, sacrum forces={n_sac_e}, "
                     f"uniform fallback={n_uf_e}"
                 )
-                self.print_to_log_file(
-                    f"  rates: L6={(n_l6_e/n_fg_e)*100:.2f}%, "
-                    f"sacrum={(n_sac_e/n_fg_e)*100:.2f}%, "
-                    f"no-bias={(n_uf_e/n_fg_e)*100:.2f}%"
-                )
-            self.print_to_log_file(
-                f"  cumulative since training start: "
-                f"force_fg={int(now.get('n_force_fg', 0))}, "
-                f"L6={int(now.get('n_l6_returned', 0))}, "
-                f"sacrum={int(now.get('n_sacrum_returned', 0))}"
-            )
-        except Exception:
-            pass
+                if n_fg_e > 0:
+                    self.print_to_log_file(
+                        f"  rates: L6={(n_l6_e/n_fg_e)*100:.2f}%, "
+                        f"sacrum={(n_sac_e/n_fg_e)*100:.2f}%, "
+                        f"no-bias={(n_uf_e/n_fg_e)*100:.2f}%"
+                    )
+            except Exception:
+                pass
 
         return out
 
@@ -2154,17 +1953,16 @@ class _WandBMixin:
             run_name = os.environ.get("WANDB_RUN_NAME") or self.__class__.__name__
         config = {
             "trainer": self.__class__.__name__,
-            "anatomy_mapping": dict(enumerate(_ANATOMY_NAMES)),
+            "trainer_version": "v20",
+            "label_scheme": "merged_last_lumbar",
+            "anatomy_mapping": dict(enumerate(_ANATOMY_NAMES, start=1)),
+            "ignore_label": _IGNORE_LABEL,
             "subgroup_taxonomy": "6-way",
             "subgroups": list(_KNOWN_SUBTYPES),
             "oversample_subtypes": list(_OVERSAMPLE_SUBTYPES),
             "ce_reweight": _env_truthy("SPINESURG_CE_REWEIGHT", default=True),
             "lstv_oversample_frac": _env_float("LSTV_OVERSAMPLE_FRAC", 0.25),
-            # v18: patch bias config recorded so W&B runs are
-            # comparable across different bias settings.
-            "patch_bias_enabled": _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=True),
-            "patch_bias_l6_prob": _env_float("SPINESURG_LSTV_BIAS_L6_PROB", 0.60),
-            "patch_bias_sacrum_prob": _env_float("SPINESURG_LSTV_BIAS_SACRUM_PROB", 0.50),
+            "patch_bias_enabled": _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=False),
             "patch_bias_loader_available": _LSTV_BIASED_LOADER_AVAILABLE,
         }
         for attr, getter in [
@@ -2242,7 +2040,6 @@ class _WandBMixin:
 
         try: _install_nnunet_warning_filter()
         except Exception: pass
-        # _maybe_load_subtype_map already ran above; second call is a no-op.
         try: self._maybe_apply_ce_reweighting()
         except Exception as exc: self.print_to_log_file(f"CE reweight: {exc}")
         try: self._install_log_intercepts()
@@ -2253,17 +2050,13 @@ class _WandBMixin:
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
         self._reset_subgroup_dice_buffer()
-        # v19.1: snapshot cross-process bias counters at epoch start so
-        # we can diff at epoch end and report per-epoch counts. The
-        # counters themselves live in lstv_biased_dataloader and are
-        # cumulative across the training run.
         if _read_shared_bias_counters is not None:
             try:
                 self._bias_counters_at_epoch_start = _read_shared_bias_counters()
             except Exception as exc:
                 self._bias_counters_at_epoch_start = {}
                 try: self.print_to_log_file(
-                    f"v19.1 bias counter snapshot at epoch start: {exc}")
+                    f"bias counter snapshot at epoch start: {exc}")
                 except Exception: pass
 
     def on_epoch_end(self):
@@ -2287,6 +2080,10 @@ class _WandBMixin:
             dpc = last("dice_per_class_or_region")
             lumbar_v, pelvis_v, fg_v = [], [], []
             if dpc is not None:
+                # nnU-Net's dice_per_class_or_region is a vector of
+                # length num_fg_classes (excluding background). For
+                # Dataset803 this has 8 entries corresponding to
+                # _FG_CLASS_IDS in order.
                 for i, v in enumerate(dpc):
                     if i >= len(_ANATOMY_NAMES): continue
                     try: vf = float(v)
@@ -2294,7 +2091,13 @@ class _WandBMixin:
                     if np.isnan(vf): continue
                     per_class_log[f"val/dice/{_ANATOMY_NAMES[i]}"] = vf
                     fg_v.append(vf)
-                    (lumbar_v if i < 6 else pelvis_v).append(vf)
+                    # _FG_CLASS_IDS[i] determines whether this index
+                    # is lumbar (1-5) or pelvis (6-8).
+                    cls_id = _FG_CLASS_IDS[i] if i < len(_FG_CLASS_IDS) else None
+                    if cls_id in _LUMBAR_IDS:
+                        lumbar_v.append(vf)
+                    elif cls_id in _PELVIS_IDS:
+                        pelvis_v.append(vf)
                 if lumbar_v: per_class_log["val/dice/mean_lumbar"] = float(np.mean(lumbar_v))
                 if pelvis_v: per_class_log["val/dice/mean_pelvis"] = float(np.mean(pelvis_v))
                 if fg_v: per_class_log["val/dice/mean_foreground_nanmasked"] = float(np.mean(fg_v))
@@ -2309,11 +2112,6 @@ class _WandBMixin:
                 **per_class_log,
             }
             try:
-                # v17.1: dedicated LSTV val pass — forward-pass every
-                # LSTV case in this fold's val set so the per-subgroup
-                # metric is deterministic instead of subsampling-noisy.
-                # Must run BEFORE _aggregate_subgroup_dice so the
-                # buffer reflects dedicated-pass results.
                 self._validate_lstv_dedicated()
             except Exception as exc:
                 self.print_to_log_file(f"LSTV dedicated val: {exc}")
@@ -2323,13 +2121,11 @@ class _WandBMixin:
                 self._print_per_subgroup_summary(epoch, sg)
             except Exception as exc:
                 self.print_to_log_file(f"subgroup aggregation: {exc}")
-            # v19.1: read shared bias counters, diff vs epoch-start
-            # snapshot, log per-epoch and cumulative numbers.
             try:
                 bias_payload = self._collect_bias_counter_payload(epoch)
                 payload.update(bias_payload)
             except Exception as exc:
-                self.print_to_log_file(f"v19.1 bias counter logging: {exc}")
+                self.print_to_log_file(f"bias counter logging: {exc}")
             self._log_wandb(payload, step=epoch)
         except Exception as exc:
             self.print_to_log_file(f"on_epoch_end: {exc}")
@@ -2375,32 +2171,25 @@ def _as_float(x):
 
 
 # =============================================================================
-# LSTV oversampling mixin (queue-level, 6-way) + v18 patch-bias install
+# LSTV oversampling mixin (queue-level, 6-way)
 # =============================================================================
 
 class _LSTVOversampleMixin:
-    """Oversample all 5 LSTV variant subtypes at the dataloader queue level,
-    AND substitute LSTVBiasedDataLoader3D for nnU-Net's default loader so
-    force_fg patches on lumb / sacr_count cases bias toward the headline
-    anatomy (L6 / sacrum respectively).
+    """Oversample all 5 LSTV variant subtypes at the dataloader queue level.
 
-    Pool composition (5 of 6 subtypes; 'normal' is the majority and
-    by definition not oversampled):
-      - lumb              (lumbarization, L6 present)
+    v20: The patch-class biasing layer (LSTVBiasedDataLoader3D) is
+    bypassed by default because under merged labels there is no L6
+    class to bias toward. The case-level oversampling that this mixin
+    performs at queue level is unchanged and remains the primary lever
+    for ensuring the model sees rare LSTV anatomy proportionally more
+    often during training.
+
+    Pool composition (5 of 6 subtypes; 'normal' is the majority):
+      - lumb              (lumbarization, 6-lumbar count)
       - sacr_count        (sacralization with full L5->sacrum count change)
       - sacralization     (sacral-wing morphology, count unchanged)
       - semisacralization (unilateral sacral-wing fusion)
       - ambiguous         (uncertain Castellvi classification)
-
-    Rationale: every non-normal LSTV variant deserves more training
-    exposure than its natural frequency. ambiguous and semisacralization
-    are rare (n<5 each) — they can only be over-represented through
-    duplication, which is acceptable given the alternative (the model
-    rarely sees them at all during training).
-
-    v18: get_dataloaders is overridden to substitute the biased loader
-    class. This replaces the v15-v17.x np.random.choice monkey-patch
-    that never fired in worker processes.
     """
     _lstv_case_ids: Optional[Set[str]] = None
     _lstv_subtype_counts: Optional[Counter] = None
@@ -2452,27 +2241,12 @@ class _LSTVOversampleMixin:
                     f"using {len(pool_set)} for oversampling")
                 return pool_set
 
-        self.print_to_log_file("LSTV oversample: falling back to L6 scan (lumb-only)")
-        labels_dir = self._lstv_labels_dir_for_legacy_scan()
-        if labels_dir is None:
-            self._lstv_case_ids = set()
-            return self._lstv_case_ids
-        ids = _scan_lstv_case_ids_by_l6_voxels(labels_dir)
-        self._lstv_case_ids = ids
-        self._lstv_subtype_counts = Counter({"lumb_l6scan": len(ids)})
-        self._lstv_detection_source = f"l6scan:{labels_dir}"
-        return ids
-
-    def _lstv_labels_dir_for_legacy_scan(self):
-        override = os.environ.get("LSTV_LABELS_DIR", "").strip()
-        if override: return override
-        raw = os.environ.get("nnUNet_raw") or os.environ.get("nnUNet_raw_data_base")
-        if raw:
-            try:
-                cand = join(raw, self.plans_manager.dataset_name, "labelsTr")
-                if isdir(cand): return cand
-            except Exception: pass
-        return None
+        self.print_to_log_file(
+            "LSTV oversample: legacy fallback path inactive under v20 "
+            "(last_lumbar scan returns all cases). Ensure lstv_cases.json "
+            "or HF manifest is present for the dataset.")
+        self._lstv_case_ids = set()
+        return self._lstv_case_ids
 
     def _apply_lstv_sampler(self):
         try: frac = float(os.environ.get("LSTV_OVERSAMPLE_FRAC", "0.25"))
@@ -2536,49 +2310,26 @@ class _LSTVOversampleMixin:
         if avg_dup > 25:
             self.print_to_log_file(f"LSTV oversample: WARNING avg_dup={avg_dup:.0f}x -> overfitting risk")
 
-    # ── v18: substitute the biased loader class via get_dataloaders ──────
-
     def get_dataloaders(self):
-        """v18: substitute LSTVBiasedDataLoader3D for nnU-Net's default
-        nnUNetDataLoader3D so that force_fg patches on lumb / sacr_count
-        cases bias toward the headline anatomy (L6 / sacrum).
+        """v20: bias substitution is OFF by default.
 
-        nnU-Net's nnUNetTrainer.get_dataloaders builds dataloaders by
-        instantiating nnUNetDataLoader3D as referenced in the trainer
-        module's namespace. To swap our subclass in, we rebind that
-        symbol for the duration of super().get_dataloaders() and
-        restore it after. This survives fork/spawn cleanly because
-        workers fork AFTER the substitution and pickle the substituted
-        class.
-
-        Disable via SPINESURG_LSTV_BIAS_ENABLED=0 — the substitution
-        is skipped and nnU-Net's default uniform foreground sampling
-        is used. The biased loader itself also reads the env var, so
-        even if substitution happens but bias_enabled=False, the
-        loader behaves identically to the parent.
+        Under merged labels, the LSTVBiasedDataLoader3D's L6-detection
+        logic is meaningless (no L6 voxels exist in the dataset). Set
+        SPINESURG_LSTV_BIAS_ENABLED=1 only if running on a legacy
+        unmerged dataset; otherwise the default-off path produces
+        nnU-Net's standard uniform foreground sampling.
         """
-        bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=True)
+        bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=False)
 
-        # Short-circuit: bias disabled OR loader class missing -> no swap
         if not bias_enabled:
-            self.print_to_log_file(
-                "LSTV patch bias: disabled via SPINESURG_LSTV_BIAS_ENABLED=0; "
-                "using nnU-Net default loader.")
             return super().get_dataloaders()
 
         if not _LSTV_BIASED_LOADER_AVAILABLE:
             self.print_to_log_file(
                 f"LSTV patch bias: LSTVBiasedDataLoader3D not importable "
-                f"({_LSTV_LOADER_IMPORT_ERROR}); using nnU-Net default loader. "
-                f"Install lstv_biased_dataloader.py alongside this trainer "
-                f"to enable bias.")
+                f"({_LSTV_LOADER_IMPORT_ERROR}); using nnU-Net default loader.")
             return super().get_dataloaders()
 
-        # Locate the trainer module (where nnUNetDataLoader3D is imported)
-        # so we can rebind that symbol. nnU-Net's nnUNetTrainer.get_dataloaders
-        # uses an unqualified `nnUNetDataLoader3D(...)` call which Python
-        # resolves at runtime against the module's globals, so rebinding
-        # in the module namespace is sufficient.
         try:
             import nnunetv2.training.nnUNetTrainer.nnUNetTrainer as _trainer_mod
         except ImportError as exc:
@@ -2591,8 +2342,7 @@ class _LSTVOversampleMixin:
         if original_3d is None:
             self.print_to_log_file(
                 "LSTV patch bias: nnUNetDataLoader3D symbol not found in "
-                "trainer module; using nnU-Net default loader. "
-                "(This indicates a nnU-Net layout change incompatible with v18.)")
+                "trainer module; using nnU-Net default loader.")
             return super().get_dataloaders()
 
         l6_p = _env_float("SPINESURG_LSTV_BIAS_L6_PROB", 0.60)
@@ -2600,7 +2350,9 @@ class _LSTVOversampleMixin:
         self.print_to_log_file(
             f"LSTV patch bias: substituting nnUNetDataLoader3D -> "
             f"LSTVBiasedDataLoader3D for get_dataloaders() "
-            f"(L6 prob={l6_p:.2f}, sacrum prob={sac_p:.2f})")
+            f"(L6 prob={l6_p:.2f}, sacrum prob={sac_p:.2f})  "
+            f"[NOTE: under v20 merged labels, the loader's "
+            f"L6-detection is no-op; bias has no effect on Dataset803]")
 
         _trainer_mod.nnUNetDataLoader3D = LSTVBiasedDataLoader3D
         try:
@@ -2612,13 +2364,6 @@ class _LSTVOversampleMixin:
         super().on_train_start()
         try: self._apply_lstv_sampler()
         except Exception as exc: self.print_to_log_file(f"LSTV oversample: {exc}")
-        # Banner runs LAST so it captures post-sampler pool composition
-        # AND can verify the train loader's class is LSTVBiasedDataLoader3D.
-        # super().on_train_start() above ran _WandBMixin's setup
-        # (subtype map, CE reweight, get_dataloaders [which our override
-        # intercepted to swap the loader class], W&B init);
-        # _apply_lstv_sampler then duplicated keys to hit the target
-        # frac. Now dump everything as one grep-able block.
         try: self._emit_startup_diagnostics()
         except Exception as exc:
             self.print_to_log_file(f"startup diagnostics: {exc}")
@@ -2661,38 +2406,25 @@ class nnUNetTrainerWandB_1000ep_500iter(_WandBMixin, nnUNetTrainer):
 class nnUNetTrainerWandB_500ep_LSTVOversample(
     _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
 ):
-    """500 epochs + LSTV queue oversample + class-override patch bias
-    + CE reweight. DEFAULT for the SpineSurg-CT paper run.
+    """500 epochs + LSTV queue oversample + CE reweight.
+    DEFAULT for the SpineSurg-CT paper run.
 
-    v18 (May 2026): Patch class biasing now via LSTVBiasedDataLoader3D
-         subclass, not np.random.choice monkey-patching. The previous
-         monkey-patch never fired in worker processes (verified
-         bias_call_count=0 across 64 epochs of fold 4 in production
-         job 35993148, and in every prior production run). v18's class
-         override is testable end-to-end (see
-         tests/test_lstv_biased_dataloader.py) and verifiably active
-         at training time (see PATCH BIAS section in startup
-         diagnostics banner).
-    v17.4: Hallucination metrics (specificity tracking on absent classes).
-    v17.1-v17.3: Dedicated LSTV val pass — forces forward pass on every
-         LSTV case in this fold's val set every epoch, regardless of
-         whether the regular val sampler caught them in its
-         num_val_iterations subsample. Eliminates n=0 LSTV val epochs
-         that silenced the headline metric.
-    v17: Oversample pool now includes all 5 LSTV variants (added
-         ambiguous, n=4). Symmetric per-record subtype refinement at
-         convert time: spine_only demotes pelvis-region subtypes
-         (sacralization, semisacralization), pelvic_native demotes
-         lumbar-region subtypes (lumb, sacr_count). Verbose
-         startup-diagnostic banner emitted via
-         _emit_startup_diagnostics.
-    v15-v16: Multiple attempts to make the np.random.choice monkey-patch
-         fire at the right call site. Superseded by v18.
-    v12: Per-subgroup dice logger no longer crashes on numpy keys array
-         (was using truthy fallback chain that numpy rejects).
-    v11: CE weight tensor sized to actual network output (was 11; should
-         be num_segmentation_heads, typically 10 for our schema).
-    v10: 6-way subgroups; semisacralization separated from sacralization.
+    v20 (May 2026): Merged last_lumbar at the dataset level (Dataset803);
+         class collision at the L5/L6 boundary eliminated by training
+         against a single merged class. Patch class biasing
+         (SPINESURG_LSTV_BIAS_ENABLED) defaults to OFF — the bias
+         loader's L6 detection is meaningless under merged labels.
+         Confusion W&B output reduced from ~1000 keys/epoch to ~14
+         (three focused headline blocks: last_lumbar GT on lumb,
+         L4 GT on sacr_count, predicted last_lumbar on sacr_count).
+    v18: Patch class biasing via LSTVBiasedDataLoader3D.
+    v17.4: Hallucination metrics.
+    v17.1-v17.3: Dedicated LSTV val pass.
+    v17: 6-way oversample pool; symmetric subtype refinement.
+    v15-v16: monkey-patch attempts (superseded).
+    v12: Per-subgroup dice numpy-keys fix.
+    v11: CE weight tensor sized to actual network output.
+    v10: 6-way subgroups.
     """
     def __init__(self, plans, configuration, fold, dataset_json,
                  unpack_dataset=True, device=torch.device('cuda')):

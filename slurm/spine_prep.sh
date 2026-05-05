@@ -15,10 +15,20 @@
 # =============================================================================
 # Convert writes symlinks like
 #     imagesTr/X__fused_0000.nii.gz -> /data/hf_export/ct/X.nii.gz
-# That target is a CONTAINER path; it resolves inside the container via the
-# /data/hf_export bind mount but looks "broken" from the host. Therefore:
-# do NOT run any host-side dangling-symlink cleanup. Earlier versions did,
-# and they wiped the whole dataset on every "resume" run.
+# for CT IMAGES. That target is a CONTAINER path; it resolves inside the
+# container via the /data/hf_export bind mount but looks "broken" from the
+# host. Therefore: do NOT run any host-side dangling-symlink cleanup.
+# Earlier versions did, and they wiped the whole dataset on every "resume"
+# run.
+#
+# LABEL files (May 2026 v5+): under Dataset803 with the merged-label
+# scheme, label NIfTIs are PHYSICALLY REWRITTEN by the convert script via
+# a vectorized LUT (LABEL_REMAP_AT_CONVERT = {6:5, 7:6, 8:7, 9:8, 10:9}).
+# This collapses L6 into last_lumbar and shifts sacrum/hips/ignore down
+# by one for contiguous label IDs. Symlinking labels would be wrong
+# under Dataset803 — the source NIfTIs still contain L6 voxels which the
+# v20 trainer is not configured to predict. The convert script handles
+# this correctly: --symlinks applies to CT only when a remap is active.
 #
 # Threading: 12 workers x 4 BLAS threads = 48 threads, fits RLIMIT_NPROC.
 #
@@ -31,42 +41,34 @@
 #
 # v3 (2026-04-29) — flexible HF_EXPORT_DIR + SPLITS_FILE overrides
 # ----------------------------------------------------------------
-# Earlier this script hardcoded HF export at
-#   ${PROJECT_ROOT}/data/hf_export
-# and splits at
-#   ${PROJECT_ROOT}/data/splits_5fold.json
-# That broke when the export lives under ~/CTSpinoPelvic1K/data/hf_export
-# (the natural Stage 3 output) and the splits ride along inside that
-# export at hf_export/splits_5fold.json (where export_dataset.sh writes
-# them). Two new env vars make this configurable:
-#
-#   HF_EXPORT_DIR   path to hf_export/ (CT, labels, manifest.json, ...)
-#                   default tries:
-#                     1. ${PROJECT_ROOT}/data/hf_export   (legacy)
-#                     2. ${HOME}/CTSpinoPelvic1K/data/hf_export
-#                   first hit wins.
-#
-#   SPLITS_FILE     path to splits_5fold.json
-#                   default tries:
-#                     1. ${HF_EXPORT_DIR}/splits_5fold.json  (preferred,
-#                        co-located with the export it describes)
-#                     2. ${PROJECT_ROOT}/data/splits_5fold.json (legacy)
-#                   first hit wins.
-#
-# Both can be overridden explicitly to point anywhere on NFS:
-#     HF_EXPORT_DIR=/some/path/hf_export sbatch slurm/spine_prep.sh
+# HF_EXPORT_DIR + SPLITS_FILE env-var auto-discovery (see comments below).
 #
 # v4 (2026-05-01) — convert_hf_to_nnunet.py CLI updated
 # ------------------------------------------------------
-# The convert script's CLI was renamed to align with its sibling
-# generate_5fold_splits.py:
-#   --hf_export_dir  -> --hf_dir
-#   --nnunet_raw_dir -> --nnunet_raw
-#   --splits_file    -> --splits
-# These are the only changes. The args that no longer exist
-# (--single_fold_splits, --include_train_match_types, --test_match_types)
-# have been removed from this script; setting their env-var counterparts
-# now produces an explicit error instead of silently being ignored.
+# CLI renamed: --hf_export_dir -> --hf_dir, --nnunet_raw_dir -> --nnunet_raw,
+# --splits_file -> --splits.
+#
+# v5 (2026-05-03) — Dataset803 merged-label defaults
+# ---------------------------------------------------
+# Defaults flipped from Dataset802 (10-class unmerged) to Dataset803
+# (9-class merged last_lumbar):
+#
+#   DATASET_ID:    802 -> 803
+#   DATASET_NAME:  SpineSurgCTFull -> SpineSurgCTFullMerged
+#
+# To run the legacy 10-class baseline (e.g. for a paper baseline row),
+# override on submit:
+#   DATASET_ID=802 DATASET_NAME=SpineSurgCTFull \
+#     sbatch slurm/spine_prep.sh
+# AND pass --no_remap to convert_hf_to_nnunet.py (see notes below). The
+# convert script accepts either; the trainer assumes contiguous labels
+# and is currently incompatible with the unmerged scheme.
+#
+# Dataset.json sanity check (v5): now validates the ENTIRE label dict
+# against the expected scheme for each dataset ID. For Dataset803 this
+# means {bg:0, L1-L4:1-4, last_lumbar:5, sacrum:6, hips:7-8, ignore:9}.
+# Catches the failure modes of (a) running v5 against a stale
+# Dataset802 build, (b) running --no_remap accidentally.
 # =============================================================================
 
 set -euo pipefail
@@ -84,8 +86,12 @@ export NXF_SINGULARITY_HOME_MOUNT=true
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # -- Config ------------------------------------------------------------------
-DATASET_ID="${DATASET_ID:-802}"
-DATASET_NAME="${DATASET_NAME:-SpineSurgCTFull}"
+# v5 defaults: Dataset803 (merged last_lumbar). Override DATASET_ID=802 +
+# DATASET_NAME=SpineSurgCTFull + LEGACY_NO_REMAP=1 to run the unmerged
+# baseline.
+DATASET_ID="${DATASET_ID:-803}"
+DATASET_NAME="${DATASET_NAME:-SpineSurgCTFullMerged}"
+LEGACY_NO_REMAP="${LEGACY_NO_REMAP:-0}"
 CONFIG="${CONFIG:-3d_fullres}"
 PLANNER="${PLANNER:-nnUNetPlannerResEncM}"
 GPU_MEMORY_TARGET_GB="${GPU_MEMORY_TARGET_GB:-100}"
@@ -109,6 +115,16 @@ if [[ -n "${INCLUDE_TRAIN_MATCH_TYPES}" || -n "${TEST_MATCH_TYPES}" ]]; then
     echo "       manifest_validation.json as training cases, and manifest_test.json " >&2
     echo "       as test cases. Filter at the manifest level upstream if needed." >&2
     exit 1
+fi
+
+# v5: warn loudly when Dataset802 is requested without --no_remap, since
+# that combination produces a 9-class dataset under the 802 ID — almost
+# certainly an operator mistake.
+if [[ "${DATASET_ID}" == "802" && "${LEGACY_NO_REMAP}" != "1" ]]; then
+    echo "WARN: DATASET_ID=802 requested but LEGACY_NO_REMAP=0." >&2
+    echo "      Dataset802 conventionally means the legacy 10-class scheme." >&2
+    echo "      Set LEGACY_NO_REMAP=1 to pass --no_remap to the convert script," >&2
+    echo "      or use DATASET_ID=803 for the merged-label scheme." >&2
 fi
 
 case "${PLANNER}" in
@@ -247,13 +263,29 @@ if [[ -f "${COMPLETE_MARKER}" ]] \
 fi
 
 # >>> NO host-side dangling-symlink cleanup. <<<
-# Convert writes container-path symlinks (/data/hf_export/...). They look
+# CT images are container-path symlinks (/data/hf_export/...). They look
 # "broken" from the host but resolve inside the container via the bind
-# mount.
+# mount. Label files are real (physically rewritten under merged-label
+# remap) and don't need any cleanup either.
+
+# Convert script flags (v5):
+#   --no_remap is passed when running the legacy 802 baseline. Without
+#   it, the convert script applies LABEL_REMAP_AT_CONVERT = {6:5, 7:6,
+#   8:7, 9:8, 10:9} to every label file, producing the merged 9-class
+#   contiguous scheme.
+CONVERT_REMAP_FLAG=""
+if [[ "${LEGACY_NO_REMAP}" == "1" ]]; then
+    CONVERT_REMAP_FLAG="--no_remap"
+fi
 
 echo "================================================================"
 echo " Stage A: convert + preprocess (SIMPLE, NFS-only)"
 echo "   Dataset      : ${DS_DIR_NAME}"
+if [[ "${LEGACY_NO_REMAP}" == "1" ]]; then
+    echo "   Label scheme : LEGACY 10-class (--no_remap; L5/L6 separate)"
+else
+    echo "   Label scheme : v20 merged 9-class (last_lumbar = former L5+L6)"
+fi
 echo "   Plans        : ${PLANS} (target ${GPU_MEMORY_TARGET_GB} GB)"
 echo "   HF export    : ${HF_EXPORT_NFS}"
 echo "   Splits file  : ${SPLITS_FILE_HOST}"
@@ -284,15 +316,6 @@ SING_BINDS=(
 )
 
 # -- Step 1: convert HF export -> nnU-Net raw (on NFS) -----------------------
-#
-# May 2026 CLI:
-#   --hf_dir       (was --hf_export_dir)
-#   --splits       (was --splits_file)
-#   --nnunet_raw   (was --nnunet_raw_dir)
-#
-# All three are now required; no SINGLE_FOLD_SPLITS / match_type filter
-# fallbacks. The earlier args, if encountered in old logs, indicate the
-# convert script was rolled back.
 echo ""; echo "----- Step 1: convert HF export -> nnU-Net raw -----"
 if [[ -f "${NFS_RAW_DS}/dataset.json" ]]; then
     echo "  dataset.json present; skipping convert."
@@ -304,7 +327,7 @@ else
             --nnunet_raw /nnunet_nfs/raw \
             --dataset_id   ${DATASET_ID} \
             --dataset_name ${DATASET_NAME} \
-            --symlinks
+            --symlinks ${CONVERT_REMAP_FLAG}
 fi
 
 # -- Step 2: plan + preprocess (reads + writes on NFS) -----------------------
@@ -344,29 +367,83 @@ if [[ "${N_NPZ_NFS}" -eq 0 ]]; then
     exit 2
 fi
 
-# Sanity: confirm dataset.json has the ignore label so downstream training
-# honors partial-annotation cases. Catches the failure mode where the
-# old dataset.json (without ignore=10) survived from a prior run.
-DS_JSON_OK=$(python - "${NFS_RAW_DS}/dataset.json" <<'PY' 2>/dev/null || echo "fail"
+# v5 dataset.json sanity check: validate the FULL label dict against
+# the expected scheme for the DATASET_ID. Catches:
+#   - Stale Dataset802 build still living under the 803 dir name
+#   - Forgot --no_remap when rebuilding 802 baseline
+#   - export_hf.py changes that changed the source label values
+DS_JSON_OK=$(python - "${NFS_RAW_DS}/dataset.json" "${DATASET_ID}" "${LEGACY_NO_REMAP}" <<'PY' 2>/dev/null || echo "fail"
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
-    labels = d.get('labels', {})
-    if labels.get('ignore') == 10:
-        print('ok')
+    ds_id = int(sys.argv[2])
+    legacy_no_remap = sys.argv[3] == "1"
+    labels = d.get("labels", {})
+    if "ignore" not in labels:
+        print(f"missing-ignore-key: labels={labels}")
+        sys.exit(0)
+
+    # Decide which scheme to expect
+    use_merged = (ds_id == 803) or (not legacy_no_remap and ds_id != 802)
+
+    if use_merged:
+        expected = {
+            "background":  0,
+            "L1":          1,
+            "L2":          2,
+            "L3":          3,
+            "L4":          4,
+            "last_lumbar": 5,
+            "sacrum":      6,
+            "left_hip":    7,
+            "right_hip":   8,
+            "ignore":      9,
+        }
+        scheme = "v20 merged"
     else:
-        print(f'missing-ignore: labels={labels}')
+        expected = {
+            "background":  0,
+            "L1":          1,
+            "L2":          2,
+            "L3":          3,
+            "L4":          4,
+            "L5":          5,
+            "L6":          6,
+            "sacrum":      7,
+            "left_hip":    8,
+            "right_hip":   9,
+            "ignore":      10,
+        }
+        scheme = "legacy 10-class"
+    # nnU-Net v2 may serialize int values as strings; normalize.
+    norm = {k: int(v) for k, v in labels.items()}
+    if norm == expected:
+        print(f"ok ({scheme})")
+    else:
+        # Be helpful: report the first mismatch
+        mism = []
+        for k in sorted(set(norm) | set(expected)):
+            if norm.get(k) != expected.get(k):
+                mism.append(f"{k}: got={norm.get(k)} expected={expected.get(k)}")
+        print(f"label-mismatch ({scheme}): {'; '.join(mism)}")
 except Exception as e:
-    print(f'fail: {e}')
+    print(f"fail: {e}")
 PY
 )
-if [[ "${DS_JSON_OK}" != "ok" ]]; then
+if [[ "${DS_JSON_OK}" != ok* ]]; then
     echo "ERROR: dataset.json sanity check FAILED: ${DS_JSON_OK}" >&2
-    echo "       Expected labels.ignore == 10 for partial-annotation training." >&2
-    echo "       Re-run convert_hf_to_nnunet.py against the patched export." >&2
+    if [[ "${DATASET_ID}" == "803" ]]; then
+        echo "       Expected v20 merged scheme: bg=0, L1-L4=1-4, last_lumbar=5," >&2
+        echo "       sacrum=6, left_hip=7, right_hip=8, ignore=9." >&2
+        echo "       Re-run convert_hf_to_nnunet.py against the patched export." >&2
+    else
+        echo "       Expected legacy 10-class scheme: bg=0, L1-L6=1-6, sacrum=7," >&2
+        echo "       left_hip=8, right_hip=9, ignore=10." >&2
+        echo "       Set LEGACY_NO_REMAP=1 if rebuilding the 802 baseline." >&2
+    fi
     exit 3
 fi
-echo "  dataset.json: labels.ignore == 10 (partial-annotation training will work)"
+echo "  dataset.json: ${DS_JSON_OK} (partial-annotation training will work)"
 
 touch "${COMPLETE_MARKER}"
 

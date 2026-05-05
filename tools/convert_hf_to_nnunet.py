@@ -15,10 +15,10 @@ Writes
 ------
   NNUNET_RAW/Dataset{ID}_{NAME}/
     imagesTr/{caseID}_0000.nii.gz   (symlinks or copies of CT)
-    labelsTr/{caseID}.nii.gz        (symlinks or copies of label)
+    labelsTr/{caseID}.nii.gz        (REMAPPED copies — see below)
     imagesTs/{caseID}_0000.nii.gz   (test set)
     labelsTs/{caseID}.nii.gz
-    dataset.json                    (10-class label scheme + ignore)
+    dataset.json                    (label scheme + ignore)
     lstv_cases.json                 (schema v3 — 6-way LSTV subtypes)
     splits_final.json               (5-fold CV splits, mirrored from input)
 
@@ -31,87 +31,89 @@ Default: full build (link/copy + dataset.json + splits + lstv_cases).
     the fold assignments / subtype mapping (e.g. after re-running
     generate_5fold_splits.py).
 
-dataset.json label scheme (May 2026 update)
--------------------------------------------
-  0 background  1 L1  2 L2  3 L3  4 L4  5 L5  6 L6  7 sacrum  8 left_hip  9 right_hip
-  10 ignore (NEW)
+Label scheme (May 2026 — Dataset803 / "merged" variant)
+-------------------------------------------------------
+  0 background
+  1 L1
+  2 L2
+  3 L3
+  4 L4
+  5 last_lumbar  (was L5+L6 merged at convert time — see
+                  LABEL_REMAP_AT_CONVERT)
+  6 sacrum       (renumbered from 7)
+  7 left_hip     (renumbered from 8)
+  8 right_hip    (renumbered from 9)
+  9 ignore       (renumbered from 10)
 
-Why "ignore" is here:
-  Some HF export records are *partial annotations* — separate-mode
-  patients have one CT scan annotated only for spine (L1-L6) and a
-  different CT scan annotated only for pelvis (sacrum + hips). The
-  patched export_hf.py (May 2026) writes those label files with value
-  10 in voxels outside the present annotator's domain.
+Why contiguous renumbering matters
+==================================
+nnU-Net v2 builds the network's output channel count from the SORTED
+LIST of label values (excluding the ignore label). The trainer's
+per-class dice / confusion code then compares network argmax outputs
+(channel indices) against ground-truth label values, treating them
+as equivalent. This equivalence holds only when label values are
+CONTIGUOUS — a gap (e.g., labels 0,1,...,5,7,8,9 with no 6) breaks
+the channel-index ↔ label-value mapping and corrupts every per-class
+metric. So when we drop L6, we shift sacrum/hips/ignore down by one
+to maintain contiguity.
 
-  nnU-Net v2 honors `"ignore"` in `labels` by:
-    - setting `has_ignore_label = True` on the LabelManager
-    - using `ignore_label = 10` as `ignore_index` in CE loss
-    - masking ignore voxels out of the Dice loss via the DC_and_CE_loss
-      wrapper when `ignore_label` is configured
-    - NOT allocating an output head for class 10 (network output stays
-      at 10 channels: bg + 9 fg)
+Why labels are merged
+=====================
+Direct multi-class semantic segmentation of L5 vs L6 fails on
+transitional anatomy because the disambiguating signal is non-local:
+"the bottom-most lumbar vertebra" looks anatomically near-identical
+whether it is the L5 of a 5-lumbar normal spine or the L6 of a
+6-lumbar lumbarized spine. Voxel-wise classification cannot solve
+this — see Möller et al. 2026 (VERIDAH), Section 2.2:
 
-  Without this entry, partial-annotation labels would falsely supervise
-  the network with "background" wherever the partial annotator did not
-  trace, poisoning the loss for L6 / sacrum / hips on roughly two-thirds
-  of the training set. See export_hf.py "PARTIAL ANNOTATION CONTRACT".
+    "we replace the T13 and L6 labels in the reference annotation
+     with T12 and L5, respectively. Thus, the existence of a T13
+     and L6 is indicated by two consecutive T12 or L5 labels."
+
+We follow the same pattern for L6 only (we do not have T13 cases in
+this dataset). Individual L5/L6 labels are recovered downstream via
+instance-level post-processing (connected components on the
+last_lumbar mask, ordered superior-to-inferior, with count
+determining whether the bottom is L5 or L6).
+
+Why "ignore" is here
+====================
+Some HF export records are *partial annotations* — separate-mode
+patients have one CT scan annotated only for spine (L1-L6) and a
+different CT scan annotated only for pelvis (sacrum + hips). The
+patched export_hf.py (May 2026) writes those label files with value
+10 in voxels outside the present annotator's domain.
+
+nnU-Net v2 honors `"ignore"` in `labels` by:
+  - setting `has_ignore_label = True` on the LabelManager
+  - using `ignore_label = 10` as `ignore_index` in CE loss
+  - masking ignore voxels out of the Dice loss via the DC_and_CE_loss
+    wrapper when `ignore_label` is configured
+  - NOT allocating an output head for class 10
+
+Without this entry, partial-annotation labels would falsely supervise
+the network with "background" wherever the partial annotator did not
+trace, poisoning the loss for last_lumbar / sacrum / hips on roughly
+two-thirds of the training set. See export_hf.py
+"PARTIAL ANNOTATION CONTRACT".
 
 Per-record subtype refinement (May 2026, schema v3)
 ===================================================
-A patient with LSTV morphology may contribute multiple records with
-different `config` values:
-
-  fused          -> all anatomy in one volume
-  spine_only     -> spine annotated, pelvis = ignore
-  pelvic_native  -> pelvis annotated, lumbar = ignore
-
-The patient-level subtype (e.g. "lumb") is correct for fused and
-spine_only views — they SHOW the lumbar morphology that defines the
-subtype. But pelvic_native views from the SAME patient have only
-sacrum + hips visible (lumbar region is masked as ignore=10), so
-their label files contain zero L6 voxels even for lumb patients.
-
-If we tagged a pelvic_native record as "lumb":
-
-  1. The patch-bias hook would try to bias toward L6 patches that
-     don't exist in the case's foreground class list -> no-op but
-     misleading "37 cases in bias pool" log line.
-
-  2. The per-subgroup val dice averages "L6 dice" over cases lacking
-     L6 in GT, returning None per case (filtered from the mean), but
-     the n_cases count is inflated and the "L6 dice on lumbarization
-     cases" headline metric becomes harder to interpret across
-     epochs.
-
-  3. The oversample pool puts these cases on the same footing as
-     true-lumb spine views, wasting roughly half the oversample
-     budget on pelvic-only views that contribute no lumbar signal.
-
-Fix: `_refine_subtype_for_record_config` applies SYMMETRIC per-record
-demotion based on which anatomical region a config covers:
+Unchanged from prior version. A patient with LSTV morphology may
+contribute multiple records with different `config` values (fused,
+spine_only, pelvic_native). The patient-level subtype is correct only
+for records whose config actually shows the relevant anatomy:
 
   pelvic_native  ->  demote {lumb, sacr_count} to "normal"
-                     (these subtypes' defining anatomy is the LUMBAR
-                     vertebral count: presence of an L6 body, or L5
-                     missing because it sacralized into the sacrum
-                     body. A pelvic_native scan has the lumbar region
-                     masked as ignore=10, so this signal is absent.)
-
+                     (lumbar region masked as ignore=10)
   spine_only     ->  demote {sacralization, semisacralization} to
-                     "normal" (these subtypes' defining anatomy is
-                     SACRAL-WING morphology: uni- or bilateral fusion
-                     of the L5 transverse process to the sacrum. A
-                     spine_only scan has the pelvis masked as
-                     ignore=10, so this signal is absent.)
-
-  fused          ->  preserve all subtypes (entire anatomy annotated)
-  ambiguous      ->  preserved on every config (uncertain
-                     classification — keep the case represented in
-                     per-subgroup metrics)
+                     "normal" (pelvis masked as ignore=10)
+  fused          ->  preserve all subtypes
+  ambiguous      ->  preserved on every config
 
 lstv_cases.json schema v3 (Apr 2026)
 ====================================
-6-way LSTV subtype taxonomy mirroring splits_5fold.json schema v6:
+6-way LSTV subtype taxonomy:
   normal, lumb, sacr_count, semisacralization, sacralization, ambiguous
 
   {
@@ -135,6 +137,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -153,50 +157,126 @@ SUBTYPES = (
     "ambiguous",
 )
 
-# Subtypes whose defining anatomy lives in the LUMBAR vertebral region
-# (vertebral body count: presence/absence of L6, or L5 missing because
-# it sacralized into the sacrum body). A pelvic_native config masks the
-# lumbar region as ignore=10, so a pelvic_native record does NOT carry
-# these subtypes' signal even if the patient does. Demote on
-# pelvic_native.
+# Subtypes whose defining anatomy lives in the LUMBAR vertebral region.
+# pelvic_native config masks the lumbar region as ignore=10, so a
+# pelvic_native record does NOT carry these subtypes' signal.
 _LUMBAR_REGION_SUBTYPES = frozenset({
     "lumb",
     "sacr_count",
 })
 
-# Subtypes whose defining anatomy lives in the SACRAL/PELVIC region
-# (sacral-wing morphology: full or partial fusion of the L5 transverse
-# process to the sacrum). A spine_only config masks the pelvis as
-# ignore=10, so a spine_only record does NOT carry these subtypes'
-# signal even if the patient does. Demote on spine_only.
+# Subtypes whose defining anatomy lives in the SACRAL/PELVIC region.
+# spine_only config masks the pelvis as ignore=10, so a spine_only
+# record does NOT carry these subtypes' signal.
 _PELVIS_REGION_SUBTYPES = frozenset({
     "sacralization",
     "semisacralization",
 })
 
-# Config values recognized in the manifest, mirroring trainer constants.
 _VALID_CONFIGS = ("fused", "spine_only", "pelvic_native")
 _PELVIC_ONLY_CONFIG = "pelvic_native"
 _SPINE_ONLY_CONFIG  = "spine_only"
 
-# 10-class scheme + ignore label for partial-annotation cases.
-# nnU-Net v2 treats the literal key "ignore" specially — see module
-# docstring for full semantics. The value 10 must match the value
-# written by export_hf.merge_labels() in partial-annotation mode and
-# the trainer's _IGNORE_LABEL constant.
+# ── Label scheme (Dataset803 — merged last_lumbar) ─────────────────────
+#
+# nnU-Net v2 reads the "labels" dict to determine the network's output
+# head channel count. Each foreground name -> int value pair becomes
+# an output channel. The "ignore" entry is special: it is NOT a
+# channel; it is used as the ignore_index in the CE loss.
+#
+# Label 6 is intentionally absent from LABEL_NAMES — the L6 voxels
+# from source NIfTIs are remapped to label 5 (last_lumbar) at convert
+# time via LABEL_REMAP_AT_CONVERT. The network has no channel for the
+# old L6 because there are no label-6 voxels in the produced data.
 LABEL_NAMES = {
-    "background": 0,
-    "L1":         1,
-    "L2":         2,
-    "L3":         3,
-    "L4":         4,
-    "L5":         5,
-    "L6":         6,
-    "sacrum":     7,
-    "left_hip":   8,
-    "right_hip":  9,
-    "ignore":     10,
+    "background":  0,
+    "L1":          1,
+    "L2":          2,
+    "L3":          3,
+    "L4":          4,
+    "last_lumbar": 5,   # merged L5+L6 (see module docstring)
+    "sacrum":      6,   # renumbered from 7
+    "left_hip":    7,   # renumbered from 8
+    "right_hip":   8,   # renumbered from 9
+    "ignore":      9,   # renumbered from 10
 }
+
+# Source-label -> trained-label remap. Applied by
+# _remap_and_write_label() during the link/copy loop. Source labels
+# not listed here pass through unchanged.
+#
+# We collapse L6 into last_lumbar AND shift everything above it down
+# by one to maintain contiguous label values. See module docstring
+# "Why contiguous renumbering matters".
+#
+# In the source NIfTIs (HF export):
+#   0 bg, 1-4 L1-L4, 5 L5, 6 L6, 7 sacrum, 8 left_hip, 9 right_hip,
+#   10 ignore (partial-annotation contract)
+#
+# In the converted NIfTIs (this dataset):
+#   0 bg, 1-4 L1-L4, 5 last_lumbar (former L5+L6), 6 sacrum,
+#   7 left_hip, 8 right_hip, 9 ignore
+LABEL_REMAP_AT_CONVERT: Dict[int, int] = {
+    6: 5,   # L6 -> last_lumbar (the merge)
+    7: 6,   # sacrum: shift down
+    8: 7,   # left_hip: shift down
+    9: 8,   # right_hip: shift down
+    10: 9,  # ignore: shift down (partial-annotation contract)
+}
+
+# The maximum label value the source NIfTIs are expected to contain.
+# Anything above this in a source label file is unexpected; the remap
+# is defensive and clamps via lookup table size.
+_MAX_SOURCE_LABEL = 10
+
+
+def _build_remap_lut(remap: Dict[int, int],
+                     max_label: int = _MAX_SOURCE_LABEL) -> np.ndarray:
+    """Build a vectorized lookup table for label remapping.
+
+    Returns an int32 array `lut` of length `max_label + 1` where
+    `lut[old_label] == new_label`. Source labels not in `remap` map
+    to themselves. Source labels above `max_label` are not handled
+    by the LUT; the caller must clip or assert before indexing.
+    """
+    lut = np.arange(max_label + 1, dtype=np.int32)
+    for src, dst in remap.items():
+        if not (0 <= src <= max_label):
+            raise ValueError(
+                f"label remap source {src} outside expected range "
+                f"[0, {max_label}]; widen _MAX_SOURCE_LABEL or fix remap dict")
+        lut[src] = dst
+    return lut
+
+
+def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray) -> None:
+    """Read source label NIfTI, apply the remap LUT, write to dst.
+
+    Used when the dataset.json label scheme differs from the source
+    files (e.g., merging L6 into last_lumbar to avoid class collision
+    in transitional vertebra training). Preserves the source affine
+    and header. Output dtype is uint8 (label IDs are small).
+
+    The LUT must accommodate the maximum value in the source file.
+    Values exceeding the LUT length are clipped to the LUT max — this
+    is defensive against unexpected source labels and mirrors the
+    behavior of np.clip + indexing.
+    """
+    import nibabel as nib
+
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    img = nib.load(src)
+    arr = np.asarray(img.get_fdata(), dtype=np.int32)
+    src_max = int(arr.max()) if arr.size else 0
+    if src_max >= len(lut):
+        log.warning("source label %s contains value %d above LUT max %d; clipping",
+                    src.name, src_max, len(lut) - 1)
+        arr = np.clip(arr, 0, len(lut) - 1)
+    arr_remapped = lut[arr].astype(np.uint8)
+    out = nib.Nifti1Image(arr_remapped, img.affine, img.header)
+    out.set_data_dtype(np.uint8)
+    nib.save(out, dst)
 
 
 def _refine_subtype_for_record_config(patient_subtype: str,
@@ -204,41 +284,8 @@ def _refine_subtype_for_record_config(patient_subtype: str,
     """Adjust the patient-level subtype based on this record's
     annotation config (symmetric anatomical-region demotion).
 
-    A patient with LSTV morphology may contribute multiple records
-    with different `config` values. The patient-level subtype is only
-    correct for records whose config actually shows the relevant
-    anatomy:
-
-      lumb / sacr_count are LUMBAR-region findings (vertebral count).
-        - fused, spine_only:  preserve the subtype
-        - pelvic_native:      demote to "normal" (lumbar region masked
-                              as ignore=10, no L6 or count info)
-
-      sacralization / semisacralization are SACRAL/PELVIC findings
-      (sacral-wing morphology, L5 transverse-process fusion).
-        - fused, pelvic_native: preserve the subtype
-        - spine_only:           demote to "normal" (pelvis masked as
-                                ignore=10, no sacral wing visible)
-
-      ambiguous: preserved on every config so the case is still
-        represented in per-subgroup metrics. Don't silently relabel
-        as normal — that would hide ambiguous cases entirely.
-
-      normal: stays normal regardless of config.
-
-    Defensive: unknown / empty config values are treated as 'fused'
-    (most permissive — preserve the patient subtype).
-
-    Args:
-      patient_subtype: one of SUBTYPES, derived from the patient's
-        clinical/morphological annotation.
-      record_config: one of _VALID_CONFIGS, recorded per record in
-        the HF manifest.
-
-    Returns:
-      The refined subtype for this specific record.
-
-    Test contract: see tests/test_subtype_refinement.py.
+    Unchanged from prior version. See module docstring for full
+    semantics.
     """
     rc = (record_config or "").strip().lower()
     if rc == _PELVIC_ONLY_CONFIG:
@@ -293,8 +340,7 @@ def _case_id(token: str, record_idx: int = 0) -> str:
 
 def _resolve_subtype_for_case(record: Dict,
                                 splits_subtypes: Dict[str, str]) -> str:
-    """
-    Determine the canonical 6-way subtype for a single record.
+    """Determine the canonical 6-way subtype for a single record.
 
     Steps:
       1. Resolve patient-level subtype via splits-derived map (preferred)
@@ -332,7 +378,6 @@ def _resolve_subtype_for_case(record: Dict,
         else:
             patient_subtype = "normal"
 
-    # Step 2: refine for this record's config (pelvic_native demotion)
     return _refine_subtype_for_record_config(patient_subtype, record_config)
 
 
@@ -346,15 +391,21 @@ def _build_case_indices(
     labels_ts: Optional[Path],
     use_symlinks: bool,
     do_link: bool,
+    label_remap_lut: Optional[np.ndarray],
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Dict],
-           List[str], List[str], int, Dict[str, int]]:
+           List[str], List[str], int, Dict[str, int],
+           Dict[str, int]]:
     """
-    Iterate manifests, optionally symlink/copy CT+label files, and build
-    the case_id -> {subtype, token, attrs} indices.
+    Iterate manifests, optionally write CT (link/copy) and label
+    (remap-and-write) files into the nnU-Net layout, build indices.
 
     Returns: (case_to_subtype, case_to_token, case_to_attrs,
-              train_case_ids, test_case_ids, n_skipped, refinement_stats)
-    where refinement_stats counts how many cases were demoted by config.
+              train_case_ids, test_case_ids, n_skipped,
+              refinement_stats, remap_stats)
+
+    refinement_stats: how many cases were demoted by config.
+    remap_stats: how many label files were physically rewritten via
+                 the remap LUT (vs symlinked when no remap configured).
     """
     case_to_subtype: Dict[str, str] = {}
     case_to_token:   Dict[str, str] = {}
@@ -363,12 +414,8 @@ def _build_case_indices(
     test_case_ids:  List[str] = []
     n_skipped = 0
 
-    # Track how many records had their patient subtype demoted via the
-    # pelvic_native config refinement. Useful for the post-build summary
-    # so the user can spot if e.g. the manifest's `config` field is
-    # missing (refinement_stats stays at 0 even though pelvic_native
-    # records exist).
     refinement_stats: Dict[str, int] = defaultdict(int)
+    remap_stats: Dict[str, int] = defaultdict(int)
 
     record_idx_by_token: Dict[str, int] = defaultdict(int)
 
@@ -414,10 +461,19 @@ def _build_case_indices(
 
             if do_link:
                 try:
-                    _link_or_copy(ct_src,    ct_dst,    use_symlinks)
-                    _link_or_copy(label_src, label_dst, use_symlinks)
+                    # CT image: symlink/copy unchanged.
+                    _link_or_copy(ct_src, ct_dst, use_symlinks)
+                    # Label: remap-and-write if a remap LUT is
+                    # configured; otherwise symlink/copy through.
+                    if label_remap_lut is not None:
+                        _remap_and_write_label(label_src, label_dst,
+                                                label_remap_lut)
+                        remap_stats["n_remapped"] += 1
+                    else:
+                        _link_or_copy(label_src, label_dst, use_symlinks)
+                        remap_stats["n_passthrough"] += 1
                 except Exception as e:
-                    log.warning("link/copy failed token=%s: %s", tok, e)
+                    log.warning("link/copy/remap failed token=%s: %s", tok, e)
                     n_skipped += 1
                     if split == "test":
                         test_case_ids.pop()
@@ -425,14 +481,8 @@ def _build_case_indices(
                         train_case_ids.pop()
                     continue
 
-            # Compute refined per-record subtype, and also compute the
-            # raw patient-level subtype so we can count demotions.
             patient_subtype_raw = splits_subtypes.get(tok)
             if patient_subtype_raw is None:
-                # Fall through to per-record resolution; in this branch
-                # we can't separate "raw" from "refined" cleanly, so we
-                # just compute the refined subtype directly without
-                # counting demotion stats for this record.
                 subtype = _resolve_subtype_for_case(rec, splits_subtypes)
             else:
                 rec_config = str(rec.get("config", ""))
@@ -455,12 +505,12 @@ def _build_case_indices(
                 "config":          str(rec.get("config", "")),
                 "split":           split,
                 "partial_annotation": bool(rec.get("partial_annotation", False)),
-                # Keep the raw patient-level subtype for traceability.
                 "patient_subtype_raw": patient_subtype_raw or "(none)",
             }
 
     return (case_to_subtype, case_to_token, case_to_attrs,
-            train_case_ids, test_case_ids, n_skipped, dict(refinement_stats))
+            train_case_ids, test_case_ids, n_skipped,
+            dict(refinement_stats), dict(remap_stats))
 
 
 def _write_splits_final(
@@ -543,9 +593,21 @@ def main():
     p.add_argument("--hf_dir",   required=True, type=Path)
     p.add_argument("--splits",   required=True, type=Path)
     p.add_argument("--nnunet_raw", required=True, type=Path)
-    p.add_argument("--dataset_id",   type=int, default=802)
-    p.add_argument("--dataset_name", default="SpineSurgCTFull")
-    p.add_argument("--symlinks", action="store_true")
+    p.add_argument("--dataset_id",   type=int, default=803,
+                    help="Dataset ID. 803 = merged-label variant (default); "
+                         "802 = unmerged baseline.")
+    p.add_argument("--dataset_name", default="SpineSurgCTFullMerged",
+                    help="Dataset name. SpineSurgCTFullMerged (default) for "
+                         "the merged-label variant; SpineSurgCTFull for the "
+                         "unmerged baseline.")
+    p.add_argument("--symlinks", action="store_true",
+                    help="Symlink CT images instead of copying. Note: label "
+                         "files are ALWAYS physically rewritten when a label "
+                         "remap is configured (LABEL_REMAP_AT_CONVERT non-empty).")
+    p.add_argument("--no_remap", action="store_true",
+                    help="Disable the L6->last_lumbar label remap. Use this "
+                         "to reproduce the legacy unmerged 10-class scheme on "
+                         "Dataset802. Default: remap is APPLIED.")
     p.add_argument("--regen_splits_only", action="store_true")
     args = p.parse_args()
 
@@ -571,6 +633,34 @@ def main():
     n_total_records = sum(len(v) for v in manifests.values())
     log.info("Manifests: %d total records across train/val/test", n_total_records)
 
+    # Resolve label remap config and build LUT.
+    if args.no_remap or not LABEL_REMAP_AT_CONVERT:
+        label_remap_lut = None
+        active_label_names = {
+            "background":  0,
+            "L1":          1,
+            "L2":          2,
+            "L3":          3,
+            "L4":          4,
+            "L5":          5,
+            "L6":          6,
+            "sacrum":      7,
+            "left_hip":    8,
+            "right_hip":   9,
+            "ignore":      10,
+        }
+        log.info("Label remap: DISABLED (legacy 10-class scheme; --no_remap)")
+        log.info("  -> output dataset will have non-contiguous labels and is "
+                 "intended only as a reference baseline; do NOT train against "
+                 "it with the v20+ trainer (the trainer assumes contiguous "
+                 "label values).")
+    else:
+        label_remap_lut = _build_remap_lut(LABEL_REMAP_AT_CONVERT)
+        active_label_names = LABEL_NAMES
+        log.info("Label remap at convert time: %s", dict(LABEL_REMAP_AT_CONVERT))
+        log.info("  -> source labels are PHYSICALLY REWRITTEN; --symlinks "
+                 "applies to CT images only.")
+
     ds_dir = args.nnunet_raw / f"Dataset{args.dataset_id:03d}_{args.dataset_name}"
 
     do_link = not args.regen_splits_only
@@ -594,44 +684,77 @@ def main():
 
     (case_to_subtype, case_to_token, case_to_attrs,
      train_case_ids, test_case_ids, n_skipped,
-     refinement_stats) = _build_case_indices(
+     refinement_stats, remap_stats) = _build_case_indices(
         manifests, splits_subtypes, args.hf_dir,
         images_tr, labels_tr, images_ts, labels_ts,
         use_symlinks=args.symlinks, do_link=do_link,
+        label_remap_lut=label_remap_lut,
     )
 
     if do_link:
         log.info("Linked/copied: train=%d  test=%d  skipped=%d",
                  len(train_case_ids), len(test_case_ids), n_skipped)
+        if remap_stats:
+            log.info("Label file disposition:")
+            for k, n in sorted(remap_stats.items()):
+                log.info("  %-20s %d", k, n)
     else:
         log.info("Indexed: train=%d  test=%d  skipped=%d  (no link/copy in regen mode)",
                  len(train_case_ids), len(test_case_ids), n_skipped)
 
     if refinement_stats:
-        log.info("Per-record subtype refinements (pelvic_native demotions):")
+        log.info("Per-record subtype refinements (anatomical-region demotions):")
         for transition, n in sorted(refinement_stats.items()):
             log.info("  %-50s %d", transition, n)
     else:
         log.info("Per-record subtype refinements: none "
-                 "(no pelvic_native records of LSTV patients, or `config` field missing)")
+                 "(no spine_only / pelvic_native records of LSTV patients, "
+                 "or `config` field missing)")
 
     # ── dataset.json (skipped in regen mode) ───────────────────────────────
     if do_link:
+        if label_remap_lut is not None:
+            description = (
+                "CTSpinoPelvic1K — fused 9-class spine + pelvis CT (8 fg + bg) "
+                "with merged last_lumbar (L5+L6) and ignore label (9) for "
+                "partial annotations. L6 source labels remapped to "
+                "last_lumbar (5) at convert time; sacrum/hips/ignore "
+                "shifted down by one for contiguous label values. "
+                "Recover individual L5/L6 via instance post-processing or "
+                "VERIDAH (Möller 2026)."
+            )
+            release = (
+                "May 2026 — schema v6 splits / v3 lstv_cases / "
+                "partial-annotation ignore label / per-record subtype "
+                "refinement / L6 merged into last_lumbar following "
+                "Möller 2026 (VERIDAH §2.2) / contiguous label IDs"
+            )
+        else:
+            description = (
+                "CTSpinoPelvic1K — fused 10-class spine + pelvis CT "
+                "with ignore label (10) for partial annotations "
+                "(LEGACY UNMERGED VARIANT)"
+            )
+            release = (
+                "May 2026 — schema v6 splits / v3 lstv_cases / "
+                "partial-annotation ignore label / per-record subtype "
+                "refinement (legacy 10-class)"
+            )
         dataset_json = {
             "channel_names": {"0": "CT"},
-            "labels":        LABEL_NAMES,
+            "labels":        active_label_names,
             "numTraining":   len(train_case_ids),
             "file_ending":   ".nii.gz",
             "name":          args.dataset_name,
-            "description":   "CTSpinoPelvic1K — fused 10-class spine + pelvis CT "
-                              "with ignore label (10) for partial annotations",
+            "description":   description,
             "reference":     "CTSpine1K + CTPelvic1K, COLONOG cohort",
-            "release":       "May 2026 — schema v6 splits / v3 lstv_cases / "
-                              "partial-annotation ignore label / "
-                              "per-record subtype refinement",
+            "release":       release,
         }
         (ds_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
-        log.info("Wrote dataset.json (labels include ignore=10 for partial-annotation cases)")
+        log.info("Wrote dataset.json with %d label keys (%d foreground + bg + ignore)",
+                 len(active_label_names),
+                 sum(1 for k in active_label_names
+                     if k not in ("background", "ignore")))
 
     # ── splits_final.json + lstv_cases.json (always written) ───────────────
     _write_splits_final(
