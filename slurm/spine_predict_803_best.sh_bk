@@ -14,33 +14,37 @@
 # =============================================================================
 # Stage 1 / 2: PREDICT ONLY — Dataset803 / 500ep / checkpoint_best
 # =============================================================================
-# GPU-bound. Writes ensemble predictions for the 174 test cases.
-# Env block + binds mirror slurm/spine_prep.sh.
+# Mirrors slurm/spine_train_array.sh's container-handling pattern:
+# ALL preflight validation runs on the host. There is exactly ONE
+# `singularity exec` in this script (the actual nnUNetv2_predict call).
 #
-# CRITICAL: imagesTs/*_0000.nii.gz are SYMLINKS to /data/hf_export/ct/*
-# (container path created by convert_hf_to_nnunet.py --symlinks). The
-# /data/hf_export bind MUST be present or those symlinks dangle inside
-# the container and nnUNetv2_predict reports "0 cases in the source
-# folder". Earlier version of this script omitted that bind and caused
-# job 36001641 to do nothing. Don't repeat.
+# May 2026 — host-side validation refactor
+# =========================================
+# Earlier version did two probe `singularity exec` calls before launch
+# (symlink-resolution probe + pymp tmpdir writability probe). On nodes
+# where singularity has to convert SIF -> sandbox on first invocation,
+# each probe pays that cost; on a slow/contended node the first probe
+# can wedge for hours (job 36030037 sat 8.5h in the symlink probe).
+# Both probes are now equivalent host-side bash:
+#   - symlink probe  -> readlink each .nii.gz, translate the container
+#                       path /data/hf_export/ to ${HF_EXPORT_NFS}/, stat
+#                       the resolved host path
+#   - pymp tmpdir    -> we mkdir'd it ourselves on the host, just touch
+#                       a probe file
+# These take milliseconds and don't touch singularity at all.
 #
-# CRITICAL (May 2026): SINGULARITYENV_TMPDIR points to node-local /dev/shm
-# (via /pymp_tmp bind) — NOT NFS. nnU-Net v2's preprocessing workers use
-# Unix-socket IPC under TMPDIR; NFS has slow finalizer semantics and
-# unreliable socket lifecycle, which causes a worker-shutdown vs queue-drain
-# race. Symptom: completed run (progress 100%) followed by FileNotFoundError
-# on .../listener-XXXX in 6+ child processes, then a top-level
-# nnUNetv2_predict crash even though all output NIfTIs are on disk.
-# /dev/shm is RAM-backed, fast, and handles socket lifecycle cleanly.
-# Job 36015585 hit this crash; this fix prevents it.
-#
-#   * -npp 8 / -nps 6 — keep H200 fed
-#   * stdbuf line-buffered stdout/stderr
-#   * background ETA watcher every 60s
-#   * --continue_prediction — re-submit if walltime hits, resumes
-#   * Filesystem-based completion validation — treats post-completion
-#     multiprocessing-shutdown crash as cosmetic when all output NIfTIs
-#     are present (validates by filesystem, not exit code).
+# Race-condition mitigations preserved
+# ====================================
+#   * SINGULARITYENV_TMPDIR -> node-local /dev/shm (NOT NFS) — avoids
+#     the worker-shutdown vs queue-drain race that crashes nnU-Net v2's
+#     predict at completion under -npp/-nps > 1
+#   * /dev/shm bound directly (matches train script pattern)
+#   * Filesystem-based completion validation (not exit code) — treats
+#     post-completion multiprocessing-shutdown crash as cosmetic when
+#     all output NIfTIs are present
+#   * Single consolidated EXIT trap
+#   * /data/hf_export bind preserved — imagesTs/*_0000.nii.gz are
+#     symlinks pointing at /data/hf_export/ct/* (container path)
 #
 # Override at submit time:
 #   sbatch --export=ALL,CHECKPOINT=checkpoint_latest.pth slurm/spine_predict_803_best.sh
@@ -48,12 +52,12 @@
 
 set -euo pipefail
 
-# -- Singularity runtime dirs (matches slurm/spine_prep.sh) ------------------
+# -- Singularity / runtime dirs (matches spine_train_array.sh) ---------------
 export SINGULARITY_TMPDIR="/tmp/${USER}_job_${SLURM_JOB_ID}"
 export XDG_RUNTIME_DIR="${SINGULARITY_TMPDIR}/runtime"
 export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
 mkdir -p "${SINGULARITY_TMPDIR}" "${XDG_RUNTIME_DIR}" "${NXF_SINGULARITY_CACHEDIR}"
-trap 'rm -rf "${SINGULARITY_TMPDIR}"' EXIT
+
 export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
 export PATH="${CONDA_PREFIX}/bin:${PATH}"
 unset JAVA_HOME; which singularity
@@ -85,9 +89,6 @@ WANDB_TRAINER_HOST="${PROJECT_ROOT}/tools/nnunet_wandb_variant.py"
 WANDB_TRAINER_CONTAINER="/opt/conda/lib/python3.11/site-packages/nnunetv2/training/nnUNetTrainer/variants/nnunet_wandb_variant.py"
 
 # -- HF export discovery (matches slurm/spine_prep.sh) -----------------------
-# Required because imagesTs/*_0000.nii.gz are symlinks pointing at
-# /data/hf_export/ct/* (container-internal path). Without this bind,
-# the symlinks dangle inside the container.
 if [[ -z "${HF_EXPORT_DIR:-}" ]]; then
     for cand in \
         "${PROJECT_ROOT}/data/hf_export" \
@@ -103,8 +104,19 @@ HF_EXPORT_NFS="${HF_EXPORT_DIR}"
 
 DS_DIR_NAME="Dataset$(printf '%03d' ${DATASET_ID})_${DATASET_NAME}"
 RUN_DIR="${NNUNET_NFS}/results/${DS_DIR_NAME}/${TRAINER}__${PLANS}__${CONFIG}"
+IMAGES_TS_HOST="${NNUNET_NFS}/raw/${DS_DIR_NAME}/imagesTs"
 
-mkdir -p "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/tmp"
+mkdir -p "${PROJECT_ROOT}/logs"
+
+WATCH_DONE_FLAG="${NODE_LOCAL_TMP}/.watcher_should_exit"
+WATCHER_PID=""
+
+# ----- Single consolidated trap --------------------------------------------
+cleanup() {
+    [[ -n "${WATCHER_PID}" ]] && { touch "${WATCH_DONE_FLAG}" 2>/dev/null || true; kill "${WATCHER_PID}" 2>/dev/null || true; }
+    rm -rf "${SINGULARITY_TMPDIR}" "${NODE_LOCAL_TMP}"
+}
+trap cleanup EXIT
 
 # ----- Config banner --------------------------------------------------------
 echo "================================================================"
@@ -117,21 +129,25 @@ echo "  preproc workers (-npp): ${NPP}"
 echo "  export workers (-nps) : ${NPS}"
 echo "  project root  : ${PROJECT_ROOT}"
 echo "  HF export     : ${HF_EXPORT_NFS}"
-echo "  pymp tmpdir   : ${NODE_LOCAL_TMP} (node-local /dev/shm)"
+echo "  pymp tmpdir   : ${NODE_LOCAL_TMP} (node-local /dev/shm, host path)"
 echo "  job id        : ${SLURM_JOB_ID:-<not in slurm>}"
 echo "  node          : ${SLURMD_NODENAME:-$(hostname)}"
 echo "  start time    : $(date -Iseconds)"
 echo "================================================================"
 
-# ----- Preflight ------------------------------------------------------------
+# ----- Host-side preflight (no singularity exec) ----------------------------
 [[ ! -f "${CONTAINER}"        ]] && { echo "ERROR: container not found: ${CONTAINER}" >&2; exit 1; }
+[[ ! -f "${WANDB_TRAINER_HOST}" ]] && { echo "ERROR: trainer source not found: ${WANDB_TRAINER_HOST}" >&2; exit 1; }
 [[ ! -d "${HF_EXPORT_NFS}/ct" ]] && {
     echo "ERROR: ${HF_EXPORT_NFS}/ct missing — symlinked imagesTs CTs will not resolve." >&2
     echo "  Override with HF_EXPORT_DIR=/path/to/hf_export sbatch ..." >&2
     exit 1
 }
+[[ ! -d "${IMAGES_TS_HOST}" ]] && {
+    echo "ERROR: imagesTs not found: ${IMAGES_TS_HOST}" >&2; exit 1
+}
 
-# ----- Verify each fold has the requested checkpoint ------------------------
+# Verify each fold has the requested checkpoint.
 echo ""
 echo "Verifying checkpoints under ${RUN_DIR} ..."
 MISSING=()
@@ -161,25 +177,73 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
 fi
 echo "  All 5 folds have ${CHECKPOINT}."
 
+# ----- Host-side symlink resolution probe -----------------------------------
+# Replaces the previous `singularity exec ... ls` probe. Reads a sample
+# of imagesTs symlinks, translates the container path
+# /data/hf_export/...  -> ${HF_EXPORT_NFS}/..., and stats the host path.
+# The bind mount is what makes the in-container side work; if the host
+# side resolves, the bound path will too.
+echo ""
+echo "Probing symlink resolution on host ..."
+SAMPLES=( $(find "${IMAGES_TS_HOST}" -maxdepth 1 -name "*_0000.nii.gz" 2>/dev/null | head -3) )
+if [[ ${#SAMPLES[@]} -eq 0 ]]; then
+    echo "ERROR: no *_0000.nii.gz files in ${IMAGES_TS_HOST}" >&2
+    exit 2
+fi
+for SYM in "${SAMPLES[@]}"; do
+    TARGET=$(readlink -f "${SYM}" 2>/dev/null || readlink "${SYM}")
+    if [[ -z "${TARGET}" ]]; then
+        echo "ERROR: ${SYM} is not a symlink (or readlink failed)" >&2
+        exit 2
+    fi
+    if [[ "${TARGET}" == /data/hf_export/* ]]; then
+        # Container path; translate to host
+        HOST_TARGET="${HF_EXPORT_NFS}/${TARGET#/data/hf_export/}"
+    else
+        # Already host-resolved (readlink -f followed it)
+        HOST_TARGET="${TARGET}"
+    fi
+    if [[ ! -f "${HOST_TARGET}" ]]; then
+        echo "ERROR: symlink target unresolvable on host:" >&2
+        echo "       symlink: ${SYM}" >&2
+        echo "       raw    : $(readlink "${SYM}")" >&2
+        echo "       host   : ${HOST_TARGET}" >&2
+        echo "       This means HF_EXPORT_DIR is wrong or the dataset is missing files." >&2
+        exit 2
+    fi
+done
+echo "  symlinks resolve on host (sampled ${#SAMPLES[@]}): OK"
+
+# ----- Host-side pymp tmpdir writability probe ------------------------------
+# We mkdir'd ${NODE_LOCAL_TMP} on the host; container will see it via
+# the /dev/shm bind. No need to spin up the container to verify.
+if ! ( touch "${NODE_LOCAL_TMP}/.probe" && rm -f "${NODE_LOCAL_TMP}/.probe" ); then
+    echo "ERROR: ${NODE_LOCAL_TMP} not writable on host." >&2
+    exit 3
+fi
+echo "  pymp tmpdir writable on host: OK"
+
 # ----- GPU sanity -----------------------------------------------------------
 echo ""
 echo "GPU visible to job:"
 nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,driver_version --format=csv | sed 's/^/  /'
 
-# -- Singularity env mirroring spine_prep.sh ---------------------------------
-# CHANGE: TMPDIR now points at /pymp_tmp (bound from node-local /dev/shm)
-# instead of /workspace/tmp (NFS). See header comment for rationale.
-export SINGULARITYENV_TMPDIR="/pymp_tmp"
+# -- Singularity env ---------------------------------------------------------
+# TMPDIR points at the host /dev/shm path because we bind /dev/shm:/dev/shm
+# directly (matches train script). The container sees the same path on
+# both sides — no /pymp_tmp indirection needed.
+export SINGULARITYENV_TMPDIR="${NODE_LOCAL_TMP}"
 export SINGULARITYENV_nnUNet_raw="/nnunet_nfs/raw"
 export SINGULARITYENV_nnUNet_preprocessed="/nnunet_nfs/preprocessed"
 export SINGULARITYENV_nnUNet_results="/nnunet_nfs/results"
 
-SING_BINDS=(
+# Bind layout mirrors spine_train_array.sh's TRAIN_BINDS structure.
+PRED_BINDS=(
     --nv
+    --bind "/dev/shm:/dev/shm"
     --bind "${PROJECT_ROOT}:/workspace"
     --bind "${HF_EXPORT_NFS}:/data/hf_export"
     --bind "${NNUNET_NFS}:/nnunet_nfs"
-    --bind "${NODE_LOCAL_TMP}:/pymp_tmp"
     --bind "${WANDB_TRAINER_HOST}:${WANDB_TRAINER_CONTAINER}"
     --pwd  /workspace
 )
@@ -190,32 +254,10 @@ PRED_DIR_CONT="/nnunet_nfs/predictions/${DS_DIR_NAME}_${CONFIG}_${TRAINER}_${PLA
 mkdir -p "${PRED_DIR_NFS}"
 
 N_EXISTING=$({ find "${PRED_DIR_NFS}" -maxdepth 1 -name "*.nii.gz" 2>/dev/null || true; } | wc -l)
-N_TEST=$({ find "${NNUNET_NFS}/raw/${DS_DIR_NAME}/imagesTs" -maxdepth 1 -name "*_0000.nii.gz" 2>/dev/null || true; } | wc -l)
+N_TEST=$({ find "${IMAGES_TS_HOST}" -maxdepth 1 -name "*_0000.nii.gz" 2>/dev/null || true; } | wc -l)
 echo ""
 echo "Test cases (host find): ${N_TEST}   existing predictions: ${N_EXISTING}"
 echo "Output dir: ${PRED_DIR_NFS}"
-
-# Probe symlink resolution INSIDE the container before launching predict.
-# If imagesTs CTs don't resolve through the bind, fail now with a clear
-# error rather than have nnUNetv2_predict silently report "0 cases".
-echo ""
-echo "Probing symlink resolution inside container ..."
-PROBE_RESULT=$(singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
-    bash -c "ls /nnunet_nfs/raw/${DS_DIR_NAME}/imagesTs/*_0000.nii.gz 2>/dev/null \
-              | head -1 \
-              | xargs -I{} test -f {} && echo OK || echo FAIL")
-if [[ "${PROBE_RESULT}" != "OK" ]]; then
-    echo "ERROR: imagesTs CT symlinks do not resolve inside the container." >&2
-    echo "       This means /data/hf_export bind is missing or HF_EXPORT_DIR" >&2
-    echo "       points at the wrong location. Sample symlink target:" >&2
-    HOST_SAMPLE=$(find "${NNUNET_NFS}/raw/${DS_DIR_NAME}/imagesTs" -maxdepth 1 -name "*_0000.nii.gz" 2>/dev/null | head -1)
-    if [[ -n "${HOST_SAMPLE}" ]]; then
-        echo "       ${HOST_SAMPLE}" >&2
-        echo "       -> $(readlink ${HOST_SAMPLE})" >&2
-    fi
-    exit 2
-fi
-echo "  symlinks resolve inside container: OK"
 
 if [[ "${N_EXISTING}" -ge "${N_TEST}" && "${N_TEST}" -gt 0 ]]; then
     echo "All ensemble predictions already exist; nothing to do."
@@ -226,7 +268,6 @@ CONTINUE_FLAG=""
 [[ "${N_EXISTING}" -gt 0 ]] && CONTINUE_FLAG="--continue_prediction"
 
 # ----- Background ETA watcher ----------------------------------------------
-WATCH_DONE_FLAG="${PRED_DIR_NFS}/.watcher_should_exit"
 rm -f "${WATCH_DONE_FLAG}"
 (
     T_START=$(date +%s)
@@ -262,17 +303,15 @@ rm -f "${WATCH_DONE_FLAG}"
     done
 ) &
 WATCHER_PID=$!
-# CHANGE: trap also nukes node-local /dev/shm pymp dir on exit.
-trap 'rm -rf "${SINGULARITY_TMPDIR}" "${NODE_LOCAL_TMP}"; touch "${WATCH_DONE_FLAG}" 2>/dev/null; kill ${WATCHER_PID} 2>/dev/null || true' EXIT
 
-# ----- Run predict ----------------------------------------------------------
-# CHANGE: -e disabled around nnU-Net so the post-completion shutdown
-# crash doesn't kill the wrapper before we can validate by filesystem.
+# ----- Run predict (the ONLY singularity exec in this script) ---------------
+# Disable -e around nnU-Net so post-completion multiprocessing-shutdown
+# crashes don't kill our wrapper before it can validate output count.
 echo ""
 echo "Launching nnUNetv2_predict at $(date -Iseconds) ..."
 echo "----------------------------------------------------------------"
 set +e
-stdbuf -oL -eL singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
+stdbuf -oL -eL singularity exec "${PRED_BINDS[@]}" "${CONTAINER}" \
     nnUNetv2_predict \
         -i  "/nnunet_nfs/raw/${DS_DIR_NAME}/imagesTs" \
         -o  "${PRED_DIR_CONT}" \
@@ -289,15 +328,13 @@ stdbuf -oL -eL singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
 NNUNET_EXIT=$?
 set -e
 
-# ----- Stop watcher and summarize ------------------------------------------
+# ----- Stop watcher ---------------------------------------------------------
 touch "${WATCH_DONE_FLAG}"
 sleep 2
-kill ${WATCHER_PID} 2>/dev/null || true
-rm -f "${WATCH_DONE_FLAG}"
+kill "${WATCHER_PID}" 2>/dev/null || true
+WATCHER_PID=""
 
-# CHANGE: validate by filesystem, not exit code. The post-completion
-# multiprocessing-shutdown crash is cosmetic when all output NIfTIs
-# are present and non-empty.
+# ----- Validate by filesystem, not exit code -------------------------------
 sleep 5
 N_FINAL=$({ find "${PRED_DIR_NFS}" -maxdepth 1 -name "*.nii.gz" 2>/dev/null || true; } | wc -l)
 N_BAD=$({ find "${PRED_DIR_NFS}" -maxdepth 1 -name "*.nii.gz" -size -1k 2>/dev/null || true; } | wc -l)
@@ -321,8 +358,9 @@ if [[ ${N_FINAL} -ge ${N_TEST} && ${N_BAD} -eq 0 ]]; then
     if [[ ${NNUNET_EXIT} -ne 0 ]]; then
         echo " NOTE: nnUNetv2_predict exited ${NNUNET_EXIT}, but all"
         echo "       ${N_FINAL}/${N_TEST} predictions are present and non-empty."
-        echo "       Known multiprocessing-shutdown race in nnU-Net v2 — cosmetic."
-        echo "       Treating run as successful."
+        echo "       This is a known multiprocessing-shutdown race in nnU-Net v2"
+        echo "       (parent queue drain vs. worker finalizer cleanup) and is"
+        echo "       cosmetic. Treating run as successful."
     fi
     echo ""
     echo " Next: run eval"
@@ -330,13 +368,4 @@ if [[ ${N_FINAL} -ge ${N_TEST} && ${N_BAD} -eq 0 ]]; then
     echo "================================================================"
     exit 0
 elif [[ ${N_FINAL} -lt ${N_TEST} ]]; then
-    echo " WARN: only ${N_FINAL} of ${N_TEST} predictions completed."
-    echo "       Re-submit this script — --continue_prediction will resume."
-    echo "================================================================"
-    exit ${NNUNET_EXIT}
-else
-    echo " ERROR: ${N_FINAL}/${N_TEST} files present but ${N_BAD} are bad."
-    echo "        Inspect listed files; you may need to delete and re-predict."
-    echo "================================================================"
-    exit 1
-fi
+    echo " WARN: only ${N_FINAL} of ${N_
