@@ -166,20 +166,41 @@ esac
 PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/spinesurg-ct-nnunet}"
 
 # -- HF export discovery -----------------------------------------------------
+# The dataset (CT, labels, manifests, splits) lives in the SEPARATE
+# CTSpinoPelvic1K repo — see .gitignore ("Dataset (separate repo; do NOT
+# commit)"). That copy is CANONICAL. A project-local data/hf_export under
+# spinesurg-ct-nnunet is a shadow: used only if the canonical is absent, and
+# warned about loudly so a stale local copy can never silently win.
+# Override either with HF_EXPORT_DIR=/path (export) or SPLITS_FILE=/path.
+CTSPINO_ROOT="${CTSPINO_ROOT:-${HOME}/CTSpinoPelvic1K}"
+CTSPINO_HF_EXPORT="${CTSPINO_ROOT}/data/hf_export"
+LOCAL_HF_EXPORT="${PROJECT_ROOT}/data/hf_export"
+
 if [[ -z "${HF_EXPORT_DIR:-}" ]]; then
-    for cand in \
-        "${PROJECT_ROOT}/data/hf_export" \
-        "${HOME}/CTSpinoPelvic1K/data/hf_export"; do
-        if [[ -d "${cand}/ct" ]]; then
-            HF_EXPORT_DIR="${cand}"
-            break
+    if [[ -d "${CTSPINO_HF_EXPORT}/ct" ]]; then
+        HF_EXPORT_DIR="${CTSPINO_HF_EXPORT}"
+        if [[ -d "${LOCAL_HF_EXPORT}/ct" ]]; then
+            echo "WARN: a project-local hf_export shadow exists at" >&2
+            echo "        ${LOCAL_HF_EXPORT}" >&2
+            echo "      but the CANONICAL CTSpinoPelvic1K export is being used:" >&2
+            echo "        ${CTSPINO_HF_EXPORT}" >&2
+            echo "      To deliberately use the local one: HF_EXPORT_DIR=${LOCAL_HF_EXPORT}" >&2
         fi
-    done
+    elif [[ -d "${LOCAL_HF_EXPORT}/ct" ]]; then
+        HF_EXPORT_DIR="${LOCAL_HF_EXPORT}"
+        echo "WARN: canonical CTSpinoPelvic1K export not found at" >&2
+        echo "        ${CTSPINO_HF_EXPORT}" >&2
+        echo "      falling back to project-local shadow ${LOCAL_HF_EXPORT}." >&2
+    fi
 fi
-HF_EXPORT_DIR="${HF_EXPORT_DIR:-${PROJECT_ROOT}/data/hf_export}"
+HF_EXPORT_DIR="${HF_EXPORT_DIR:-${CTSPINO_HF_EXPORT}}"
 HF_EXPORT_NFS="${HF_EXPORT_DIR}"
 
 # -- Splits file discovery ---------------------------------------------------
+# Splits MUST come from the SAME export that provides the CT/labels/manifests
+# (the splitter derived them from that manifest), so the default tracks
+# HF_EXPORT_NFS. A project-local data/splits_5fold.json is a shadow, used
+# only if the export's own splits is missing — and warned about.
 if [[ -z "${SPLITS_FILE:-}" ]]; then
     for cand in \
         "${HF_EXPORT_NFS}/splits_5fold.json" \
@@ -191,6 +212,14 @@ if [[ -z "${SPLITS_FILE:-}" ]]; then
     done
 fi
 SPLITS_FILE_HOST="${SPLITS_FILE:-${HF_EXPORT_NFS}/splits_5fold.json}"
+
+if [[ "${SPLITS_FILE_HOST}" == "${PROJECT_ROOT}/data/splits_5fold.json" \
+      && -f "${CTSPINO_HF_EXPORT}/splits_5fold.json" ]]; then
+    echo "WARN: using project-local splits shadow" >&2
+    echo "        ${SPLITS_FILE_HOST}" >&2
+    echo "      while canonical ${CTSPINO_HF_EXPORT}/splits_5fold.json exists." >&2
+    echo "      Pin SPLITS_FILE=... to be explicit." >&2
+fi
 
 NNUNET_NFS="${PROJECT_ROOT}/nnunet"
 CONTAINER="${PROJECT_ROOT}/containers/spinesurg-ct.sif"
@@ -263,7 +292,21 @@ PY
     exit 1
 }
 SP_MTIME=$(stat -c '%y' "${SPLITS_FILE_HOST}" 2>/dev/null || stat -f '%Sm' "${SPLITS_FILE_HOST}")
-echo "  splits_5fold.json mtime: ${SP_MTIME}"
+echo "  splits source : ${SPLITS_FILE_HOST}"
+echo "  splits mtime  : ${SP_MTIME}"
+
+# Schema guard: the 6-way LSTV taxonomy needs schema v6+. This also catches
+# stray pre-schema junk files (e.g. an old splits_5fold.json with no
+# schema_version) being picked up by accident.
+SP_SCHEMA=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('schema_version',0))" "${SPLITS_FILE_HOST}" 2>/dev/null || echo 0)
+echo "  splits schema : v${SP_SCHEMA}"
+if [[ "${SP_SCHEMA}" -lt 6 ]]; then
+    echo "ERROR: splits file ${SPLITS_FILE_HOST} is schema v${SP_SCHEMA} (< 6)." >&2
+    echo "       The 6-way LSTV subtype taxonomy requires v6+. Regenerate with" >&2
+    echo "       scripts/generate_5fold_splits.py against the current HF export," >&2
+    echo "       or point SPLITS_FILE at the canonical CTSpinoPelvic1K v6 file." >&2
+    exit 1
+fi
 
 # -- Step 0: NFS cache check (fast exit if already complete) -----------------
 if [[ -f "${COMPLETE_MARKER}" ]] \
