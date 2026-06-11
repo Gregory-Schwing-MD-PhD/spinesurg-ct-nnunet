@@ -224,6 +224,46 @@ LABEL_REMAP_AT_CONVERT: Dict[int, int] = {
     10: 9,  # ignore: shift down (partial-annotation contract)
 }
 
+# No-ignore variant (fused-only ablation, May 2026).
+# ==================================================
+# Reviewer ask (camera-ready): a "fused-only versus all-cases" ablation,
+# evaluated on the fused test split. Fused records are FULLY annotated —
+# export_hf.py guarantees they carry NO ignore (10) voxels (it logs an
+# error if a fused label ever contains one). So when we restrict the
+# training/test pool to fused records, the ignore label becomes vestigial
+# and we drop it entirely: there is no partial-annotation machinery, no
+# ignore_index in the loss. This is the "don't use the ignore protocol"
+# arm of the ablation.
+#
+# The L6 -> last_lumbar merge is KEPT (it is orthogonal to the ignore
+# protocol) so the label semantics stay identical to the main Dataset803
+# model and the two arms differ only in (training pool, ignore protocol).
+#
+# Source 10 (ignore) -> background (0) defensively. On fused data this
+# never fires; it only matters if a stray ignore voxel slips through, in
+# which case treating it as background is the safe, fully-supervised
+# choice (there is no ignore class to route it to).
+LABEL_REMAP_NO_IGNORE: Dict[int, int] = {
+    6: 5,   # L6 -> last_lumbar (the merge)
+    7: 6,   # sacrum: shift down
+    8: 7,   # left_hip: shift down
+    9: 8,   # right_hip: shift down
+    10: 0,  # ignore -> background (defensive; fused carries none)
+}
+
+# 9-key scheme (8 foreground + background), no ignore class.
+LABEL_NAMES_NO_IGNORE = {
+    "background":  0,
+    "L1":          1,
+    "L2":          2,
+    "L3":          3,
+    "L4":          4,
+    "last_lumbar": 5,
+    "sacrum":      6,
+    "left_hip":    7,
+    "right_hip":   8,
+}
+
 # The maximum label value the source NIfTIs are expected to contain.
 # Anything above this in a source label file is unexpected; the remap
 # is defensive and clamps via lookup table size.
@@ -392,20 +432,28 @@ def _build_case_indices(
     use_symlinks: bool,
     do_link: bool,
     label_remap_lut: Optional[np.ndarray],
+    include_configs: Optional[frozenset] = None,
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Dict],
            List[str], List[str], int, Dict[str, int],
-           Dict[str, int]]:
+           Dict[str, int], int, Dict[str, int]]:
     """
     Iterate manifests, optionally write CT (link/copy) and label
     (remap-and-write) files into the nnU-Net layout, build indices.
 
+    include_configs: when not None, only records whose `config` (lower-cased)
+        is in this set are kept; all others are dropped from EVERY split
+        (train/val/test). Used by the fused-only ablation (include_configs
+        = {"fused"}). None means keep all records.
+
     Returns: (case_to_subtype, case_to_token, case_to_attrs,
               train_case_ids, test_case_ids, n_skipped,
-              refinement_stats, remap_stats)
+              refinement_stats, remap_stats, n_filtered, filtered_by_config)
 
     refinement_stats: how many cases were demoted by config.
     remap_stats: how many label files were physically rewritten via
                  the remap LUT (vs symlinked when no remap configured).
+    n_filtered: how many records were dropped by include_configs.
+    filtered_by_config: per-config breakdown of the dropped records.
     """
     case_to_subtype: Dict[str, str] = {}
     case_to_token:   Dict[str, str] = {}
@@ -416,6 +464,8 @@ def _build_case_indices(
 
     refinement_stats: Dict[str, int] = defaultdict(int)
     remap_stats: Dict[str, int] = defaultdict(int)
+    n_filtered = 0
+    filtered_by_config: Dict[str, int] = defaultdict(int)
 
     record_idx_by_token: Dict[str, int] = defaultdict(int)
 
@@ -425,6 +475,17 @@ def _build_case_indices(
             if not tok:
                 n_skipped += 1
                 continue
+
+            # Config filter (fused-only ablation). Drop records whose
+            # `config` is not in the allow-list from every split. Done
+            # BEFORE the per-token record index is consumed so the kept
+            # records keep contiguous _r suffixes.
+            if include_configs is not None:
+                rec_config = str(rec.get("config", "")).strip().lower()
+                if rec_config not in include_configs:
+                    n_filtered += 1
+                    filtered_by_config[rec_config or "(none)"] += 1
+                    continue
 
             ct_rel    = rec.get("ct_file") or rec.get("ct") or ""
             label_rel = rec.get("label_file") or rec.get("label") or ""
@@ -510,7 +571,8 @@ def _build_case_indices(
 
     return (case_to_subtype, case_to_token, case_to_attrs,
             train_case_ids, test_case_ids, n_skipped,
-            dict(refinement_stats), dict(remap_stats))
+            dict(refinement_stats), dict(remap_stats),
+            n_filtered, dict(filtered_by_config))
 
 
 def _write_splits_final(
@@ -608,8 +670,39 @@ def main():
                     help="Disable the L6->last_lumbar label remap. Use this "
                          "to reproduce the legacy unmerged 10-class scheme on "
                          "Dataset802. Default: remap is APPLIED.")
+    p.add_argument("--include_configs", default="",
+                    help="Comma-separated list of record `config` values to "
+                         "KEEP (e.g. 'fused'). Records whose config is not "
+                         "listed are dropped from ALL splits (train/val/test). "
+                         "Empty (default) keeps every record. Use 'fused' for "
+                         "the fused-only ablation.")
+    p.add_argument("--drop_ignore_label", action="store_true",
+                    help="Build the label scheme WITHOUT the ignore class and "
+                         "remap any source ignore voxels (10) to background "
+                         "(0). For the fused-only ablation, where records are "
+                         "fully annotated and carry no ignore voxels. Keeps the "
+                         "L6->last_lumbar merge. Incompatible with --no_remap.")
     p.add_argument("--regen_splits_only", action="store_true")
     args = p.parse_args()
+
+    if args.drop_ignore_label and args.no_remap:
+        log.error("--drop_ignore_label is incompatible with --no_remap "
+                  "(no-ignore is defined only on the merged contiguous scheme).")
+        raise SystemExit(2)
+
+    include_configs: Optional[frozenset] = None
+    if args.include_configs.strip():
+        include_configs = frozenset(
+            c.strip().lower() for c in args.include_configs.split(",") if c.strip()
+        )
+        unknown = include_configs - set(_VALID_CONFIGS)
+        if unknown:
+            log.warning("--include_configs lists unrecognized config(s) %s; "
+                        "valid configs are %s. Records with those configs "
+                        "(if any) will be kept; typos silently keep nothing.",
+                        sorted(unknown), list(_VALID_CONFIGS))
+        log.info("Config filter ACTIVE: keeping only records with config in %s",
+                 sorted(include_configs))
 
     if not args.hf_dir.exists():
         log.error("HF dir not found: %s", args.hf_dir)
@@ -654,6 +747,19 @@ def main():
                  "intended only as a reference baseline; do NOT train against "
                  "it with the v20+ trainer (the trainer assumes contiguous "
                  "label values).")
+    elif args.drop_ignore_label:
+        label_remap_lut = _build_remap_lut(LABEL_REMAP_NO_IGNORE)
+        active_label_names = LABEL_NAMES_NO_IGNORE
+        log.info("Label remap (NO-IGNORE variant): %s", dict(LABEL_REMAP_NO_IGNORE))
+        log.info("  -> 9-key scheme (8 fg + bg), NO ignore class. Source "
+                 "ignore (10) -> background (0) defensively. Intended for the "
+                 "fused-only ablation (fused records carry no ignore voxels).")
+        if include_configs is None:
+            log.warning("--drop_ignore_label set WITHOUT --include_configs: "
+                        "any partial-annotation (spine_only/pelvic_native) "
+                        "records present will have their ignore voxels folded "
+                        "into BACKGROUND, which falsely supervises unannotated "
+                        "regions. Pass --include_configs fused for the ablation.")
     else:
         label_remap_lut = _build_remap_lut(LABEL_REMAP_AT_CONVERT)
         active_label_names = LABEL_NAMES
@@ -684,12 +790,19 @@ def main():
 
     (case_to_subtype, case_to_token, case_to_attrs,
      train_case_ids, test_case_ids, n_skipped,
-     refinement_stats, remap_stats) = _build_case_indices(
+     refinement_stats, remap_stats,
+     n_filtered, filtered_by_config) = _build_case_indices(
         manifests, splits_subtypes, args.hf_dir,
         images_tr, labels_tr, images_ts, labels_ts,
         use_symlinks=args.symlinks, do_link=do_link,
         label_remap_lut=label_remap_lut,
+        include_configs=include_configs,
     )
+
+    if include_configs is not None:
+        log.info("Config filter dropped %d record(s): %s",
+                 n_filtered, filtered_by_config or "{}")
+        log.info("  kept configs: %s", sorted(include_configs))
 
     if do_link:
         log.info("Linked/copied: train=%d  test=%d  skipped=%d",
@@ -713,7 +826,25 @@ def main():
 
     # ── dataset.json (skipped in regen mode) ───────────────────────────────
     if do_link:
-        if label_remap_lut is not None:
+        if args.drop_ignore_label:
+            description = (
+                "CTSpinoPelvic1K — FUSED-ONLY ablation, 9-key spine + pelvis "
+                "CT (8 fg + bg) with merged last_lumbar (L5+L6) and NO ignore "
+                "label. Training/test pool restricted to fully-annotated "
+                "fused records; the partial-annotation ignore protocol is "
+                "disabled. L6 source labels remapped to last_lumbar (5); "
+                "sacrum/hips shifted down for contiguous label values. "
+                "Reviewer ablation: fused-only vs all-cases, evaluated on the "
+                "fused test split. Recover individual L5/L6 via instance "
+                "post-processing or VERIDAH (Möller 2026)."
+            )
+            release = (
+                "May 2026 — fused-only ablation (no ignore protocol) / "
+                "schema v6 splits / v3 lstv_cases / L6 merged into "
+                "last_lumbar following Möller 2026 (VERIDAH §2.2) / "
+                "contiguous label IDs"
+            )
+        elif label_remap_lut is not None:
             description = (
                 "CTSpinoPelvic1K — fused 9-class spine + pelvis CT (8 fg + bg) "
                 "with merged last_lumbar (L5+L6) and ignore label (9) for "
@@ -751,10 +882,12 @@ def main():
             "release":       release,
         }
         (ds_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
-        log.info("Wrote dataset.json with %d label keys (%d foreground + bg + ignore)",
-                 len(active_label_names),
-                 sum(1 for k in active_label_names
-                     if k not in ("background", "ignore")))
+        n_fg = sum(1 for k in active_label_names
+                   if k not in ("background", "ignore"))
+        has_ignore = "ignore" in active_label_names
+        log.info("Wrote dataset.json with %d label keys (%d foreground + bg%s)",
+                 len(active_label_names), n_fg,
+                 " + ignore" if has_ignore else "; NO ignore class")
 
     # ── splits_final.json + lstv_cases.json (always written) ───────────────
     _write_splits_final(

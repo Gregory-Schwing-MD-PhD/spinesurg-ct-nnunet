@@ -20,18 +20,25 @@
 #
 # Usage:
 #     FOLD=0 sbatch slurm/spine_eval_single.sh
+#
+# Fused-only ablation (predict + eval the fold-0 model on the fused test
+# split). N_CLASSES=9 because the no-ignore scheme has values 0..8:
+#     FOLD=0 DATASET_ID=804 DATASET_NAME=SpineSurgCTFusedOnly \
+#       TRAINER=nnUNetTrainerWandB_500ep_LSTVOversample N_CLASSES=9 \
+#       sbatch slurm/spine_eval_single.sh
 # =============================================================================
 
 set -euo pipefail
 
 FOLD="${FOLD:-0}"
 
-DATASET_ID=802
-DATASET_NAME="SpineSurgCTFull"
-CONFIG="3d_fullres"
+DATASET_ID="${DATASET_ID:-802}"
+DATASET_NAME="${DATASET_NAME:-SpineSurgCTFull}"
+CONFIG="${CONFIG:-3d_fullres}"
 TRAINER="${TRAINER:-nnUNetTrainerWandB_1000ep_LSTVOversample}"
-GPU_MEMORY_TARGET_GB=100
-PLANS="nnUNetResEncUNetPlans_${GPU_MEMORY_TARGET_GB}G"
+GPU_MEMORY_TARGET_GB="${GPU_MEMORY_TARGET_GB:-100}"
+PLANS="${PLANS:-nnUNetResEncUNetPlans_${GPU_MEMORY_TARGET_GB}G}"
+N_CLASSES="${N_CLASSES:-10}"
 
 PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/SpineSurg-CT}"
 NNUNET_NFS="${PROJECT_ROOT}/nnunet"
@@ -95,7 +102,7 @@ singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
         --labels_dir      "/nnunet_nfs/raw/${DS_DIR_NAME}/labelsTs" \
         --output_json     "${PRED_DIR_CONT}/metrics.json" \
         --output_md       "${PRED_DIR_CONT}/metrics.md" \
-        --n_classes       10
+        --n_classes       ${N_CLASSES}
 
 echo ""; echo "----- paper metrics -----"
 singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \

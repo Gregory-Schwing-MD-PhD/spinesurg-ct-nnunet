@@ -101,6 +101,19 @@ SINGLE_FOLD_SPLITS="${SINGLE_FOLD_SPLITS:-0}"
 INCLUDE_TRAIN_MATCH_TYPES="${INCLUDE_TRAIN_MATCH_TYPES:-}"
 TEST_MATCH_TYPES="${TEST_MATCH_TYPES:-}"
 
+# Fused-only ablation (May 2026) — reviewer "fused-only vs all-cases" ask.
+#   INCLUDE_CONFIGS=fused     keep only fused records (drop spine_only +
+#                             pelvic_native partial-annotation records).
+#   DROP_IGNORE_LABEL=1       build the 9-key no-ignore scheme (8 fg + bg);
+#                             fused records carry no ignore voxels, so the
+#                             ignore protocol is disabled entirely.
+# Example (build the ablation dataset):
+#   INCLUDE_CONFIGS=fused DROP_IGNORE_LABEL=1 \
+#     DATASET_ID=804 DATASET_NAME=SpineSurgCTFusedOnly \
+#     sbatch slurm/spine_prep.sh
+INCLUDE_CONFIGS="${INCLUDE_CONFIGS:-}"
+DROP_IGNORE_LABEL="${DROP_IGNORE_LABEL:-0}"
+
 # Hard error on env vars that map to convert features that no longer
 # exist (May 2026 CLI). Better to fail loudly than silently train on
 # an unfiltered dataset.
@@ -113,8 +126,23 @@ if [[ -n "${INCLUDE_TRAIN_MATCH_TYPES}" || -n "${TEST_MATCH_TYPES}" ]]; then
     echo "ERROR: INCLUDE_TRAIN_MATCH_TYPES / TEST_MATCH_TYPES are no longer supported." >&2
     echo "       The convert script now uses ALL records from manifest_train.json + " >&2
     echo "       manifest_validation.json as training cases, and manifest_test.json " >&2
-    echo "       as test cases. Filter at the manifest level upstream if needed." >&2
+    echo "       as test cases. For the fused-only ablation use INCLUDE_CONFIGS=fused" >&2
+    echo "       (config-level filter), not the removed match-type filters." >&2
     exit 1
+fi
+
+# Fused-only ablation guards (mirror convert_hf_to_nnunet.py).
+if [[ "${DROP_IGNORE_LABEL}" == "1" && "${LEGACY_NO_REMAP}" == "1" ]]; then
+    echo "ERROR: DROP_IGNORE_LABEL=1 is incompatible with LEGACY_NO_REMAP=1." >&2
+    echo "       The no-ignore scheme is defined only on the merged contiguous" >&2
+    echo "       label scheme; drop LEGACY_NO_REMAP for the ablation." >&2
+    exit 1
+fi
+if [[ "${DROP_IGNORE_LABEL}" == "1" && -z "${INCLUDE_CONFIGS}" ]]; then
+    echo "WARN: DROP_IGNORE_LABEL=1 without INCLUDE_CONFIGS — partial-annotation" >&2
+    echo "      records (spine_only/pelvic_native) would have their ignore voxels" >&2
+    echo "      folded into BACKGROUND, falsely supervising unannotated regions." >&2
+    echo "      For the reviewer ablation pass INCLUDE_CONFIGS=fused." >&2
 fi
 
 # v5: warn loudly when Dataset802 is requested without --no_remap, since
@@ -278,14 +306,26 @@ if [[ "${LEGACY_NO_REMAP}" == "1" ]]; then
     CONVERT_REMAP_FLAG="--no_remap"
 fi
 
+# Fused-only ablation flags (empty unless requested via env).
+CONVERT_ABLATION_FLAGS=""
+if [[ -n "${INCLUDE_CONFIGS}" ]]; then
+    CONVERT_ABLATION_FLAGS="${CONVERT_ABLATION_FLAGS} --include_configs ${INCLUDE_CONFIGS}"
+fi
+if [[ "${DROP_IGNORE_LABEL}" == "1" ]]; then
+    CONVERT_ABLATION_FLAGS="${CONVERT_ABLATION_FLAGS} --drop_ignore_label"
+fi
+
 echo "================================================================"
 echo " Stage A: convert + preprocess (SIMPLE, NFS-only)"
 echo "   Dataset      : ${DS_DIR_NAME}"
 if [[ "${LEGACY_NO_REMAP}" == "1" ]]; then
     echo "   Label scheme : LEGACY 10-class (--no_remap; L5/L6 separate)"
+elif [[ "${DROP_IGNORE_LABEL}" == "1" ]]; then
+    echo "   Label scheme : FUSED-ONLY no-ignore 9-key (8 fg + bg; NO ignore class)"
 else
     echo "   Label scheme : v20 merged 9-class (last_lumbar = former L5+L6)"
 fi
+[[ -n "${INCLUDE_CONFIGS}" ]] && echo "   Config filter: keep only [${INCLUDE_CONFIGS}]"
 echo "   Plans        : ${PLANS} (target ${GPU_MEMORY_TARGET_GB} GB)"
 echo "   HF export    : ${HF_EXPORT_NFS}"
 echo "   Splits file  : ${SPLITS_FILE_HOST}"
@@ -327,7 +367,7 @@ else
             --nnunet_raw /nnunet_nfs/raw \
             --dataset_id   ${DATASET_ID} \
             --dataset_name ${DATASET_NAME} \
-            --symlinks ${CONVERT_REMAP_FLAG}
+            --symlinks ${CONVERT_REMAP_FLAG} ${CONVERT_ABLATION_FLAGS}
 fi
 
 # -- Step 2: plan + preprocess (reads + writes on NFS) -----------------------
@@ -372,13 +412,43 @@ fi
 #   - Stale Dataset802 build still living under the 803 dir name
 #   - Forgot --no_remap when rebuilding 802 baseline
 #   - export_hf.py changes that changed the source label values
-DS_JSON_OK=$(python - "${NFS_RAW_DS}/dataset.json" "${DATASET_ID}" "${LEGACY_NO_REMAP}" <<'PY' 2>/dev/null || echo "fail"
+DS_JSON_OK=$(python - "${NFS_RAW_DS}/dataset.json" "${DATASET_ID}" "${LEGACY_NO_REMAP}" "${DROP_IGNORE_LABEL}" <<'PY' 2>/dev/null || echo "fail"
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     ds_id = int(sys.argv[2])
     legacy_no_remap = sys.argv[3] == "1"
+    drop_ignore = len(sys.argv) > 4 and sys.argv[4] == "1"
     labels = d.get("labels", {})
+
+    # Fused-only no-ignore ablation: expect the 9-key scheme with NO
+    # ignore class. Validated separately because the default check below
+    # requires an "ignore" key (which this scheme intentionally lacks).
+    if drop_ignore:
+        expected = {
+            "background":  0,
+            "L1":          1,
+            "L2":          2,
+            "L3":          3,
+            "L4":          4,
+            "last_lumbar": 5,
+            "sacrum":      6,
+            "left_hip":    7,
+            "right_hip":   8,
+        }
+        norm = {k: int(v) for k, v in labels.items()}
+        if "ignore" in norm:
+            print(f"unexpected-ignore-key (no-ignore ablation): labels={norm}")
+        elif norm == expected:
+            print("ok (fused-only no-ignore 9-key)")
+        else:
+            mism = []
+            for k in sorted(set(norm) | set(expected)):
+                if norm.get(k) != expected.get(k):
+                    mism.append(f"{k}: got={norm.get(k)} expected={expected.get(k)}")
+            print(f"label-mismatch (no-ignore): {'; '.join(mism)}")
+        sys.exit(0)
+
     if "ignore" not in labels:
         print(f"missing-ignore-key: labels={labels}")
         sys.exit(0)
@@ -432,7 +502,12 @@ PY
 )
 if [[ "${DS_JSON_OK}" != ok* ]]; then
     echo "ERROR: dataset.json sanity check FAILED: ${DS_JSON_OK}" >&2
-    if [[ "${DATASET_ID}" == "803" ]]; then
+    if [[ "${DROP_IGNORE_LABEL}" == "1" ]]; then
+        echo "       Expected fused-only no-ignore scheme: bg=0, L1-L4=1-4," >&2
+        echo "       last_lumbar=5, sacrum=6, left_hip=7, right_hip=8 (NO ignore)." >&2
+        echo "       Ensure --include_configs fused --drop_ignore_label reached" >&2
+        echo "       convert_hf_to_nnunet.py (INCLUDE_CONFIGS=fused DROP_IGNORE_LABEL=1)." >&2
+    elif [[ "${DATASET_ID}" == "803" ]]; then
         echo "       Expected v20 merged scheme: bg=0, L1-L4=1-4, last_lumbar=5," >&2
         echo "       sacrum=6, left_hip=7, right_hip=8, ignore=9." >&2
         echo "       Re-run convert_hf_to_nnunet.py against the patched export." >&2
@@ -443,7 +518,11 @@ if [[ "${DS_JSON_OK}" != ok* ]]; then
     fi
     exit 3
 fi
-echo "  dataset.json: ${DS_JSON_OK} (partial-annotation training will work)"
+if [[ "${DROP_IGNORE_LABEL}" == "1" ]]; then
+    echo "  dataset.json: ${DS_JSON_OK} (fused-only; ignore protocol disabled)"
+else
+    echo "  dataset.json: ${DS_JSON_OK} (partial-annotation training will work)"
+fi
 
 touch "${COMPLETE_MARKER}"
 
@@ -455,5 +534,11 @@ echo "   data dir        : ${PREP_DATA_DIR}"
 echo "   .npz files      : ${N_NPZ_NFS}"
 echo "   preprocessed    : ${NFS_PREP_DS}  (${NFS_SIZE})"
 echo ""
-echo " NEXT:  sbatch slurm/spine_train_array.sh"
+if [[ "${DROP_IGNORE_LABEL}" == "1" || -n "${INCLUDE_CONFIGS}" ]]; then
+    echo " NEXT (train fold 0 of the ablation):"
+    echo "   DATASET_ID=${DATASET_ID} DATASET_NAME=${DATASET_NAME} \\"
+    echo "     sbatch --array=0 slurm/spine_train_array.sh"
+else
+    echo " NEXT:  sbatch slurm/spine_train_array.sh"
+fi
 echo "================================================================"
