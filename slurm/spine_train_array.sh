@@ -145,6 +145,15 @@ SPINESURG_USE_TMP_CACHE="${SPINESURG_USE_TMP_CACHE:-1}"
 DATASET_ID="${DATASET_ID:-803}"
 DATASET_NAME="${DATASET_NAME:-SpineSurgCTFullMerged}"
 CONFIG="${CONFIG:-3d_fullres}"
+
+# Label-scheme toggle for the trainer (tools/nnunet_wandb_variant.py). The
+# trainer resolves SPINESURG_LABEL_SCHEME at import time to pick the merged
+# 9-class (Dataset803) vs unmerged 10-class (Dataset802) constants, CE
+# weights, confusion headline, and loss ignore_index. Default it from
+# DATASET_ID (802 -> unmerged, anything else -> merged) unless the caller set
+# it explicitly. Passed into the container via SINGULARITYENV_ below.
+SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-$([[ "${DATASET_ID}" == "802" ]] && echo unmerged || echo merged)}"
+export SPINESURG_LABEL_SCHEME
 TRAINER="${TRAINER:-nnUNetTrainerWandB_500ep_LSTVOversample}"
 PLANNER="${PLANNER:-nnUNetPlannerResEncM}"
 GPU_MEMORY_TARGET_GB="${GPU_MEMORY_TARGET_GB:-100}"
@@ -505,6 +514,7 @@ export SINGULARITYENV_LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}"
 export SINGULARITYENV_SPINESURG_LSTV_BIAS_ENABLED="${SPINESURG_LSTV_BIAS_ENABLED}"
 export SINGULARITYENV_SPINESURG_LSTV_BIAS_L6_PROB="${SPINESURG_LSTV_BIAS_L6_PROB}"
 export SINGULARITYENV_SPINESURG_LSTV_BIAS_SACRUM_PROB="${SPINESURG_LSTV_BIAS_SACRUM_PROB}"
+export SINGULARITYENV_SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME}"
 export SINGULARITYENV_SPINESURG_PERF="${SPINESURG_PERF}"
 export SINGULARITYENV_SPINESURG_CHANNELS_LAST="${SPINESURG_CHANNELS_LAST}"
 export SINGULARITYENV_SPINESURG_PROFILE="${SPINESURG_PROFILE}"
@@ -585,6 +595,7 @@ echo "   gpu           : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/
 echo "   cpus alloc    : ${SLURM_CPUS_PER_TASK:-?}"
 echo "   dataset       : ${DS_DIR_NAME}"
 echo "   label scheme  : ${LABEL_SCHEME_STATE}"
+echo "   trainer scheme: SPINESURG_LABEL_SCHEME=${SPINESURG_LABEL_SCHEME} (merged=Dataset803 9-class, unmerged=Dataset802 10-class)"
 echo "   trainer       : ${TRAINER}"
 echo "   plans         : ${PLANS}"
 echo "   LSTV frac     : ${LSTV_OVERSAMPLE_FRAC}"

@@ -191,28 +191,97 @@ _METRIC_KEYS = (
     "epoch_start_timestamps", "epoch_end_timestamps",
 )
 
-# ── Anatomy constants (Dataset803 — merged last_lumbar, contiguous IDs) ────
-# Foreground class IDs are 1..8 (8 classes). _ANATOMY_NAMES is parallel
-# to _FG_CLASS_IDS so that _ANATOMY_NAMES[cid - 1] yields the human-
-# readable name for the foreground class with ID cid.
-_ANATOMY_NAMES = ["L1", "L2", "L3", "L4", "last_lumbar",
-                   "sacrum", "left_hip", "right_hip"]
 
-_FG_CLASS_IDS    = [1, 2, 3, 4, 5, 6, 7, 8]
-_LUMBAR_IDS      = [1, 2, 3, 4, 5]   # L1..last_lumbar
-_PELVIS_IDS      = [6, 7, 8]         # sacrum, left_hip, right_hip
+# ── Env helpers ────────────────────────────────────────────────────────────
+# Defined EARLY (before the label-scheme toggle and the anatomy constants)
+# because the label scheme must be resolved at import time — see the block
+# below. These are pure os.environ reads with no other dependencies.
 
-# Semantic label-ID aliases used by the headline logic.
-_L4_LABEL_ID          = 4   # bottom anatomical lumbar in sacr_count cases
-_LAST_LUMBAR_LABEL_ID = 5   # merged former-L5 + former-L6 (was 5 / 6)
-_SACRUM_LABEL_ID      = 6   # was 7 in unmerged scheme
-_IGNORE_LABEL         = 9   # was 10 in unmerged scheme
+def _env_truthy(name, default=False):
+    v = os.environ.get(name, "").strip().lower()
+    return (v in ("1", "true", "yes", "on")) if v else default
+
+
+def _env_int(name, default):
+    try: return int(os.environ.get(name, str(default)))
+    except Exception: return default
+
+
+def _env_float(name, default):
+    try: return float(os.environ.get(name, str(default)))
+    except Exception: return default
+
+
+# ── Label-scheme toggle (resolved ONCE, at import time) ────────────────────
+# SPINESURG_LABEL_SCHEME selects which label scheme this trainer is built
+# for. It MUST be resolved here, before any `def` below, because several
+# module-level helpers bind scheme-dependent constants as DEFAULT ARGUMENTS
+# (e.g. ignore_label=_IGNORE_LABEL, num_classes=_DEFAULT_NUM_OUTPUT_CLASSES),
+# and Python evaluates default arguments at def-time. sbatch exports the env
+# var before Python starts (see slurm/spine_train_array.sh), so it is stable
+# at import. Do NOT try to mutate these constants at runtime.
+#
+#   merged   (default) -> Dataset803, 9 output channels (bg + 8 fg);
+#                         L5/L6 collapsed into a single last_lumbar class.
+#   unmerged           -> Dataset802, 10 output channels (bg + 9 fg);
+#                         L5 and L6 are distinct classes (NeurIPS rebuttal
+#                         baseline: retrained to show L6 collapses to ~0 Dice).
+def _resolve_label_scheme() -> str:
+    v = os.environ.get("SPINESURG_LABEL_SCHEME", "").strip().lower()
+    if v in ("unmerged", "802", "legacy", "10class", "10-class"):
+        return "unmerged"
+    # Anything else (unset / "merged" / "803" / typos) -> merged (default).
+    return "merged"
+
+
+_SCHEME = _resolve_label_scheme()
+
+
+# ── Anatomy constants (scheme-dependent; finalized at import time) ─────────
+# _ANATOMY_NAMES is parallel to _FG_CLASS_IDS so that
+# _ANATOMY_NAMES[cid - 1] yields the human-readable name for the
+# foreground class with ID cid.
+if _SCHEME == "unmerged":
+    # Dataset802 — legacy 10-class scheme; L5 and L6 are distinct.
+    # Foreground class IDs are 1..9 (9 classes).
+    _ANATOMY_NAMES = ["L1", "L2", "L3", "L4", "L5", "L6",
+                      "sacrum", "left_hip", "right_hip"]
+
+    _FG_CLASS_IDS    = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    _LUMBAR_IDS      = [1, 2, 3, 4, 5, 6]   # L1..L6
+    _PELVIS_IDS      = [7, 8, 9]            # sacrum, left_hip, right_hip
+
+    # Semantic label-ID aliases used by the headline logic.
+    _L4_LABEL_ID     = 4   # bottom lumbar on sacr_count (4-lumbar) cases
+    _L5_LABEL_ID     = 5   # distinct L5
+    _L6_LABEL_ID     = 6   # distinct L6 (the collapse-to-L5 rebuttal metric)
+    _SACRUM_LABEL_ID = 7
+    _IGNORE_LABEL    = 10
+
+    # Network output channel count under the Dataset802 label schema:
+    # background + 9 foreground classes (ignore is masked, not classified).
+    _DEFAULT_NUM_OUTPUT_CLASSES = 10
+else:
+    # Dataset803 (default) — merged last_lumbar, contiguous IDs.
+    # Foreground class IDs are 1..8 (8 classes).
+    _ANATOMY_NAMES = ["L1", "L2", "L3", "L4", "last_lumbar",
+                       "sacrum", "left_hip", "right_hip"]
+
+    _FG_CLASS_IDS    = [1, 2, 3, 4, 5, 6, 7, 8]
+    _LUMBAR_IDS      = [1, 2, 3, 4, 5]   # L1..last_lumbar
+    _PELVIS_IDS      = [6, 7, 8]         # sacrum, left_hip, right_hip
+
+    # Semantic label-ID aliases used by the headline logic.
+    _L4_LABEL_ID          = 4   # bottom anatomical lumbar in sacr_count cases
+    _LAST_LUMBAR_LABEL_ID = 5   # merged former-L5 + former-L6 (was 5 / 6)
+    _SACRUM_LABEL_ID      = 6   # was 7 in unmerged scheme
+    _IGNORE_LABEL         = 9   # was 10 in unmerged scheme
+
+    # Network output channel count under the Dataset803 label schema:
+    # background + 8 foreground classes (ignore is masked, not classified).
+    _DEFAULT_NUM_OUTPUT_CLASSES = 9
 
 _VALID_CONFIGS   = ("fused", "spine_only", "pelvic_native")
-
-# Network output channel count under the Dataset803 label schema:
-# background + 8 foreground classes (ignore is masked, not classified).
-_DEFAULT_NUM_OUTPUT_CLASSES = 9
 
 # 6-way LSTV taxonomy (unchanged from v17+).
 _SUBTYPE_NORMAL     = "normal"
@@ -252,21 +321,6 @@ def _install_perf_tuning():
     except Exception: pass
     try: torch.set_float32_matmul_precision('high')
     except Exception: pass
-
-
-def _env_truthy(name, default=False):
-    v = os.environ.get(name, "").strip().lower()
-    return (v in ("1", "true", "yes", "on")) if v else default
-
-
-def _env_int(name, default):
-    try: return int(os.environ.get(name, str(default)))
-    except Exception: return default
-
-
-def _env_float(name, default):
-    try: return float(os.environ.get(name, str(default)))
-    except Exception: return default
 
 
 # ── LSTV case identification ────────────────────────────────────────────────
@@ -422,7 +476,10 @@ def _scan_lstv_case_ids_by_last_lumbar_voxels(labels_dir: str) -> Set[str]:
         if not fn.endswith(".nii.gz"): continue
         try:
             arr = np.asarray(nib.load(join(labels_dir, fn)).dataobj).astype(np.int16)
-            if np.any(arr == _LAST_LUMBAR_LABEL_ID):
+            # Scan for the bottom-most lumbar label (last_lumbar=5 under the
+            # merged scheme, L6=6 under the unmerged scheme). Referenced via
+            # _LUMBAR_IDS[-1] so this stays valid under both label schemes.
+            if np.any(arr == _LUMBAR_IDS[-1]):
                 out.add(fn[:-len(".nii.gz")])
         except Exception: continue
     return out
@@ -594,36 +651,53 @@ def _class_id_to_name(cid: int) -> str:
 # stays uncluttered. Other classes (L1-L3, hips) would be near-zero
 # noise on the relevant subgroups anyway.
 
-_HEADLINE_TARGETS_LL_GT_ON_LUMB = (
-    ("last_lumbar", _LAST_LUMBAR_LABEL_ID, "as_last_lumbar_frac",
-     "good — merged class predicted correctly"),
-    ("sacrum",      _SACRUM_LABEL_ID,      "as_sacrum_frac",
-     "concerning — bottom lumbar predicted as sacrum"),
-    ("L4",          _L4_LABEL_ID,          "as_L4_frac",
-     "concerning — bottom lumbar predicted as L4 (count truncated)"),
-    ("background",  0,                     "as_background_frac",
-     "concerning — lumbar voxel predicted as background"),
-)
+if _SCHEME == "unmerged":
+    # Unmerged (Dataset802) rebuttal block: anchor on GT-L6 over lumb cases
+    # and ask where those voxels get classified. The `as_L5_frac` entry is
+    # THE rebuttal metric — direct multi-class classification collapses L6
+    # onto L5, so this fraction is expected to be high while val/dice/L6 is
+    # ~0. Wired through the same _aggregate_block_by_gt machinery as merged.
+    _HEADLINE_TARGETS_L6_GT_ON_LUMB = (
+        ("L5",         _L5_LABEL_ID,     "as_L5_frac",
+         "THE collapse — GT-L6 voxels predicted as L5 (unmerged failure mode)"),
+        ("L4",         _L4_LABEL_ID,     "as_L4_frac",
+         "GT-L6 voxels predicted as L4"),
+        ("sacrum",     _SACRUM_LABEL_ID, "as_sacrum_frac",
+         "GT-L6 voxels predicted as sacrum"),
+        ("background", 0,                "as_background_frac",
+         "GT-L6 voxels predicted as background"),
+    )
+else:
+    _HEADLINE_TARGETS_LL_GT_ON_LUMB = (
+        ("last_lumbar", _LAST_LUMBAR_LABEL_ID, "as_last_lumbar_frac",
+         "good — merged class predicted correctly"),
+        ("sacrum",      _SACRUM_LABEL_ID,      "as_sacrum_frac",
+         "concerning — bottom lumbar predicted as sacrum"),
+        ("L4",          _L4_LABEL_ID,          "as_L4_frac",
+         "concerning — bottom lumbar predicted as L4 (count truncated)"),
+        ("background",  0,                     "as_background_frac",
+         "concerning — lumbar voxel predicted as background"),
+    )
 
-_HEADLINE_TARGETS_L4_GT_ON_SACR_COUNT = (
-    ("L4",          _L4_LABEL_ID,          "as_L4_frac",
-     "good — L4 predicted correctly"),
-    ("last_lumbar", _LAST_LUMBAR_LABEL_ID, "as_last_lumbar_frac",
-     "concerning — model still calls bottom lumbar 'last_lumbar' even with 4-lumbar count"),
-    ("sacrum",      _SACRUM_LABEL_ID,      "as_sacrum_frac",
-     "concerning — L4 predicted as sacrum"),
-    ("background",  0,                     "as_background_frac",
-     "concerning — L4 predicted as background"),
-)
+    _HEADLINE_TARGETS_L4_GT_ON_SACR_COUNT = (
+        ("L4",          _L4_LABEL_ID,          "as_L4_frac",
+         "good — L4 predicted correctly"),
+        ("last_lumbar", _LAST_LUMBAR_LABEL_ID, "as_last_lumbar_frac",
+         "concerning — model still calls bottom lumbar 'last_lumbar' even with 4-lumbar count"),
+        ("sacrum",      _SACRUM_LABEL_ID,      "as_sacrum_frac",
+         "concerning — L4 predicted as sacrum"),
+        ("background",  0,                     "as_background_frac",
+         "concerning — L4 predicted as background"),
+    )
 
-_HEADLINE_TARGETS_PRED_LL_ON_SACR_COUNT = (
-    ("L4",          _L4_LABEL_ID,          "actually_L4_frac",
-     "predicted last_lumbar at L4 anatomy (the failure mode)"),
-    ("sacrum",      _SACRUM_LABEL_ID,      "actually_sacrum_frac",
-     "predicted last_lumbar at sacrum anatomy"),
-    ("background",  0,                     "actually_background_frac",
-     "predicted last_lumbar in noise"),
-)
+    _HEADLINE_TARGETS_PRED_LL_ON_SACR_COUNT = (
+        ("L4",          _L4_LABEL_ID,          "actually_L4_frac",
+         "predicted last_lumbar at L4 anatomy (the failure mode)"),
+        ("sacrum",      _SACRUM_LABEL_ID,      "actually_sacrum_frac",
+         "predicted last_lumbar at sacrum anatomy"),
+        ("background",  0,                     "actually_background_frac",
+         "predicted last_lumbar in noise"),
+    )
 
 
 # =============================================================================
@@ -657,23 +731,46 @@ def _build_ce_class_weights(num_classes: int) -> Optional[torch.Tensor]:
     if num_classes is None or num_classes <= 0:
         return None
 
-    # Per-class weights keyed by the class index in the network output.
-    # Indices 0-8: background, L1-L4, last_lumbar, sacrum, left_hip,
-    # right_hip. (No entry for ignore=9; ignore is masked.)
-    weights = {
-        0: 0.5,  # background
-        1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0,  # L1-L4
-        5: 1.5,  # last_lumbar (merged former L5 + former L6)
-        6: 2.0,  # sacrum
-        7: 1.0, 8: 1.0,  # hips
-    }
-    name_to_id = {
-        "background":  0,
-        "L1":          1, "L2": 2, "L3": 3, "L4": 4,
-        "last_lumbar": 5,
-        "sacrum":      6,
-        "left_hip":    7, "right_hip": 8,
-    }
+    if _SCHEME == "unmerged":
+        # Unmerged (Dataset802) — L5 and L6 are distinct channels. Restore
+        # the pre-merge rare-class boost: L6 is the rare class (present only
+        # on lumbarized 6-lumbar spines) and needs a strong upweight; L5 a
+        # modest one; sacrum emphasized at the lumbosacral boundary.
+        # Indices 0-9: background, L1-L4, L5, L6, sacrum, left_hip,
+        # right_hip. (No entry for ignore=10; ignore is masked.)
+        weights = {
+            0: 0.5,  # background
+            1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0,  # L1-L4
+            5: 1.5,  # L5
+            6: 4.0,  # L6 (rare; strong boost to fight the collapse-to-L5)
+            7: 2.0,  # sacrum
+            8: 1.0, 9: 1.0,  # hips
+        }
+        name_to_id = {
+            "background":  0,
+            "L1":          1, "L2": 2, "L3": 3, "L4": 4,
+            "L5":          5, "L6": 6,
+            "sacrum":      7,
+            "left_hip":    8, "right_hip": 9,
+        }
+    else:
+        # Per-class weights keyed by the class index in the network output.
+        # Indices 0-8: background, L1-L4, last_lumbar, sacrum, left_hip,
+        # right_hip. (No entry for ignore=9; ignore is masked.)
+        weights = {
+            0: 0.5,  # background
+            1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0,  # L1-L4
+            5: 1.5,  # last_lumbar (merged former L5 + former L6)
+            6: 2.0,  # sacrum
+            7: 1.0, 8: 1.0,  # hips
+        }
+        name_to_id = {
+            "background":  0,
+            "L1":          1, "L2": 2, "L3": 3, "L4": 4,
+            "last_lumbar": 5,
+            "sacrum":      6,
+            "left_hip":    7, "right_hip": 8,
+        }
     overrides = os.environ.get("SPINESURG_CE_WEIGHTS", "").strip()
     if overrides:
         for spec in overrides.split(","):
@@ -976,6 +1073,69 @@ class _WandBMixin:
                 f"INSTALL FAILED: {exc}; using default loss")
             self._phase_end("ce_reweight", ok=False, note=str(exc))
 
+    # ── Label-scheme / dataset consistency check ──────────────────────────
+
+    def _verify_label_scheme_matches_dataset(self) -> None:
+        """Assert the import-time _SCHEME matches the dataset.json actually
+        being trained on.
+
+        Training Dataset802 (unmerged) data with the merged constants — or
+        Dataset803 (merged) data with unmerged constants — would silently
+        corrupt every per-class metric (channel-index vs label-value
+        mismatch) and use the wrong ignore_index in the loss. This guard
+        turns that into a loud, immediate failure.
+
+        The dataset scheme is detected from its label dict: an 'L6'
+        foreground key (or 9 foreground classes) => unmerged; a
+        'last_lumbar' key (or 8 foreground classes) => merged. On mismatch,
+        raises RuntimeError naming both the env _SCHEME and the detected
+        dataset scheme. If the label dict cannot be read, the check is
+        skipped (best-effort; it never blocks training on its own error).
+        """
+        labels: Dict = {}
+        try:
+            labels = dict(self.plans_manager.dataset_json.get("labels", {}))
+        except Exception:
+            try:
+                labels = dict(getattr(self, "dataset_json", {}).get("labels", {}))
+            except Exception:
+                labels = {}
+        if not labels:
+            try:
+                self.print_to_log_file(
+                    "label-scheme check: dataset.json labels unavailable; "
+                    f"skipping (env _SCHEME={_SCHEME})")
+            except Exception:
+                pass
+            return
+
+        label_keys = {str(k) for k in labels}
+        n_fg = sum(1 for k in labels
+                   if str(k).lower() not in ("ignore", "background"))
+        if "L6" in label_keys or n_fg == 9:
+            detected = "unmerged"
+        elif "last_lumbar" in label_keys or n_fg == 8:
+            detected = "merged"
+        else:
+            detected = None
+
+        try:
+            self.print_to_log_file(
+                f"label-scheme check: env _SCHEME={_SCHEME}, "
+                f"detected dataset scheme={detected} (labels={labels})")
+        except Exception:
+            pass
+
+        if detected is not None and detected != _SCHEME:
+            raise RuntimeError(
+                f"LABEL SCHEME MISMATCH: SPINESURG_LABEL_SCHEME resolved to "
+                f"'{_SCHEME}' but the dataset.json being trained indicates a "
+                f"'{detected}' scheme (labels={labels}). Set "
+                f"SPINESURG_LABEL_SCHEME={detected} (802 -> unmerged, "
+                f"803 -> merged), or point the trainer at the matching "
+                f"dataset. Aborting to avoid corrupt per-class metrics and a "
+                f"wrong loss ignore_index.")
+
     # ── Startup diagnostics ──────────────────────────────────────────────
 
     def _emit_startup_diagnostics(self) -> None:
@@ -991,9 +1151,13 @@ class _WandBMixin:
             except Exception: ds_name = "<unknown>"
             log(f"  dataset:          {ds_name}")
             log(f"  fold:             {getattr(self, 'fold', '?')}")
-            log(f"  label scheme:     v20 merged (last_lumbar = former L5+L6)")
+            _scheme_desc = ("merged (last_lumbar = former L5+L6)"
+                            if _SCHEME == "merged"
+                            else "unmerged (L5 and L6 distinct)")
+            log(f"  label scheme:     {_SCHEME}  [{_scheme_desc}]")
             log(f"  num_fg_classes:   {len(_FG_CLASS_IDS)}  ({_ANATOMY_NAMES})")
             log(f"  ignore_label:     {_IGNORE_LABEL}")
+            log(f"  num_output_chans: {_DEFAULT_NUM_OUTPUT_CLASSES}  (bg + fg)")
             try:
                 log(f"  num_epochs:       {self.num_epochs}")
                 log(f"  iters/epoch:      {getattr(self, 'num_iterations_per_epoch', '?')}")
@@ -1566,17 +1730,26 @@ class _WandBMixin:
             if pelvis_means: out[f"val/lstv_subgroup/{subtype}/mean_pelvis_dice"] = float(np.mean(pelvis_means))
             if fg_means:     out[f"val/lstv_subgroup/{subtype}/mean_fg_dice"] = float(np.mean(fg_means))
 
-        # ── v20 headline: last_lumbar dice on lumbarization ──────────
-        # Replaces the v19 L6_dice_on_lumbarization headline. Under
-        # the merged scheme this should reach ~0.85+ (similar to L4 on
-        # normals) once the class collision is resolved.
+        # ── headline: bottom-lumbar dice on lumbarization ────────────
+        # Merged (v20): last_lumbar dice on lumb cases — replaces the v19
+        # L6_dice_on_lumbarization headline; should reach ~0.85+ once the
+        # class collision is resolved.
+        # Unmerged (802): L6 dice on lumb cases — THE rebuttal number,
+        # expected ~0 because direct classification collapses L6 onto L5.
         lumb_cases = self._val_subgroup_dice.get(_SUBTYPE_LUMB, [])
         if lumb_cases:
-            ll_idx = _FG_CLASS_IDS.index(_LAST_LUMBAR_LABEL_ID)
-            ll_vals = [c[ll_idx] for c in lumb_cases if c[ll_idx] is not None]
-            if ll_vals:
-                out["val/headline/last_lumbar_dice_on_lumbarization"] = float(np.mean(ll_vals))
-                out["val/headline/last_lumbar_n_lumbarization_cases"] = float(len(ll_vals))
+            if _SCHEME == "unmerged":
+                ll_idx = _FG_CLASS_IDS.index(_L6_LABEL_ID)
+                ll_vals = [c[ll_idx] for c in lumb_cases if c[ll_idx] is not None]
+                if ll_vals:
+                    out["val/headline/L6_dice_on_lumbarization"] = float(np.mean(ll_vals))
+                    out["val/headline/L6_n_lumbarization_cases"] = float(len(ll_vals))
+            else:
+                ll_idx = _FG_CLASS_IDS.index(_LAST_LUMBAR_LABEL_ID)
+                ll_vals = [c[ll_idx] for c in lumb_cases if c[ll_idx] is not None]
+                if ll_vals:
+                    out["val/headline/last_lumbar_dice_on_lumbarization"] = float(np.mean(ll_vals))
+                    out["val/headline/last_lumbar_n_lumbarization_cases"] = float(len(ll_vals))
 
         # ── v20 headline: L4 dice on sacr_count ──────────────────────
         # Symmetric counterpart: on 4-lumbar cases, L4 is the bottom
@@ -1652,15 +1825,23 @@ class _WandBMixin:
         if not cases:
             return out
         threshold = _HALLUC_VOXEL_THRESHOLD
-        ll_idx = _FG_CLASS_IDS.index(_LAST_LUMBAR_LABEL_ID)
+        # The bottom lumbar class is guaranteed absent from sacr_count GT
+        # (4-lumbar anatomy). Merged: last_lumbar (5). Unmerged: L6 (6).
+        if _SCHEME == "unmerged":
+            absent_cid = _L6_LABEL_ID
+            key = "L6_specificity_on_sacr_count"
+        else:
+            absent_cid = _LAST_LUMBAR_LABEL_ID
+            key = "last_lumbar_specificity_on_sacr_count"
+        ll_idx = _FG_CLASS_IDS.index(absent_cid)
         absent_preds = [c[ll_idx][1] for c in cases if c[ll_idx][0] == 0]
         if not absent_preds:
             return out
         n_meaningful = sum(1 for p in absent_preds if p > threshold)
         specificity = 1.0 - (n_meaningful / len(absent_preds))
-        out["val/headline/last_lumbar_specificity_on_sacr_count"] = specificity
-        out["val/headline/last_lumbar_specificity_on_sacr_count_n_cases"] = float(len(absent_preds))
-        out["val/headline/last_lumbar_specificity_on_sacr_count_mean_pred_voxels"] = (
+        out[f"val/headline/{key}"] = specificity
+        out[f"val/headline/{key}_n_cases"] = float(len(absent_preds))
+        out[f"val/headline/{key}_mean_pred_voxels"] = (
             float(np.mean(absent_preds)) if absent_preds else 0.0
         )
         return out
@@ -1681,6 +1862,20 @@ class _WandBMixin:
         out: Dict[str, float] = {}
         if (self._val_subgroup_confusion_by_gt is None
                 or self._val_subgroup_confusion_by_pred is None):
+            return out
+
+        if _SCHEME == "unmerged":
+            # Unmerged (802) rebuttal block: GT-L6 on lumb cases, where do
+            # those voxels get classified? `as_L5_frac` is THE collapse
+            # evidence (GT-L6 predicted as L5).
+            _aggregate_block_by_gt(
+                self._val_subgroup_confusion_by_gt,
+                subtype=_SUBTYPE_LUMB,
+                anchor_gt_cid=_L6_LABEL_ID,
+                target_specs=_HEADLINE_TARGETS_L6_GT_ON_LUMB,
+                block_id="L6_GT_on_lumb",
+                out=out,
+            )
             return out
 
         # Block 1: last_lumbar GT on lumb cases
@@ -1740,63 +1935,102 @@ class _WandBMixin:
                     cls_parts.append(f"{cn}={v:.2f}" if v is not None else f"{cn}=---")
                 self.print_to_log_file(f"  {sub} per-class: [{', '.join(cls_parts)}]")
 
-            # ── v20 headline metrics ──────────────────────────────────
-            ll_dice = payload.get("val/headline/last_lumbar_dice_on_lumbarization")
-            ll_n    = payload.get("val/headline/last_lumbar_n_lumbarization_cases")
-            if ll_dice is not None and ll_n is not None:
-                self.print_to_log_file(
-                    f"  HEADLINE: last_lumbar dice on lumbarization cases "
-                    f"= {ll_dice:.3f}  (n={int(ll_n)})")
-            l4_dice = payload.get("val/headline/L4_dice_on_sacr_count")
-            l4_n    = payload.get("val/headline/L4_n_sacr_count_cases")
-            if l4_dice is not None and l4_n is not None:
-                self.print_to_log_file(
-                    f"  HEADLINE: L4 dice on sacr_count cases "
-                    f"= {l4_dice:.3f}  (n={int(l4_n)})")
+            if _SCHEME == "unmerged":
+                # ── unmerged (802) rebuttal headline: L6 collapse ──────
+                l6_dice = payload.get("val/headline/L6_dice_on_lumbarization")
+                l6_n    = payload.get("val/headline/L6_n_lumbarization_cases")
+                if l6_dice is not None and l6_n is not None:
+                    self.print_to_log_file(
+                        f"  HEADLINE: L6 dice on lumbarization cases "
+                        f"= {l6_dice:.3f}  (n={int(l6_n)})  "
+                        f"[expected ~0 — L6 collapses to L5 under direct "
+                        f"multi-class classification]")
+                l4_dice = payload.get("val/headline/L4_dice_on_sacr_count")
+                l4_n    = payload.get("val/headline/L4_n_sacr_count_cases")
+                if l4_dice is not None and l4_n is not None:
+                    self.print_to_log_file(
+                        f"  HEADLINE: L4 dice on sacr_count cases "
+                        f"= {l4_dice:.3f}  (n={int(l4_n)})")
+                spec = payload.get("val/headline/L6_specificity_on_sacr_count")
+                spec_n = payload.get("val/headline/L6_specificity_on_sacr_count_n_cases")
+                spec_mean = payload.get("val/headline/L6_specificity_on_sacr_count_mean_pred_voxels")
+                if spec is not None and spec_n is not None:
+                    mean_str = (f", mean_pred={spec_mean:.0f} voxels"
+                                if spec_mean is not None else "")
+                    self.print_to_log_file(
+                        f"  HEADLINE: L6 specificity on sacr_count "
+                        f"= {spec:.3f}  (n_absent={int(spec_n)}{mean_str})  "
+                        f"[higher is better; 1.0 = no hallucination]")
 
-            # ── v20 specificity headline ──────────────────────────────
-            spec = payload.get("val/headline/last_lumbar_specificity_on_sacr_count")
-            spec_n = payload.get("val/headline/last_lumbar_specificity_on_sacr_count_n_cases")
-            spec_mean = payload.get("val/headline/last_lumbar_specificity_on_sacr_count_mean_pred_voxels")
-            if spec is not None and spec_n is not None:
-                mean_str = (f", mean_pred={spec_mean:.0f} voxels"
-                            if spec_mean is not None else "")
                 self.print_to_log_file(
-                    f"  HEADLINE: last_lumbar specificity on sacr_count "
-                    f"= {spec:.3f}  (n_absent={int(spec_n)}{mean_str})  "
-                    f"[higher is better; 1.0 = no hallucination]")
+                    "  --- unmerged confusion block (L6 collapse) ---")
+                self._print_confusion_block(
+                    payload,
+                    block_id="L6_GT_on_lumb",
+                    header="    L6 GT-voxels on lumb cases "
+                           "(total={total}, where do they end up classified?):",
+                    target_specs=_HEADLINE_TARGETS_L6_GT_ON_LUMB,
+                    empty_msg="    L6 GT-voxels on lumb cases: "
+                              "(no lumb cases this epoch)",
+                )
+            else:
+                # ── v20 headline metrics ──────────────────────────────
+                ll_dice = payload.get("val/headline/last_lumbar_dice_on_lumbarization")
+                ll_n    = payload.get("val/headline/last_lumbar_n_lumbarization_cases")
+                if ll_dice is not None and ll_n is not None:
+                    self.print_to_log_file(
+                        f"  HEADLINE: last_lumbar dice on lumbarization cases "
+                        f"= {ll_dice:.3f}  (n={int(ll_n)})")
+                l4_dice = payload.get("val/headline/L4_dice_on_sacr_count")
+                l4_n    = payload.get("val/headline/L4_n_sacr_count_cases")
+                if l4_dice is not None and l4_n is not None:
+                    self.print_to_log_file(
+                        f"  HEADLINE: L4 dice on sacr_count cases "
+                        f"= {l4_dice:.3f}  (n={int(l4_n)})")
 
-            # ── v20 confusion blocks (3 focused) ──────────────────────
-            self.print_to_log_file(
-                "  --- v20 confusion blocks (L4 / last_lumbar focus) ---")
-            self._print_confusion_block(
-                payload,
-                block_id="last_lumbar_GT_on_lumb",
-                header="    last_lumbar GT-voxels on lumb cases "
-                       "(total={total}, where do they end up classified?):",
-                target_specs=_HEADLINE_TARGETS_LL_GT_ON_LUMB,
-                empty_msg="    last_lumbar GT-voxels on lumb cases: "
-                          "(no lumb cases this epoch)",
-            )
-            self._print_confusion_block(
-                payload,
-                block_id="L4_GT_on_sacr_count",
-                header="    L4 GT-voxels on sacr_count cases "
-                       "(total={total}, where do they end up classified?):",
-                target_specs=_HEADLINE_TARGETS_L4_GT_ON_SACR_COUNT,
-                empty_msg="    L4 GT-voxels on sacr_count cases: "
-                          "(no sacr_count cases this epoch)",
-            )
-            self._print_confusion_block(
-                payload,
-                block_id="pred_last_lumbar_on_sacr_count",
-                header="    Predicted-last_lumbar voxels on sacr_count cases "
-                       "(total={total}, what's actually there in GT?):",
-                target_specs=_HEADLINE_TARGETS_PRED_LL_ON_SACR_COUNT,
-                empty_msg="    Predicted-last_lumbar voxels on sacr_count cases: "
-                          "(no sacr_count cases this epoch, or model "
-                          "predicted no last_lumbar there — good)",
-            )
+                # ── v20 specificity headline ──────────────────────────
+                spec = payload.get("val/headline/last_lumbar_specificity_on_sacr_count")
+                spec_n = payload.get("val/headline/last_lumbar_specificity_on_sacr_count_n_cases")
+                spec_mean = payload.get("val/headline/last_lumbar_specificity_on_sacr_count_mean_pred_voxels")
+                if spec is not None and spec_n is not None:
+                    mean_str = (f", mean_pred={spec_mean:.0f} voxels"
+                                if spec_mean is not None else "")
+                    self.print_to_log_file(
+                        f"  HEADLINE: last_lumbar specificity on sacr_count "
+                        f"= {spec:.3f}  (n_absent={int(spec_n)}{mean_str})  "
+                        f"[higher is better; 1.0 = no hallucination]")
+
+                # ── v20 confusion blocks (3 focused) ──────────────────
+                self.print_to_log_file(
+                    "  --- v20 confusion blocks (L4 / last_lumbar focus) ---")
+                self._print_confusion_block(
+                    payload,
+                    block_id="last_lumbar_GT_on_lumb",
+                    header="    last_lumbar GT-voxels on lumb cases "
+                           "(total={total}, where do they end up classified?):",
+                    target_specs=_HEADLINE_TARGETS_LL_GT_ON_LUMB,
+                    empty_msg="    last_lumbar GT-voxels on lumb cases: "
+                              "(no lumb cases this epoch)",
+                )
+                self._print_confusion_block(
+                    payload,
+                    block_id="L4_GT_on_sacr_count",
+                    header="    L4 GT-voxels on sacr_count cases "
+                           "(total={total}, where do they end up classified?):",
+                    target_specs=_HEADLINE_TARGETS_L4_GT_ON_SACR_COUNT,
+                    empty_msg="    L4 GT-voxels on sacr_count cases: "
+                              "(no sacr_count cases this epoch)",
+                )
+                self._print_confusion_block(
+                    payload,
+                    block_id="pred_last_lumbar_on_sacr_count",
+                    header="    Predicted-last_lumbar voxels on sacr_count cases "
+                           "(total={total}, what's actually there in GT?):",
+                    target_specs=_HEADLINE_TARGETS_PRED_LL_ON_SACR_COUNT,
+                    empty_msg="    Predicted-last_lumbar voxels on sacr_count cases: "
+                              "(no sacr_count cases this epoch, or model "
+                              "predicted no last_lumbar there — good)",
+                )
         except Exception as exc:
             try: self.print_to_log_file(f"per-subgroup summary failed: {exc}")
             except Exception: pass
@@ -1954,7 +2188,9 @@ class _WandBMixin:
         config = {
             "trainer": self.__class__.__name__,
             "trainer_version": "v20",
-            "label_scheme": "merged_last_lumbar",
+            "label_scheme": ("merged_last_lumbar" if _SCHEME == "merged"
+                             else "unmerged_l5_l6"),
+            "label_scheme_env": _SCHEME,
             "anatomy_mapping": dict(enumerate(_ANATOMY_NAMES, start=1)),
             "ignore_label": _IGNORE_LABEL,
             "subgroup_taxonomy": "6-way",
@@ -2037,6 +2273,11 @@ class _WandBMixin:
         except Exception as exc: self.print_to_log_file(f"subtype map (pre-fork): {exc}")
 
         super().on_train_start()
+
+        # Fail loudly BEFORE any training work if the import-time label
+        # scheme (SPINESURG_LABEL_SCHEME) does not match the dataset.json
+        # being trained. NOT wrapped in try/except — a mismatch must abort.
+        self._verify_label_scheme_matches_dataset()
 
         try: _install_nnunet_warning_filter()
         except Exception: pass
