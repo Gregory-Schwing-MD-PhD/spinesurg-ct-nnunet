@@ -522,6 +522,13 @@ export SINGULARITYENV_SPINESURG_PROFILE_WAIT="${SPINESURG_PROFILE_WAIT}"
 export SINGULARITYENV_SPINESURG_PROFILE_WARMUP="${SPINESURG_PROFILE_WARMUP}"
 export SINGULARITYENV_SPINESURG_PROFILE_ACTIVE="${SPINESURG_PROFILE_ACTIVE}"
 
+# W&B verbosity (default OFF). When 1, the trainer additionally emits the
+# full per-(subgroup, class) dice / n_with_class matrix (~100 low-signal
+# keys/epoch). Default 0 emits the focused set (headlines + roll-ups +
+# per-class dice); all val/headline/* rebuttal metrics stay always-on.
+export SINGULARITYENV_SPINESURG_WANDB_VERBOSE="${SPINESURG_WANDB_VERBOSE:-0}"
+echo "[env] SPINESURG_WANDB_VERBOSE=${SPINESURG_WANDB_VERBOSE:-0} (0=focused wandb keys, 1=full per-subgroup×per-class matrix)"
+
 export OMP_NUM_THREADS=4
 
 # Build container binds. Add /tmp_prep when cache is in use.

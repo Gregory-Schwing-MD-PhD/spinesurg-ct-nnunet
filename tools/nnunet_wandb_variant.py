@@ -304,6 +304,13 @@ LSTV_CASES_SCHEMA_MAX = 3
 # noise at a boundary. ~1 cc at typical CT spacing of ~0.8 mm³/voxel.
 _HALLUC_VOXEL_THRESHOLD = 100
 
+# W&B verbosity. When True, the emitter additionally logs the full
+# per-(subgroup, class) matrix (val/lstv_subgroup/{sub}/dice/{class} and
+# .../n_with_class/{class}) — ~100 low-signal keys/epoch. Default False
+# emits the FOCUSED set only (headlines + per-subgroup roll-ups + nnU-Net
+# per-class dice); every rebuttal metric (val/headline/*) stays always-on.
+_WANDB_VERBOSE = _env_truthy("SPINESURG_WANDB_VERBOSE", default=False)
+
 
 def _install_nnunet_warning_filter() -> None:
     warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide", category=RuntimeWarning)
@@ -1720,9 +1727,14 @@ class _WandBMixin:
                 vals = [c[ci] for c in cases if c[ci] is not None]
                 if not vals: continue
                 m = float(np.mean(vals))
-                per_class_means[cls_id] = m
-                out[f"val/lstv_subgroup/{subtype}/dice/{_ANATOMY_NAMES[ci]}"] = m
-                out[f"val/lstv_subgroup/{subtype}/n_with_class/{_ANATOMY_NAMES[ci]}"] = float(len(vals))
+                per_class_means[cls_id] = m  # always computed: roll-ups + headlines depend on it
+                # Verbose-only: the bulky per-(subgroup, class) matrix. The
+                # roll-ups below and the val/headline/* metrics are derived
+                # from per_class_means / the raw buffers, so gating the raw
+                # matrix keys does not affect any always-on metric.
+                if _WANDB_VERBOSE:
+                    out[f"val/lstv_subgroup/{subtype}/dice/{_ANATOMY_NAMES[ci]}"] = m
+                    out[f"val/lstv_subgroup/{subtype}/n_with_class/{_ANATOMY_NAMES[ci]}"] = float(len(vals))
             lumbar_means = [per_class_means[c] for c in _LUMBAR_IDS if c in per_class_means]
             pelvis_means = [per_class_means[c] for c in _PELVIS_IDS if c in per_class_means]
             fg_means = list(per_class_means.values())
@@ -1925,15 +1937,20 @@ class _WandBMixin:
                     f"mean_fg={_fmt(f'val/lstv_subgroup/{sub}/mean_fg_dice')}  "
                     f"lumb={_fmt(f'val/lstv_subgroup/{sub}/mean_lumbar_dice')}  "
                     f"pelvis={_fmt(f'val/lstv_subgroup/{sub}/mean_pelvis_dice')}")
-            for sub in (_SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT, _SUBTYPE_SEMI,
-                         _SUBTYPE_SACR, _SUBTYPE_AMBIG):
-                n = payload.get(f"val/lstv_subgroup/{sub}/n_cases")
-                if not n or int(n) == 0: continue
-                cls_parts = []
-                for cn in _ANATOMY_NAMES:
-                    v = payload.get(f"val/lstv_subgroup/{sub}/dice/{cn}")
-                    cls_parts.append(f"{cn}={v:.2f}" if v is not None else f"{cn}=---")
-                self.print_to_log_file(f"  {sub} per-class: [{', '.join(cls_parts)}]")
+            # Per-class breakdown reads the verbose-only matrix keys; when
+            # SPINESURG_WANDB_VERBOSE is off those keys are absent, so this
+            # would print an all-"---" line. Guard it (still degrades
+            # gracefully via .get if a single class is missing while verbose).
+            if _WANDB_VERBOSE:
+                for sub in (_SUBTYPE_LUMB, _SUBTYPE_SACR_COUNT, _SUBTYPE_SEMI,
+                             _SUBTYPE_SACR, _SUBTYPE_AMBIG):
+                    n = payload.get(f"val/lstv_subgroup/{sub}/n_cases")
+                    if not n or int(n) == 0: continue
+                    cls_parts = []
+                    for cn in _ANATOMY_NAMES:
+                        v = payload.get(f"val/lstv_subgroup/{sub}/dice/{cn}")
+                        cls_parts.append(f"{cn}={v:.2f}" if v is not None else f"{cn}=---")
+                    self.print_to_log_file(f"  {sub} per-class: [{', '.join(cls_parts)}]")
 
             if _SCHEME == "unmerged":
                 # ── unmerged (802) rebuttal headline: L6 collapse ──────
