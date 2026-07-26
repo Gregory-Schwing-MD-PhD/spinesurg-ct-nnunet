@@ -31,19 +31,41 @@ Default: full build (link/copy + dataset.json + splits + lstv_cases).
     the fold assignments / subtype mapping (e.g. after re-running
     generate_5fold_splits.py).
 
-Label scheme (May 2026 — Dataset803 / "merged" variant)
--------------------------------------------------------
+Source label scheme (VerSe-native — the dataset's single source of truth)
+-------------------------------------------------------------------------
+As of the VerSe migration, the HF export label NIfTIs carry VerSe-native
+label ids (frozen in label_scheme.py in the CTSpinoPelvic1K repo; that
+file is NOT importable here, so the relevant ids are hardcoded below as
+named constants):
+  vertebrae:   C1-C7 = 1-7,  T1-T12 = 8-19,  L1-L6 = 20-25,
+               sacrum = 26,  coccyx = 27,  T13 = 28,  S1 = 29
+  pelvis/limb: left_hip = 30, right_hip = 31, femur_left = 32,
+               femur_right = 33
+  ribs = 34-57,  soft-tissue = 58-73,  lumbar ribs = 74/75
+  ignore = 255
+Only the lumbar bodies (20-25), sacrum (26), hips (30/31) and ignore
+(255) are training classes; EVERY OTHER nonzero VerSe id (thoracic /
+cervical vertebrae, coccyx, T13, S1, femurs, ribs, soft-tissue) is
+dropped to background at convert time. See LABEL_REMAP_MERGED_FROM_VERSE
+/ LABEL_REMAP_UNMERGED_FROM_VERSE.
+
+Target label scheme (May 2026 — Dataset803 / "merged" variant)
+--------------------------------------------------------------
   0 background
-  1 L1
-  2 L2
-  3 L3
-  4 L4
-  5 last_lumbar  (was L5+L6 merged at convert time — see
-                  LABEL_REMAP_AT_CONVERT)
-  6 sacrum       (renumbered from 7)
-  7 left_hip     (renumbered from 8)
-  8 right_hip    (renumbered from 9)
-  9 ignore       (renumbered from 10)
+  1 L1           (from VerSe L1 = 20)
+  2 L2           (from VerSe L2 = 21)
+  3 L3           (from VerSe L3 = 22)
+  4 L4           (from VerSe L4 = 23)
+  5 last_lumbar  (VerSe L5 = 24 AND L6 = 25 both merged here — see
+                  LABEL_REMAP_MERGED_FROM_VERSE)
+  6 sacrum       (from VerSe sacrum = 26)
+  7 left_hip     (from VerSe left_hip = 30)
+  8 right_hip    (from VerSe right_hip = 31)
+  9 ignore       (from VerSe ignore = 255)
+
+The unmerged Dataset802 target keeps L5 (24) and L6 (25) distinct:
+  0 bg, 1-4 L1-L4, 5 L5, 6 L6, 7 sacrum, 8 left_hip, 9 right_hip,
+  10 ignore.  Selected by --no_remap (VerSe-native -> unmerged 10-class).
 
 Why contiguous renumbering matters
 ==================================
@@ -184,44 +206,96 @@ _SPINE_ONLY_CONFIG  = "spine_only"
 # an output channel. The "ignore" entry is special: it is NOT a
 # channel; it is used as the ignore_index in the CE loss.
 #
-# Label 6 is intentionally absent from LABEL_NAMES — the L6 voxels
-# from source NIfTIs are remapped to label 5 (last_lumbar) at convert
-# time via LABEL_REMAP_AT_CONVERT. The network has no channel for the
-# old L6 because there are no label-6 voxels in the produced data.
+# Label 6 (VerSe L6 = 25) is intentionally absent from LABEL_NAMES — the
+# L6 voxels from source NIfTIs are merged into label 5 (last_lumbar) at
+# convert time via LABEL_REMAP_MERGED_FROM_VERSE. The network has no
+# channel for L6 because there are no L6 voxels in the produced data.
 LABEL_NAMES = {
     "background":  0,
     "L1":          1,
     "L2":          2,
     "L3":          3,
     "L4":          4,
-    "last_lumbar": 5,   # merged L5+L6 (see module docstring)
-    "sacrum":      6,   # renumbered from 7
-    "left_hip":    7,   # renumbered from 8
-    "right_hip":   8,   # renumbered from 9
-    "ignore":      9,   # renumbered from 10
+    "last_lumbar": 5,   # merged VerSe L5 (24) + L6 (25) (see module docstring)
+    "sacrum":      6,   # from VerSe sacrum = 26
+    "left_hip":    7,   # from VerSe left_hip = 30
+    "right_hip":   8,   # from VerSe right_hip = 31
+    "ignore":      9,   # from VerSe ignore = 255
 }
 
-# Source-label -> trained-label remap. Applied by
-# _remap_and_write_label() during the link/copy loop. Source labels
-# not listed here pass through unchanged.
+# 10-key UNMERGED scheme (Dataset802) — L5 and L6 kept distinct.
+# Selected by --no_remap. Produced by LABEL_REMAP_UNMERGED_FROM_VERSE.
+LABEL_NAMES_UNMERGED = {
+    "background":  0,
+    "L1":          1,
+    "L2":          2,
+    "L3":          3,
+    "L4":          4,
+    "L5":          5,   # from VerSe L5 = 24
+    "L6":          6,   # from VerSe L6 = 25
+    "sacrum":      7,   # from VerSe sacrum = 26
+    "left_hip":    8,   # from VerSe left_hip = 30
+    "right_hip":   9,   # from VerSe right_hip = 31
+    "ignore":      10,  # from VerSe ignore = 255
+}
+
+# ── VerSe-native SOURCE label ids (single source of truth) ─────────────
 #
-# We collapse L6 into last_lumbar AND shift everything above it down
-# by one to maintain contiguous label values. See module docstring
-# "Why contiguous renumbering matters".
+# These ids are FROZEN in label_scheme.py in the CTSpinoPelvic1K repo.
+# That module is NOT importable here (it lives in a different repo that is
+# not present on the cluster), so the training-relevant ids are hardcoded
+# below. If label_scheme.py ever changes, update these to match.
 #
-# In the source NIfTIs (HF export):
-#   0 bg, 1-4 L1-L4, 5 L5, 6 L6, 7 sacrum, 8 left_hip, 9 right_hip,
-#   10 ignore (partial-annotation contract)
+#   vertebrae:   C1-C7 = 1-7,  T1-T12 = 8-19,  L1-L6 = 20-25,
+#                sacrum = 26,  coccyx = 27,  T13 = 28,  S1 = 29
+#   pelvis/limb: left_hip = 30, right_hip = 31, femur_left = 32,
+#                femur_right = 33
+#   ribs = 34-57,  soft-tissue = 58-73,  lumbar ribs = 74/75
+#   ignore = 255
+VERSE_L1        = 20
+VERSE_L2        = 21
+VERSE_L3        = 22
+VERSE_L4        = 23
+VERSE_L5        = 24
+VERSE_L6        = 25
+VERSE_SACRUM    = 26
+VERSE_LEFT_HIP  = 30
+VERSE_RIGHT_HIP = 31
+VERSE_IGNORE    = 255
+
+# Source (VerSe-native) -> trained-label remaps. Applied by
+# _remap_and_write_label() during the link/copy loop. These are consumed
+# by _build_verse_remap_lut(), which defaults EVERY unlisted nonzero
+# source id to 0 (background) — thoracic/cervical vertebrae, coccyx, T13,
+# S1, femurs, ribs and soft-tissue are NOT training classes and are
+# dropped. Background (0) stays 0.
 #
-# In the converted NIfTIs (this dataset):
-#   0 bg, 1-4 L1-L4, 5 last_lumbar (former L5+L6), 6 sacrum,
-#   7 left_hip, 8 right_hip, 9 ignore
-LABEL_REMAP_AT_CONVERT: Dict[int, int] = {
-    6: 5,   # L6 -> last_lumbar (the merge)
-    7: 6,   # sacrum: shift down
-    8: 7,   # left_hip: shift down
-    9: 8,   # right_hip: shift down
-    10: 9,  # ignore: shift down (partial-annotation contract)
+# MERGED (Dataset803, default): collapse VerSe L5+L6 into last_lumbar (5).
+LABEL_REMAP_MERGED_FROM_VERSE: Dict[int, int] = {
+    VERSE_L1:        1,
+    VERSE_L2:        2,
+    VERSE_L3:        3,
+    VERSE_L4:        4,
+    VERSE_L5:        5,   # L5 -> last_lumbar
+    VERSE_L6:        5,   # L6 -> last_lumbar (the merge)
+    VERSE_SACRUM:    6,
+    VERSE_LEFT_HIP:  7,
+    VERSE_RIGHT_HIP: 8,
+    VERSE_IGNORE:    9,   # partial-annotation contract
+}
+
+# UNMERGED (Dataset802, --no_remap): keep VerSe L5 and L6 distinct.
+LABEL_REMAP_UNMERGED_FROM_VERSE: Dict[int, int] = {
+    VERSE_L1:        1,
+    VERSE_L2:        2,
+    VERSE_L3:        3,
+    VERSE_L4:        4,
+    VERSE_L5:        5,
+    VERSE_L6:        6,
+    VERSE_SACRUM:    7,
+    VERSE_LEFT_HIP:  8,
+    VERSE_RIGHT_HIP: 9,
+    VERSE_IGNORE:    10,
 }
 
 # No-ignore variant (fused-only ablation, May 2026).
@@ -239,16 +313,22 @@ LABEL_REMAP_AT_CONVERT: Dict[int, int] = {
 # protocol) so the label semantics stay identical to the main Dataset803
 # model and the two arms differ only in (training pool, ignore protocol).
 #
-# Source 10 (ignore) -> background (0) defensively. On fused data this
+# VerSe ignore (255) -> background (0) defensively. On fused data this
 # never fires; it only matters if a stray ignore voxel slips through, in
 # which case treating it as background is the safe, fully-supervised
-# choice (there is no ignore class to route it to).
-LABEL_REMAP_NO_IGNORE: Dict[int, int] = {
-    6: 5,   # L6 -> last_lumbar (the merge)
-    7: 6,   # sacrum: shift down
-    8: 7,   # left_hip: shift down
-    9: 8,   # right_hip: shift down
-    10: 0,  # ignore -> background (defensive; fused carries none)
+# choice (there is no ignore class to route it to). Same VerSe->merged
+# mapping as LABEL_REMAP_MERGED_FROM_VERSE, but 255 -> 0 instead of 9.
+LABEL_REMAP_MERGED_NO_IGNORE_FROM_VERSE: Dict[int, int] = {
+    VERSE_L1:        1,
+    VERSE_L2:        2,
+    VERSE_L3:        3,
+    VERSE_L4:        4,
+    VERSE_L5:        5,   # L5 -> last_lumbar
+    VERSE_L6:        5,   # L6 -> last_lumbar (the merge)
+    VERSE_SACRUM:    6,
+    VERSE_LEFT_HIP:  7,
+    VERSE_RIGHT_HIP: 8,
+    VERSE_IGNORE:    0,   # ignore -> background (defensive; fused carries none)
 }
 
 # 9-key scheme (8 foreground + background), no ignore class.
@@ -264,22 +344,29 @@ LABEL_NAMES_NO_IGNORE = {
     "right_hip":   8,
 }
 
-# The maximum label value the source NIfTIs are expected to contain.
-# Anything above this in a source label file is unexpected; the remap
-# is defensive and clamps via lookup table size.
-_MAX_SOURCE_LABEL = 10
+# The maximum label value the VerSe-native source NIfTIs are expected to
+# contain (ignore = 255). The LUT spans the full 0..255 range so every
+# VerSe id — including ribs (34-57), soft-tissue (58-73) and lumbar ribs
+# (74/75) that are NOT training classes — has an explicit destination.
+_MAX_SOURCE_LABEL = 255
 
 
-def _build_remap_lut(remap: Dict[int, int],
-                     max_label: int = _MAX_SOURCE_LABEL) -> np.ndarray:
-    """Build a vectorized lookup table for label remapping.
+def _build_verse_remap_lut(remap: Dict[int, int],
+                           max_label: int = _MAX_SOURCE_LABEL) -> np.ndarray:
+    """Build a vectorized lookup table for VerSe-native label remapping.
 
     Returns an int32 array `lut` of length `max_label + 1` where
-    `lut[old_label] == new_label`. Source labels not in `remap` map
-    to themselves. Source labels above `max_label` are not handled
-    by the LUT; the caller must clip or assert before indexing.
+    `lut[old_label] == new_label`. UNLISTED source ids default to 0
+    (BACKGROUND) — NOT to themselves. This is the critical difference
+    from a passthrough LUT: VerSe carries many non-training ids
+    (thoracic/cervical vertebrae, coccyx, T13, S1, femurs, ribs,
+    soft-tissue) that must be dropped to background rather than leaked
+    through and rejected by nnU-Net's --verify_dataset_integrity.
+
+    Background (0) stays 0 (it is 0 in the zero-initialized LUT and not
+    overridden unless the remap dict says so).
     """
-    lut = np.arange(max_label + 1, dtype=np.int32)
+    lut = np.zeros(max_label + 1, dtype=np.int32)  # unlisted -> 0 (background)
     for src, dst in remap.items():
         if not (0 <= src <= max_label):
             raise ValueError(
@@ -664,12 +751,16 @@ def main():
                          "unmerged baseline.")
     p.add_argument("--symlinks", action="store_true",
                     help="Symlink CT images instead of copying. Note: label "
-                         "files are ALWAYS physically rewritten when a label "
-                         "remap is configured (LABEL_REMAP_AT_CONVERT non-empty).")
+                         "files are ALWAYS physically rewritten (the source is "
+                         "VerSe-native and is always remapped to the training "
+                         "scheme), so --symlinks applies to CT images only.")
     p.add_argument("--no_remap", action="store_true",
-                    help="Disable the L6->last_lumbar label remap. Use this "
-                         "to reproduce the legacy unmerged 10-class scheme on "
-                         "Dataset802. Default: remap is APPLIED.")
+                    help="Select the UNMERGED remap: VerSe-native -> unmerged "
+                         "10-class (Dataset802), keeping L5 and L6 as distinct "
+                         "classes. Default (flag absent): the MERGED remap, "
+                         "VerSe-native -> merged 9-class (Dataset803), collapsing "
+                         "L5+L6 into last_lumbar. (Both remaps drop every "
+                         "non-training VerSe id to background.)")
     p.add_argument("--include_configs", default="",
                     help="Comma-separated list of record `config` values to "
                          "KEEP (e.g. 'fused'). Records whose config is not "
@@ -726,34 +817,29 @@ def main():
     n_total_records = sum(len(v) for v in manifests.values())
     log.info("Manifests: %d total records across train/val/test", n_total_records)
 
-    # Resolve label remap config and build LUT.
-    if args.no_remap or not LABEL_REMAP_AT_CONVERT:
-        label_remap_lut = None
-        active_label_names = {
-            "background":  0,
-            "L1":          1,
-            "L2":          2,
-            "L3":          3,
-            "L4":          4,
-            "L5":          5,
-            "L6":          6,
-            "sacrum":      7,
-            "left_hip":    8,
-            "right_hip":   9,
-            "ignore":      10,
-        }
-        log.info("Label remap: DISABLED (legacy 10-class scheme; --no_remap)")
-        log.info("  -> output dataset will have non-contiguous labels and is "
-                 "intended only as a reference baseline; do NOT train against "
-                 "it with the v20+ trainer (the trainer assumes contiguous "
-                 "label values).")
+    # Resolve label remap config and build LUT. The source is ALWAYS
+    # VerSe-native, so a remap LUT is ALWAYS built (label files are always
+    # physically rewritten). Unlisted VerSe ids drop to background — see
+    # _build_verse_remap_lut.
+    if args.no_remap:
+        label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_UNMERGED_FROM_VERSE)
+        active_label_names = LABEL_NAMES_UNMERGED
+        log.info("Label remap: VerSe-native -> unmerged 10-class (Dataset802; "
+                 "--no_remap): %s", dict(LABEL_REMAP_UNMERGED_FROM_VERSE))
+        log.info("  -> L5 (VerSe 24) and L6 (VerSe 25) kept as distinct "
+                 "classes; output has non-contiguous training semantics only "
+                 "in the sense that L6 is a real class. Every non-training "
+                 "VerSe id drops to background; source labels are PHYSICALLY "
+                 "REWRITTEN (--symlinks applies to CT images only).")
     elif args.drop_ignore_label:
-        label_remap_lut = _build_remap_lut(LABEL_REMAP_NO_IGNORE)
+        label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_MERGED_NO_IGNORE_FROM_VERSE)
         active_label_names = LABEL_NAMES_NO_IGNORE
-        log.info("Label remap (NO-IGNORE variant): %s", dict(LABEL_REMAP_NO_IGNORE))
-        log.info("  -> 9-key scheme (8 fg + bg), NO ignore class. Source "
-                 "ignore (10) -> background (0) defensively. Intended for the "
-                 "fused-only ablation (fused records carry no ignore voxels).")
+        log.info("Label remap: VerSe-native -> merged 9-key NO-IGNORE: %s",
+                 dict(LABEL_REMAP_MERGED_NO_IGNORE_FROM_VERSE))
+        log.info("  -> 9-key scheme (8 fg + bg), NO ignore class. VerSe ignore "
+                 "(255) -> background (0) defensively. Every non-training VerSe "
+                 "id drops to background. Intended for the fused-only ablation "
+                 "(fused records carry no ignore voxels).")
         if include_configs is None:
             log.warning("--drop_ignore_label set WITHOUT --include_configs: "
                         "any partial-annotation (spine_only/pelvic_native) "
@@ -761,11 +847,13 @@ def main():
                         "into BACKGROUND, which falsely supervises unannotated "
                         "regions. Pass --include_configs fused for the ablation.")
     else:
-        label_remap_lut = _build_remap_lut(LABEL_REMAP_AT_CONVERT)
+        label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_MERGED_FROM_VERSE)
         active_label_names = LABEL_NAMES
-        log.info("Label remap at convert time: %s", dict(LABEL_REMAP_AT_CONVERT))
-        log.info("  -> source labels are PHYSICALLY REWRITTEN; --symlinks "
-                 "applies to CT images only.")
+        log.info("Label remap: VerSe-native -> merged 9-class (Dataset803): %s",
+                 dict(LABEL_REMAP_MERGED_FROM_VERSE))
+        log.info("  -> VerSe L5+L6 collapsed into last_lumbar (5); every "
+                 "non-training VerSe id drops to background; source labels are "
+                 "PHYSICALLY REWRITTEN (--symlinks applies to CT images only).")
 
     ds_dir = args.nnunet_raw / f"Dataset{args.dataset_id:03d}_{args.dataset_name}"
 
@@ -844,32 +932,38 @@ def main():
                 "last_lumbar following Möller 2026 (VERIDAH §2.2) / "
                 "contiguous label IDs"
             )
-        elif label_remap_lut is not None:
+        elif not args.no_remap:
             description = (
                 "CTSpinoPelvic1K — fused 9-class spine + pelvis CT (8 fg + bg) "
                 "with merged last_lumbar (L5+L6) and ignore label (9) for "
-                "partial annotations. L6 source labels remapped to "
-                "last_lumbar (5) at convert time; sacrum/hips/ignore "
-                "shifted down by one for contiguous label values. "
+                "partial annotations. VerSe-native source labels remapped to "
+                "the merged 9-class scheme at convert time (VerSe L5/L6 -> "
+                "last_lumbar 5, sacrum 26 -> 6, hips 30/31 -> 7/8, ignore "
+                "255 -> 9); every non-training VerSe id -> background. "
                 "Recover individual L5/L6 via instance post-processing or "
                 "VERIDAH (Möller 2026)."
             )
             release = (
                 "May 2026 — schema v6 splits / v3 lstv_cases / "
                 "partial-annotation ignore label / per-record subtype "
-                "refinement / L6 merged into last_lumbar following "
-                "Möller 2026 (VERIDAH §2.2) / contiguous label IDs"
+                "refinement / VerSe-native source remapped to merged "
+                "9-class following Möller 2026 (VERIDAH §2.2) / "
+                "contiguous label IDs"
             )
         else:
             description = (
-                "CTSpinoPelvic1K — fused 10-class spine + pelvis CT "
-                "with ignore label (10) for partial annotations "
-                "(LEGACY UNMERGED VARIANT)"
+                "CTSpinoPelvic1K — fused 10-class spine + pelvis CT with "
+                "ignore label (10) for partial annotations (UNMERGED VARIANT; "
+                "L5 and L6 distinct). VerSe-native source labels remapped to "
+                "the unmerged 10-class scheme at convert time (VerSe L5 -> 5, "
+                "L6 -> 6, sacrum 26 -> 7, hips 30/31 -> 8/9, ignore 255 -> 10); "
+                "every non-training VerSe id -> background."
             )
             release = (
                 "May 2026 — schema v6 splits / v3 lstv_cases / "
                 "partial-annotation ignore label / per-record subtype "
-                "refinement (legacy 10-class)"
+                "refinement / VerSe-native source remapped to unmerged "
+                "10-class"
             )
         dataset_json = {
             "channel_names": {"0": "CT"},

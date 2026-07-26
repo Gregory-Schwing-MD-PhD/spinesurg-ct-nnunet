@@ -4,15 +4,16 @@ convert + trainer changeset.
 
 Coverage
 --------
-1. Convert script:
-   - _build_remap_lut()  — LUT construction is correct under the
-                            published LABEL_REMAP_AT_CONVERT.
+1. Convert script (VerSe-native source):
+   - _build_verse_remap_lut()  — LUT construction is correct under the
+                            published LABEL_REMAP_MERGED_FROM_VERSE, and
+                            every UNLISTED VerSe id defaults to 0
+                            (background), not passthrough.
    - _remap_and_write_label() — end-to-end NIfTI rewrite preserves
-                                 affine, shrinks the L6 class to zero,
-                                 collapses L5+L6 voxel counts into the
-                                 new last_lumbar slot, and shifts
-                                 sacrum/hips/ignore down by one.
-   - LABEL_NAMES + LABEL_REMAP_AT_CONVERT are MUTUALLY CONSISTENT
+                                 affine, collapses VerSe L5 (24) + L6 (25)
+                                 into last_lumbar (5), drops non-training
+                                 VerSe ids (e.g. thoracic) to background.
+   - LABEL_NAMES + LABEL_REMAP_MERGED_FROM_VERSE are MUTUALLY CONSISTENT
      (every LUT destination value appears as a LABEL_NAMES value).
 
 2. Trainer aggregation:
@@ -169,7 +170,7 @@ def _import_under_test():
     # v20 release. If any are missing, the user has an older version on
     # sys.path (e.g. masking tools/ from the project root). Surface the
     # exact problem instead of letting 25 test failures bury it.
-    convert_required = ["_build_remap_lut", "LABEL_REMAP_AT_CONVERT", "LABEL_NAMES"]
+    convert_required = ["_build_verse_remap_lut", "LABEL_REMAP_MERGED_FROM_VERSE", "LABEL_NAMES"]
     trainer_required = [
         "_L4_LABEL_ID", "_LAST_LUMBAR_LABEL_ID",
         "_HEADLINE_TARGETS_LL_GT_ON_LUMB",
@@ -249,30 +250,45 @@ def trainer_mod():
 # ──────────────────────────────────────────────────────────────────────
 
 def test_lut_published_remap_correct(convert_mod):
-    """LUT correctly implements LABEL_REMAP_AT_CONVERT = {6:5, 7:6, 8:7, 9:8, 10:9}."""
-    lut = convert_mod._build_remap_lut(convert_mod.LABEL_REMAP_AT_CONVERT)
-    expected = [0, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9]  # length 11
-    assert len(lut) == 11, f"LUT length should be 11 got {len(lut)}"
-    assert lut.tolist() == expected, (
-        f"LUT mismatch:\n  expected: {expected}\n  got:      {lut.tolist()}"
-    )
+    """LUT correctly implements LABEL_REMAP_MERGED_FROM_VERSE: the
+    VerSe-native lumbar bodies (20-25), sacrum (26), hips (30/31) and
+    ignore (255) map to the merged 9-class scheme; EVERY other id -> 0."""
+    lut = convert_mod._build_verse_remap_lut(
+        convert_mod.LABEL_REMAP_MERGED_FROM_VERSE)
+    # LUT spans the full VerSe range so ignore (255) is indexable.
+    assert len(lut) == 256, f"LUT length should be 256 got {len(lut)}"
+    expected = {
+        0: 0, 20: 1, 21: 2, 22: 3, 23: 4, 24: 5, 25: 5,
+        26: 6, 30: 7, 31: 8, 255: 9,
+    }
+    for src, dst in expected.items():
+        assert int(lut[src]) == dst, (
+            f"VerSe {src} -> {int(lut[src])}, expected {dst}")
+    # Non-training VerSe ids (thoracic/cervical/coccyx/T13/S1/femur/rib/
+    # soft-tissue/lumbar-rib) MUST drop to background, not pass through.
+    for src in (5, 15, 27, 28, 29, 32, 33, 40, 60, 74, 75):
+        assert int(lut[src]) == 0, (
+            f"non-training VerSe {src} must -> 0, got {int(lut[src])}")
 
 
 def test_lut_round_trip_through_array(convert_mod):
-    """Vectorized indexing arr -> lut[arr] yields the documented merge:
-    L5 voxels and L6 voxels both end up at label 5; sacrum 7->6 etc."""
-    lut = convert_mod._build_remap_lut(convert_mod.LABEL_REMAP_AT_CONVERT)
-    arr = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=np.int32)
+    """Vectorized indexing arr -> lut[arr] yields the documented VerSe
+    merge: L5 (24) and L6 (25) both end up at label 5; sacrum 26->6 etc.,
+    and a stray thoracic id -> 0."""
+    lut = convert_mod._build_verse_remap_lut(
+        convert_mod.LABEL_REMAP_MERGED_FROM_VERSE)
+    arr = np.array([0, 20, 21, 22, 23, 24, 25, 26, 30, 31, 255, 15],
+                   dtype=np.int32)
     out = lut[arr]
-    assert out.tolist() == [0, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9]
+    assert out.tolist() == [0, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 0]
 
 
 def test_lut_rejects_out_of_range_remap_source(convert_mod):
-    """Building a LUT with a remap key beyond _MAX_SOURCE_LABEL should
-    raise — defensive against silent off-by-one in label scheme edits."""
-    bogus = {99: 1}  # 99 way above _MAX_SOURCE_LABEL=10
+    """Building a LUT with a remap key beyond _MAX_SOURCE_LABEL (255)
+    should raise — defensive against silent off-by-one in label edits."""
+    bogus = {999: 1}  # 999 way above _MAX_SOURCE_LABEL=255
     try:
-        convert_mod._build_remap_lut(bogus)
+        convert_mod._build_verse_remap_lut(bogus)
     except ValueError as exc:
         assert "outside expected range" in str(exc), (
             f"unexpected message: {exc}"
@@ -284,7 +300,7 @@ def test_lut_rejects_out_of_range_remap_source(convert_mod):
 def test_label_names_contiguous_and_consistent_with_remap(convert_mod):
     """LABEL_NAMES values + ignore form a contiguous range 0..N, and
     every LUT destination is a valid foreground class id under the
-    new scheme. This catches the subtle bug of leaving a gap in label
+    merged scheme. This catches the subtle bug of leaving a gap in label
     IDs (which would break the trainer's per-class dice computation —
     pred_argmax channel indices have to match GT label values)."""
     lns = convert_mod.LABEL_NAMES
@@ -295,34 +311,39 @@ def test_label_names_contiguous_and_consistent_with_remap(convert_mod):
         f"foreground label IDs are not contiguous: {fg_values}; "
         f"this WILL break per-class dice in the trainer"
     )
-    # Every LUT destination ends up at a defined label value
-    lut_dsts = set(convert_mod.LABEL_REMAP_AT_CONVERT.values())
+    # Every VerSe remap destination ends up at a defined label value.
+    lut_dsts = set(convert_mod.LABEL_REMAP_MERGED_FROM_VERSE.values())
     all_dsts = set(lns.values())
     missing = lut_dsts - all_dsts
     assert not missing, (
-        f"LUT remap destinations {sorted(missing)} have no entry "
+        f"remap destinations {sorted(missing)} have no entry "
         f"in LABEL_NAMES; rebuilds would mint orphan label values"
     )
 
 
 def test_remap_and_write_label_nifti_end_to_end(convert_mod):
-    """Synthetic 11-label volume → remap → reload → assertions on each
-    label's voxel count. Exercises the full disk-to-disk path (nibabel
-    read/write + LUT indexing + uint8 dtype downcast)."""
+    """Synthetic VerSe-labeled volume → remap → reload → assertions on
+    each label's voxel count. Exercises the full disk-to-disk path
+    (nibabel read/write + LUT indexing + uint8 dtype downcast). Includes
+    a non-training VerSe id (thoracic T8 = 15) that must vanish to
+    background, and VerSe L5 (24) + L6 (25) that must collapse to 5."""
     import nibabel as nib
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         src = tmp / "src.nii.gz"
         dst = tmp / "dst.nii.gz"
-        # 22-slab volume so each of labels 0..10 gets two slabs of
-        # voxels — enough to detect any off-by-one in counting.
-        arr = np.zeros((10, 10, 22), dtype=np.int32)
-        for label_val in range(11):
-            arr[:, :, label_val * 2:(label_val + 1) * 2] = label_val
+        # Each source VerSe id gets two slabs (2 voxels along W) so a
+        # miscount is easy to detect. Order: bg + the 10 training ids +
+        # one non-training thoracic id (15).
+        src_ids = [0, 20, 21, 22, 23, 24, 25, 26, 30, 31, 255, 15]
+        arr = np.zeros((10, 10, 2 * len(src_ids)), dtype=np.int32)
+        for i, sid in enumerate(src_ids):
+            arr[:, :, i * 2:(i + 1) * 2] = sid
         affine = np.eye(4)
         nib.save(nib.Nifti1Image(arr, affine), str(src))
 
-        lut = convert_mod._build_remap_lut(convert_mod.LABEL_REMAP_AT_CONVERT)
+        lut = convert_mod._build_verse_remap_lut(
+            convert_mod.LABEL_REMAP_MERGED_FROM_VERSE)
         convert_mod._remap_and_write_label(src, dst, lut)
 
         out_img = nib.load(str(dst))
@@ -333,16 +354,16 @@ def test_remap_and_write_label_nifti_end_to_end(convert_mod):
         assert out_img.get_data_dtype() == np.uint8, (
             f"output dtype should be uint8, got {out_img.get_data_dtype()}"
         )
-        # Label-by-label voxel counts under the published remap
-        # source -> destination, expected count
-        # 0->0 (200), 1->1 (200), 2->2 (200), 3->3 (200), 4->4 (200),
-        # 5->5 (200), 6->5 (collapses), 7->6 (200), 8->7 (200),
-        # 9->8 (200), 10->9 (200)
+        # Destination voxel counts under the merged VerSe remap.
+        # per source slab-pair = 10*10*2 = 200 voxels.
+        #   bg(0): its own 2 slabs + T8(15) 2 slabs = 400
+        #   5 (last_lumbar): L5(24) + L6(25) = 400
+        #   1-4,6,7,8,9: 200 each
         per_slab = 10 * 10 * 2  # 200
         expected = {
-            0: per_slab, 1: per_slab, 2: per_slab, 3: per_slab,
-            4: per_slab,
-            5: 2 * per_slab,  # former L5 + former L6
+            0: 2 * per_slab,  # background + dropped thoracic (15)
+            1: per_slab, 2: per_slab, 3: per_slab, 4: per_slab,
+            5: 2 * per_slab,  # VerSe L5 + VerSe L6
             6: per_slab,      # sacrum
             7: per_slab,      # left_hip
             8: per_slab,      # right_hip
@@ -352,10 +373,10 @@ def test_remap_and_write_label_nifti_end_to_end(convert_mod):
         assert actual == expected, (
             f"voxel-count mismatch:\n  expected: {expected}\n  actual:   {actual}"
         )
-        # Crucially: no L6 voxels in output, and no value above 9.
+        # No value above 9; the non-training thoracic id is gone.
         assert int(out.max()) == 9
         assert int((out == 6).sum()) == 200, (
-            "channel 6 should contain old sacrum voxels (200) after shift"
+            "channel 6 should contain VerSe sacrum voxels (200)"
         )
 
 

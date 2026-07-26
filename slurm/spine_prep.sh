@@ -21,14 +21,15 @@
 # Earlier versions did, and they wiped the whole dataset on every "resume"
 # run.
 #
-# LABEL files (May 2026 v5+): under Dataset803 with the merged-label
-# scheme, label NIfTIs are PHYSICALLY REWRITTEN by the convert script via
-# a vectorized LUT (LABEL_REMAP_AT_CONVERT = {6:5, 7:6, 8:7, 9:8, 10:9}).
-# This collapses L6 into last_lumbar and shifts sacrum/hips/ignore down
-# by one for contiguous label IDs. Symlinking labels would be wrong
-# under Dataset803 — the source NIfTIs still contain L6 voxels which the
-# v20 trainer is not configured to predict. The convert script handles
-# this correctly: --symlinks applies to CT only when a remap is active.
+# LABEL files (May 2026 v5+): the HF export is now VerSe-native, so label
+# NIfTIs are ALWAYS PHYSICALLY REWRITTEN by the convert script via a
+# vectorized LUT that remaps VerSe ids -> the training scheme. Under
+# Dataset803 (merged) it maps VerSe L1-L4 (20-23) -> 1-4, L5+L6 (24/25)
+# -> last_lumbar (5), sacrum (26) -> 6, hips (30/31) -> 7/8, ignore (255)
+# -> 9, and drops EVERY non-training VerSe id (thoracic/cervical, coccyx,
+# T13, S1, femurs, ribs, soft-tissue) to background. Symlinking labels
+# would be wrong — the source carries dozens of non-training VerSe ids.
+# The convert script handles this: --symlinks applies to CT images only.
 #
 # Threading: 12 workers x 4 BLAS threads = 48 threads, fits RLIMIT_NPROC.
 #
@@ -340,10 +341,11 @@ fi
 # remap) and don't need any cleanup either.
 
 # Convert script flags (v5):
-#   --no_remap is passed when running the legacy 802 baseline. Without
-#   it, the convert script applies LABEL_REMAP_AT_CONVERT = {6:5, 7:6,
-#   8:7, 9:8, 10:9} to every label file, producing the merged 9-class
-#   contiguous scheme.
+#   --no_remap selects the UNMERGED remap: VerSe-native -> unmerged
+#   10-class (Dataset802), keeping L5 and L6 distinct. Without it, the
+#   convert script applies the MERGED remap: VerSe-native -> merged
+#   9-class (Dataset803), collapsing VerSe L5+L6 into last_lumbar. Both
+#   remaps drop every non-training VerSe id to background.
 CONVERT_REMAP_FLAG=""
 if [[ "${LEGACY_NO_REMAP}" == "1" ]]; then
     CONVERT_REMAP_FLAG="--no_remap"
