@@ -67,6 +67,18 @@ The unmerged Dataset802 target keeps L5 (24) and L6 (25) distinct:
   0 bg, 1-4 L1-L4, 5 L5, 6 L6, 7 sacrum, 8 left_hip, 9 right_hip,
   10 ignore.  Selected by --no_remap (VerSe-native -> unmerged 10-class).
 
+The COUNT-FREE target (--countfree) asks for no vertebral identity at all:
+  0 bg, 1 vertebra, 2 disc_space, 3 rib_left, 4 rib_right, 5 sacrum,
+  6 left_hip, 7 right_hip, 8 femur, 9 ignore.
+Both schemes above hand the network a naming problem it cannot solve
+locally -- L5 and L6 are the same bone under two counts, and which one
+you are looking at depends on how many vertebrae lie above, possibly
+outside the field of view. The count-free target moves that decision out
+of the loss and into code: the network says what is bone and where one
+vertebra ends, and counting, naming and transitional flagging happen
+afterwards, deterministically. Class 2 is DERIVED at convert time and
+appears in no source file; see _derive_disc_space().
+
 Why contiguous renumbering matters
 ==================================
 nnU-Net v2 builds the network's output channel count from the SORTED
@@ -397,10 +409,24 @@ def _derive_disc_space(arr, zooms, reach_mm: float = 10.0,
         # joint occupies space these labels give to one side or the other, and the
         # boundary has to exist somewhere. 26-connectivity so that a diagonal contact is
         # cut too; a diagonal leak reconnects the column just as thoroughly as a face one.
+        # THE SHELL COMES OFF THE LARGER OF THE TWO, NOT OFF BOTH. Removing a layer
+        # from both sides separates them twice over and costs nothing on two full
+        # vertebrae -- but the topmost and bottom-most vertebrae in a field of view are
+        # truncated slabs a few voxels thick, and taking a layer off one of those breaks
+        # it into pieces. On case 0001 that turned a 4064-voxel partial T8 into 3673 +
+        # 391 and made the component count 11 for 10 vertebrae: an off-by-one, which is
+        # the exact failure this whole design exists to prevent.
+        #
+        # One side is enough. Under 26-connectivity, deleting every voxel of one body
+        # that touches the other leaves nothing of it adjacent to the other, so the two
+        # are separated whichever side the layer came from. Taking it from the larger
+        # body means a truncated sliver is never the one cut into.
         nb = ndimage.generate_binary_structure(3, 3)
         mv, mw = (sub == v), (sub == w)
-        disc |= mv & ndimage.binary_dilation(mw, structure=nb)
-        disc |= mw & ndimage.binary_dilation(mv, structure=nb)
+        if int(mv.sum()) >= int(mw.sum()):
+            disc |= mv & ndimage.binary_dilation(mw, structure=nb)
+        else:
+            disc |= mw & ndimage.binary_dilation(mv, structure=nb)
         out[sl] |= disc
     return out
 
