@@ -520,6 +520,115 @@ LABEL_NAMES_NO_IGNORE = {
 _MAX_SOURCE_LABEL = 255
 
 
+# ── RIB-BEARING REGIONS (--rib_regions) ───────────────────────────────
+#
+# WHY SPLIT THE VERTEBRA CLASS THIS WAY, AND WHY AS A REGION.
+#
+# The count-free scheme above refuses to ask the network for vertebral
+# identity because identity is not a local property. Rib-bearing status
+# IS one: the rib is in the image, articulating with the vertebra, and a
+# per-voxel loss can see it. So it is the one piece of the counting
+# problem that can honestly be moved INTO the network, and it happens to
+# be the piece the count is anchored on -- the lowest rib-bearing
+# vertebra is the top bracket of the interval that defines the phenotype.
+#
+# Regions rather than two more mutually exclusive classes, because the
+# two facts are NESTED: rib-bearing implies vertebra. As exclusive
+# classes a softmax must spend probability deciding between them, so a
+# vertebra the network is sure about but whose rib status is genuinely
+# ambiguous gets a diluted answer on BOTH. As nested regions with
+# independent sigmoids it can say "certainly a vertebra, 0.5 that it
+# bears a rib", which is the true state of belief at a transitional
+# level and is exactly what the downstream counting stage wants to
+# consume.
+#
+# WHAT THIS DOES NOT SOLVE, stated plainly. The hard case is a lumbar
+# rib against a large transverse process, and that IS the Castellvi
+# question -- the ambiguity does not disappear because the label was
+# reorganised. What changes is that the model can now EXPRESS the
+# ambiguity as a calibrated probability instead of being forced to
+# resolve it, and a count assembled from probabilities can carry its own
+# uncertainty. That is the argument for expecting it to beat the
+# exclusive-class formulation, and it is a claim to be measured, not
+# assumed.
+#
+# Underlying (mutually exclusive) values stored in the label files:
+_RR_VERT_PLAIN, _RR_VERT_RIB = 1, 2
+_RR_DISC, _RR_RIB_L, _RR_RIB_R = 3, 4, 5
+_RR_SACRUM, _RR_HIP_L, _RR_HIP_R, _RR_FEMUR, _RR_IGNORE = 6, 7, 8, 9, 10
+
+# dataset.json "labels": encompassing regions FIRST, substructures after,
+# because regions_class_order paints them in order and later wins.
+# Insertion order matters and must survive json.dump -- see sort_keys.
+LABEL_NAMES_RIB_REGIONS = {
+    "background":  0,
+    "vertebra":    [_RR_VERT_PLAIN, _RR_VERT_RIB],   # every vertebra
+    "rib_bearing": [_RR_VERT_RIB],                   # nested inside it
+    "disc_space":  [_RR_DISC],
+    "rib_left":    [_RR_RIB_L],
+    "rib_right":   [_RR_RIB_R],
+    "sacrum":      [_RR_SACRUM],
+    "left_hip":    [_RR_HIP_L],
+    "right_hip":   [_RR_HIP_R],
+    "femur":       [_RR_FEMUR],
+    "ignore":      _RR_IGNORE,                       # NOT a region
+}
+# ignore is deliberately absent: it is not predicted
+REGIONS_CLASS_ORDER_RIB = [_RR_VERT_PLAIN, _RR_VERT_RIB, _RR_DISC, _RR_RIB_L,
+                           _RR_RIB_R, _RR_SACRUM, _RR_HIP_L, _RR_HIP_R, _RR_FEMUR]
+
+# Base remap: every vertebra starts as NON-rib-bearing and is promoted by
+# geometry, because whether a rib touches it is not a lookup.
+LABEL_REMAP_RIB_REGIONS_FROM_VERSE: Dict[int, int] = {
+    **{i: _RR_VERT_PLAIN for i in range(1, 26)},
+    28: _RR_VERT_PLAIN,
+    VERSE_SACRUM: _RR_SACRUM,
+    29: _RR_SACRUM,
+    VERSE_LEFT_HIP: _RR_HIP_L,
+    VERSE_RIGHT_HIP: _RR_HIP_R,
+    32: _RR_FEMUR, 33: _RR_FEMUR,
+    **{i: _RR_RIB_L for i in range(34, 46)},
+    **{i: _RR_RIB_R for i in range(46, 58)},
+    74: _RR_RIB_L, 75: _RR_RIB_R,
+    VERSE_IGNORE: _RR_IGNORE,
+}
+
+_RIB_IDS = tuple(range(34, 58)) + (74, 75)
+
+
+def _rib_bearing_vertebrae(arr, zooms, reach_mm=4.0):
+    """Which source vertebra ids have a rib articulating with them.
+
+    A LUMBAR RIB COUNTS. Ids 74 and 75 are ribs borne on a lumbar body,
+    and treating them as anything else would be deciding the very
+    question this scheme exists to leave open: a rib on the first
+    lumbar-type vertebra makes that vertebra rib-bearing, which shortens
+    the rib-free interval to four, which IS the transitional phenotype.
+    Excluding them would hide the phenotype inside the label.
+
+    Proximity rather than true articulation, at a few millimetres. The
+    costovertebral joint is a joint, so the two are near but need not
+    touch, and a rib head sits within a few millimetres of the body it
+    articulates with while the next vertebra down is a whole body height
+    away. The margin between those two distances is what makes a
+    threshold safe here where it would not be elsewhere.
+    """
+    from scipy import ndimage
+
+    ribs = np.isin(arr, _RIB_IDS)
+    if not ribs.any():
+        return set()
+    # distance from every voxel to the nearest rib, in millimetres
+    d = ndimage.distance_transform_edt(~ribs, sampling=zooms)
+    near = d <= reach_mm
+    hit = set()
+    for v in range(1, 26):
+        m = arr == v
+        if m.any() and bool((m & near).any()):
+            hit.add(v)
+    return hit
+
+
 def _build_verse_remap_lut(remap: Dict[int, int],
                            max_label: int = _MAX_SOURCE_LABEL) -> np.ndarray:
     """Build a vectorized lookup table for VerSe-native label remapping.
@@ -546,7 +655,8 @@ def _build_verse_remap_lut(remap: Dict[int, int],
 
 
 def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray,
-                           derive_disc: bool = False) -> None:
+                           derive_disc: bool = False,
+                           rib_regions: bool = False) -> None:
     """Read source label NIfTI, apply the remap LUT, write to dst.
 
     Used when the dataset.json label scheme differs from the source
@@ -572,6 +682,14 @@ def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray,
         arr = np.clip(arr, 0, len(lut) - 1)
     arr_remapped = lut[arr].astype(np.uint8)
 
+    if rib_regions:
+        # promote every vertebra that a rib reaches. Done from the SOURCE ids, because
+        # after the remap all vertebrae are one value and the association is gone.
+        zooms = tuple(float(z) for z in img.header.get_zooms()[:3])
+        bearing = _rib_bearing_vertebrae(arr, zooms)
+        if bearing:
+            arr_remapped[np.isin(arr, list(bearing))] = _RR_VERT_RIB
+
     if derive_disc:
         # derived from the SOURCE ids, which still carry per-level identity --
         # after the remap every vertebra is class 1 and the seams are gone
@@ -582,7 +700,9 @@ def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray,
         # restore exactly the leak it exists to close. It IS gated away from the
         # ignore region: the ignore contract is what makes partial annotation safe,
         # and nothing may supervise a region that was never annotated.
-        arr_remapped[disc & (arr_remapped != _CF_IGNORE)] = _CF_DISC
+        disc_v = _RR_DISC if rib_regions else _CF_DISC
+        ign_v = _RR_IGNORE if rib_regions else _CF_IGNORE
+        arr_remapped[disc & (arr_remapped != ign_v)] = disc_v
 
     out = nib.Nifti1Image(arr_remapped, img.affine, img.header)
     out.set_data_dtype(np.uint8)
@@ -704,6 +824,7 @@ def _build_case_indices(
     label_remap_lut: Optional[np.ndarray],
     include_configs: Optional[frozenset] = None,
     derive_disc: bool = False,
+    rib_regions: bool = False,
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Dict],
            List[str], List[str], int, Dict[str, int],
            Dict[str, int], int, Dict[str, int]]:
@@ -800,7 +921,8 @@ def _build_case_indices(
                     if label_remap_lut is not None:
                         _remap_and_write_label(label_src, label_dst,
                                                 label_remap_lut,
-                                                derive_disc=derive_disc)
+                                                derive_disc=derive_disc,
+                                                rib_regions=rib_regions)
                         remap_stats["n_remapped"] += 1
                     else:
                         _link_or_copy(label_src, label_dst, use_symlinks)
@@ -968,8 +1090,23 @@ def main():
                          "flagging then happen in code, downstream, where they "
                          "are auditable. Incompatible with --no_remap and with "
                          "--drop_ignore_label.")
+    p.add_argument("--rib_regions", action="store_true",
+                    help="The count-free scheme, with the vertebra class split into "
+                         "rib-bearing and not, expressed as nnU-Net REGIONS rather than "
+                         "as exclusive classes. Rib-bearing status is a local property, "
+                         "unlike vertebral identity, so it is the one part of the "
+                         "counting problem that can honestly be learned -- and it is the "
+                         "part the count is anchored on. Nested regions let the network "
+                         "be certain a thing is a vertebra while uncertain whether it "
+                         "bears a rib, which exclusive classes cannot express.")
     p.add_argument("--regen_splits_only", action="store_true")
     args = p.parse_args()
+
+    if args.rib_regions and (args.no_remap or args.drop_ignore_label
+                             or args.countfree):
+        log.error("--rib_regions defines its own label scheme and is incompatible with "
+                  "--countfree, --no_remap and --drop_ignore_label.")
+        raise SystemExit(2)
 
     if args.countfree and (args.no_remap or args.drop_ignore_label):
         log.error("--countfree is incompatible with --no_remap and "
@@ -1021,7 +1158,17 @@ def main():
     # VerSe-native, so a remap LUT is ALWAYS built (label files are always
     # physically rewritten). Unlisted VerSe ids drop to background — see
     # _build_verse_remap_lut.
-    if args.countfree:
+    if args.rib_regions:
+        label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_RIB_REGIONS_FROM_VERSE)
+        active_label_names = LABEL_NAMES_RIB_REGIONS
+        log.info("Label scheme: RIB-BEARING REGIONS. Vertebrae split into rib-bearing "
+                 "and not, as nested regions: 'vertebra' covers both, 'rib_bearing' "
+                 "sits inside it.")
+        log.info("  -> a lumbar rib (74/75) makes its vertebra rib-bearing, which is "
+                 "the transitional phenotype and must not be hidden inside the label. "
+                 "Rib association is computed geometrically from the SOURCE ids, before "
+                 "the remap collapses them.")
+    elif args.countfree:
         label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_COUNTFREE_FROM_VERSE)
         active_label_names = LABEL_NAMES_COUNTFREE
         log.info("Label remap: VerSe-native -> COUNT-FREE 10-key: %s",
@@ -1098,7 +1245,8 @@ def main():
         images_tr, labels_tr, images_ts, labels_ts,
         use_symlinks=args.symlinks, do_link=do_link,
         label_remap_lut=label_remap_lut,
-        derive_disc=args.countfree,
+        derive_disc=args.countfree or args.rib_regions,
+        rib_regions=args.rib_regions,
         include_configs=include_configs,
     )
 
@@ -1190,7 +1338,18 @@ def main():
             "reference":     "CTSpine1K + CTPelvic1K, COLONOG cohort",
             "release":       release,
         }
-        (ds_dir / "dataset.json").write_text(json.dumps(dataset_json, indent=2))
+        if args.rib_regions:
+            # regions_class_order paints the regions back into an integer map IN ORDER,
+            # later entries overwriting earlier, so the encompassing 'vertebra' must
+            # come before the 'rib_bearing' nested inside it. The ignore label is
+            # deliberately NOT listed: it is not predicted.
+            dataset_json["regions_class_order"] = REGIONS_CLASS_ORDER_RIB
+        # sort_keys=False is load-bearing, not style. nnU-Net reads the labels dict IN
+        # ORDER for region-based training, and alphabetical sorting would put
+        # 'rib_bearing' after 'sacrum' and before 'vertebra' -- silently painting the
+        # encompassing region over the substructure it contains and erasing it.
+        (ds_dir / "dataset.json").write_text(
+            json.dumps(dataset_json, indent=2, sort_keys=False))
         n_fg = sum(1 for k in active_label_names
                    if k not in ("background", "ignore"))
         has_ignore = "ignore" in active_label_names
