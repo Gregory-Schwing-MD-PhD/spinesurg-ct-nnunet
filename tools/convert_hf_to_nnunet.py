@@ -263,6 +263,149 @@ VERSE_LEFT_HIP  = 30
 VERSE_RIGHT_HIP = 31
 VERSE_IGNORE    = 255
 
+# ── COUNT-FREE scheme (--countfree) ───────────────────────────────────
+#
+# NO VERTEBRAL IDENTITY IS ASKED OF THE NETWORK. Every vertebra is one
+# class regardless of level. The level name is not a property of the bone
+# — L5 and L6 are the same object under two different counts — so a
+# per-voxel loss cannot express what makes the answer decidable, and a
+# network trained on it learns whichever naming convention was commoner
+# among the annotators. Counting happens afterwards, in code, where it
+# has an audit trail.
+#
+# Ribs keep a side but not a number, for the same reason: side is locally
+# decidable from the image, number is not. A rib on a lumbar body folds
+# into the rib class rather than being forced to be a twelfth rib — that
+# is the same object under two counts, and choosing here would bake in
+# the answer the counting stage exists to derive.
+#
+# Class 2 is DERIVED, not remapped: see _derive_disc_space().
+LABEL_NAMES_COUNTFREE = {
+    "background":  0,
+    "vertebra":    1,
+    "disc_space":  2,   # DERIVED at convert time, not present in any source
+    "rib_left":    3,
+    "rib_right":   4,
+    "sacrum":      5,
+    "left_hip":    6,
+    "right_hip":   7,
+    "femur":       8,
+    "ignore":      9,
+}
+
+_CF_VERTEBRA, _CF_DISC = 1, 2
+_CF_RIB_L, _CF_RIB_R = 3, 4
+_CF_SACRUM, _CF_HIP_L, _CF_HIP_R, _CF_FEMUR, _CF_IGNORE = 5, 6, 7, 8, 9
+
+# Every vertebra 1..25 plus T13 (28) collapses to one class. Sacrum (26)
+# and the carved S1 (29) are one sacrum. Coccyx (27), soft tissue
+# (58-73) and hardware (76-79) drop to background.
+LABEL_REMAP_COUNTFREE_FROM_VERSE: Dict[int, int] = {
+    **{i: _CF_VERTEBRA for i in range(1, 26)},      # C1..L6
+    28: _CF_VERTEBRA,                               # T13
+    VERSE_SACRUM: _CF_SACRUM,
+    29: _CF_SACRUM,                                 # S1, carved from sacrum top
+    VERSE_LEFT_HIP: _CF_HIP_L,
+    VERSE_RIGHT_HIP: _CF_HIP_R,
+    32: _CF_FEMUR, 33: _CF_FEMUR,
+    **{i: _CF_RIB_L for i in range(34, 46)},        # ribs 1-12 left
+    **{i: _CF_RIB_R for i in range(46, 58)},        # ribs 1-12 right
+    74: _CF_RIB_L, 75: _CF_RIB_R,                   # lumbar ribs: still ribs
+    VERSE_IGNORE: _CF_IGNORE,
+}
+
+# Adjacent-vertebra id pairs whose seam becomes a disc. Consecutive VerSe
+# ids within the vertebral column only.
+_CF_VERTEBRA_IDS = tuple(range(1, 26))
+
+
+def _derive_disc_space(arr, zooms, reach_mm: float = 10.0,
+                       max_gap_mm: float = 14.0):
+    """Return a boolean mask of the intervertebral spaces.
+
+    WHY THIS CLASS EXISTS AT ALL. nnU-Net is semantic, not instance. With
+    one "vertebra" class the column comes back as a single connected blob
+    wherever two bodies touch — and where they touch is exactly where the
+    counting stage needs a boundary. Predicting the space between them as
+    its own class turns instance separation into a local segmentation
+    problem the network can actually do, and it degrades gracefully: a
+    missed disc merges two vertebrae, which shows up as an outlier in
+    component height rather than as a silent off-by-one.
+
+    HOW THE SEAM IS FOUND. For each pair of consecutive vertebra ids that
+    are BOTH present, the disc is the background lying within reach of
+    both, with the sum of the two distances bounded so that a vertebra
+    missing from the field of view is not papered over with one enormous
+    disc. Distances are in millimetres via the voxel spacing, so the rule
+    means the same thing at every slice thickness in the corpus.
+
+    A STRICTER RULE WAS TRIED AND IS WRONG. Requiring each voxel to lie
+    geometrically BETWEEN its two nearest surface points removes a collar
+    of voxels that wrap around the sides of the bodies -- but real
+    endplates are concave, so the two nearest points are seldom collinear
+    with the voxel between them, and on real anatomy the test rejected
+    almost the whole seam. It left 2262 fragments instead of a disc on
+    case 0001, and the vertebrae it was supposed to separate stayed
+    merged into one component. The lateral collar the strict rule removes
+    is roughly one slice deep and does no harm; failing to cut the column
+    does.
+
+    WHAT IS DELIBERATELY NOT DERIVED: the lumbosacral disc. Whether a
+    disc exists between the lowest mobile vertebra and the sacrum is the
+    transitional finding itself, and a geometric rule that manufactures
+    one whenever there is a gap would answer the question the counting
+    stage is supposed to ask. Sacrum keeps its own class and needs no
+    separator from the vertebra above it, so nothing is lost by leaving
+    it alone.
+
+    Operates in the array's own frame. Nothing is reoriented; the caller
+    writes back with the source affine.
+    """
+    from scipy import ndimage
+
+    out = np.zeros(arr.shape, dtype=bool)
+    present = {v for v in _CF_VERTEBRA_IDS if np.any(arr == v)}
+    pad = [int(np.ceil(reach_mm / max(z, 1e-6))) + 1 for z in zooms]
+
+    for v in sorted(present):
+        w = v + 1
+        if w not in present:
+            continue
+        both = (arr == v) | (arr == w)
+        idx = np.argwhere(both)
+        lo = np.maximum(idx.min(0) - pad, 0)
+        hi = np.minimum(idx.max(0) + 1 + pad, arr.shape)
+        sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+        sub = arr[sl]
+
+        d_v = ndimage.distance_transform_edt(sub != v, sampling=zooms)
+        d_w = ndimage.distance_transform_edt(sub != w, sampling=zooms)
+        disc = ((sub == 0) & (d_v <= reach_mm) & (d_w <= reach_mm)
+                & (d_v + d_w <= max_gap_mm))
+
+        # AND A CUT WHERE THE TWO BODIES ABUT, WHICH THE GAP RULE CANNOT REACH.
+        # Adjacent vertebrae meet in three places -- the disc and the two facet joints
+        # -- and in these labels they frequently touch with NO background voxel between
+        # them, because the tools that produced the source segment bone and not joints.
+        # Where there is no gap there is nothing for a gap rule to fill, so the column
+        # stayed connected through the facets and came back as 2 components for 10
+        # vertebrae: the separator did not separate.
+        #
+        # The fix carves a one-voxel sheet from each body along the surface where they
+        # touch. That means the class is not purely background -- it takes back a thin
+        # shell the source assigned to bone -- and that is the honest reading: a real
+        # joint occupies space these labels give to one side or the other, and the
+        # boundary has to exist somewhere. 26-connectivity so that a diagonal contact is
+        # cut too; a diagonal leak reconnects the column just as thoroughly as a face one.
+        nb = ndimage.generate_binary_structure(3, 3)
+        mv, mw = (sub == v), (sub == w)
+        disc |= mv & ndimage.binary_dilation(mw, structure=nb)
+        disc |= mw & ndimage.binary_dilation(mv, structure=nb)
+        out[sl] |= disc
+    return out
+
+
+
 # Source (VerSe-native) -> trained-label remaps. Applied by
 # _remap_and_write_label() during the link/copy loop. These are consumed
 # by _build_verse_remap_lut(), which defaults EVERY unlisted nonzero
@@ -376,7 +519,8 @@ def _build_verse_remap_lut(remap: Dict[int, int],
     return lut
 
 
-def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray) -> None:
+def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray,
+                           derive_disc: bool = False) -> None:
     """Read source label NIfTI, apply the remap LUT, write to dst.
 
     Used when the dataset.json label scheme differs from the source
@@ -401,6 +545,19 @@ def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray) -> None:
                     src.name, src_max, len(lut) - 1)
         arr = np.clip(arr, 0, len(lut) - 1)
     arr_remapped = lut[arr].astype(np.uint8)
+
+    if derive_disc:
+        # derived from the SOURCE ids, which still carry per-level identity --
+        # after the remap every vertebra is class 1 and the seams are gone
+        zooms = tuple(float(z) for z in img.header.get_zooms()[:3])
+        disc = _derive_disc_space(arr, zooms)
+        # The disc deliberately includes a one-voxel shell taken from the two bodies
+        # where they abut, so it is NOT gated on background -- gating there would
+        # restore exactly the leak it exists to close. It IS gated away from the
+        # ignore region: the ignore contract is what makes partial annotation safe,
+        # and nothing may supervise a region that was never annotated.
+        arr_remapped[disc & (arr_remapped != _CF_IGNORE)] = _CF_DISC
+
     out = nib.Nifti1Image(arr_remapped, img.affine, img.header)
     out.set_data_dtype(np.uint8)
     nib.save(out, dst)
@@ -520,6 +677,7 @@ def _build_case_indices(
     do_link: bool,
     label_remap_lut: Optional[np.ndarray],
     include_configs: Optional[frozenset] = None,
+    derive_disc: bool = False,
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Dict],
            List[str], List[str], int, Dict[str, int],
            Dict[str, int], int, Dict[str, int]]:
@@ -615,7 +773,8 @@ def _build_case_indices(
                     # configured; otherwise symlink/copy through.
                     if label_remap_lut is not None:
                         _remap_and_write_label(label_src, label_dst,
-                                                label_remap_lut)
+                                                label_remap_lut,
+                                                derive_disc=derive_disc)
                         remap_stats["n_remapped"] += 1
                     else:
                         _link_or_copy(label_src, label_dst, use_symlinks)
@@ -773,8 +932,23 @@ def main():
                          "(0). For the fused-only ablation, where records are "
                          "fully annotated and carry no ignore voxels. Keeps the "
                          "L6->last_lumbar merge. Incompatible with --no_remap.")
+    p.add_argument("--countfree", action="store_true",
+                    help="Select the COUNT-FREE scheme: no vertebral identity is "
+                         "asked of the network at all. Every vertebra is one "
+                         "class, ribs carry a side but no number, and an "
+                         "intervertebral-space class is DERIVED at convert time "
+                         "so connected components of vertebra-minus-space are "
+                         "individual vertebrae. Level naming and transitional "
+                         "flagging then happen in code, downstream, where they "
+                         "are auditable. Incompatible with --no_remap and with "
+                         "--drop_ignore_label.")
     p.add_argument("--regen_splits_only", action="store_true")
     args = p.parse_args()
+
+    if args.countfree and (args.no_remap or args.drop_ignore_label):
+        log.error("--countfree is incompatible with --no_remap and "
+                  "--drop_ignore_label (it defines its own label scheme).")
+        raise SystemExit(2)
 
     if args.drop_ignore_label and args.no_remap:
         log.error("--drop_ignore_label is incompatible with --no_remap "
@@ -821,7 +995,21 @@ def main():
     # VerSe-native, so a remap LUT is ALWAYS built (label files are always
     # physically rewritten). Unlisted VerSe ids drop to background — see
     # _build_verse_remap_lut.
-    if args.no_remap:
+    if args.countfree:
+        label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_COUNTFREE_FROM_VERSE)
+        active_label_names = LABEL_NAMES_COUNTFREE
+        log.info("Label remap: VerSe-native -> COUNT-FREE 10-key: %s",
+                 dict(LABEL_REMAP_COUNTFREE_FROM_VERSE))
+        log.info("  -> every vertebra collapses to one class; ribs keep a side "
+                 "but no number; a lumbar rib is a rib. Class 2 (disc_space) is "
+                 "DERIVED from the source per-level ids at write time and "
+                 "appears in no source file -- it is what makes connected "
+                 "components of the vertebra class separable, which is what the "
+                 "counting stage needs. The lumbosacral disc is deliberately "
+                 "NOT derived: whether one exists is the transitional finding, "
+                 "and manufacturing it would answer the question downstream "
+                 "code is meant to ask.")
+    elif args.no_remap:
         label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_UNMERGED_FROM_VERSE)
         active_label_names = LABEL_NAMES_UNMERGED
         log.info("Label remap: VerSe-native -> unmerged 10-class (Dataset802; "
@@ -884,6 +1072,7 @@ def main():
         images_tr, labels_tr, images_ts, labels_ts,
         use_symlinks=args.symlinks, do_link=do_link,
         label_remap_lut=label_remap_lut,
+        derive_disc=args.countfree,
         include_configs=include_configs,
     )
 
