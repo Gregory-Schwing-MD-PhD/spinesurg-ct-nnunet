@@ -351,6 +351,55 @@ if [[ "${LEGACY_NO_REMAP}" == "1" ]]; then
     CONVERT_REMAP_FLAG="--no_remap"
 fi
 
+# ---------------------------------------------------------------------------
+# LSTV BENCHMARK SCHEMES (2026-08). SCHEME= selects one of three targets built
+# for the transitional-anatomy comparison. They are mutually exclusive with
+# each other and with LEGACY_NO_REMAP / DROP_IGNORE_LABEL, and the convert
+# script rejects the combination rather than silently preferring one.
+#
+#   SCHEME=oneshot      21 classes: T10-T12 and L1-L6 distinct, ribs 1-11
+#                       pooled, the TWELFTH rib kept apart from the lumbar
+#                       rib. This is the ONLY target on which the
+#                       hypoplastic-twelfth versus lumbar-rib question is
+#                       measurable -- the older schemes have neither thoracic
+#                       nor rib classes, so a model can be neither right nor
+#                       wrong about it.
+#   SCHEME=rib_regions  count-free, with the vertebra class split into
+#                       rib-bearing and not, as nested nnU-Net REGIONS. Lets
+#                       the network be certain a thing is a vertebra while
+#                       uncertain whether it bears a rib.
+#   SCHEME=countfree    no vertebral identity at all; counting happens
+#                       downstream in code. The comparator arm.
+#
+# Suggested dataset ids, kept apart so the three can coexist:
+#   oneshot 810, rib_regions 811, countfree 812
+SCHEME="${SCHEME:-}"
+CONVERT_SCHEME_FLAG=""
+case "${SCHEME}" in
+    "")            ;;
+    oneshot)       CONVERT_SCHEME_FLAG="--oneshot" ;;
+    rib_regions)   CONVERT_SCHEME_FLAG="--rib_regions" ;;
+    countfree)     CONVERT_SCHEME_FLAG="--countfree" ;;
+    *) echo "ERROR: SCHEME must be oneshot, rib_regions or countfree (got '${SCHEME}')" >&2
+       exit 1 ;;
+esac
+if [[ -n "${CONVERT_SCHEME_FLAG}" ]]; then
+    if [[ "${LEGACY_NO_REMAP}" == "1" || "${DROP_IGNORE_LABEL}" == "1" ]]; then
+        echo "ERROR: SCHEME=${SCHEME} defines its own label scheme; it cannot be combined" >&2
+        echo "       with LEGACY_NO_REMAP or DROP_IGNORE_LABEL." >&2
+        exit 1
+    fi
+    # A benchmark whose arms share a dataset id will overwrite each other's
+    # preprocessed data, and the failure looks like an unexplained accuracy change
+    # rather than an error. Refuse the default id outright.
+    if [[ "${DATASET_ID}" == "803" ]]; then
+        echo "ERROR: SCHEME=${SCHEME} was submitted with the DEFAULT DATASET_ID=803." >&2
+        echo "       Give each arm its own id or they will overwrite one another:" >&2
+        echo "         oneshot 810, rib_regions 811, countfree 812" >&2
+        exit 1
+    fi
+fi
+
 # Fused-only ablation flags (empty unless requested via env).
 CONVERT_ABLATION_FLAGS=""
 if [[ -n "${INCLUDE_CONFIGS}" ]]; then
@@ -369,6 +418,9 @@ elif [[ "${DROP_IGNORE_LABEL}" == "1" ]]; then
     echo "   Label scheme : FUSED-ONLY no-ignore 9-key (8 fg + bg; NO ignore class)"
 else
     echo "   Label scheme : v20 merged 9-class (last_lumbar = former L5+L6)"
+fi
+if [[ -n "${SCHEME}" ]]; then
+    echo "   LSTV SCHEME  : ${SCHEME} (${CONVERT_SCHEME_FLAG})"
 fi
 [[ -n "${INCLUDE_CONFIGS}" ]] && echo "   Config filter: keep only [${INCLUDE_CONFIGS}]"
 echo "   Plans        : ${PLANS} (target ${GPU_MEMORY_TARGET_GB} GB)"
@@ -400,6 +452,28 @@ SING_BINDS=(
     --pwd  /workspace
 )
 
+# -- Step 0: preflight -------------------------------------------------------
+# Every check here is one that fails SILENTLY otherwise: a misplaced ignore
+# label, non-contiguous class values, a regions_class_order that paints the
+# encompassing region over the one nested inside it, or a validation fold
+# holding none of the rare class the benchmark exists to measure. nnU-Net
+# trains happily through all of those and reports a number that looks fine.
+#
+# It runs only for the LSTV schemes, because only they introduce regions and
+# the new class layouts. Label-volume checks are skipped when the directory is
+# not visible from inside the container; the scheme checks need no data and are
+# the ones that matter most.
+if [[ -n "${CONVERT_SCHEME_FLAG}" ]]; then
+    echo ""; echo "----- Step 0: preflight -----"
+    singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
+        python tools/preflight_lstv.py \
+            --labels "${PREFLIGHT_LABELS:-}" \
+            --splits /workspace/splits_5fold.json \
+            --lstv-cases "${PREFLIGHT_LSTV_CASES:-}" || {
+        echo "PREFLIGHT FAILED -- nothing downstream is worth running." >&2
+        exit 1; }
+fi
+
 # -- Step 1: convert HF export -> nnU-Net raw (on NFS) -----------------------
 echo ""; echo "----- Step 1: convert HF export -> nnU-Net raw -----"
 if [[ -f "${NFS_RAW_DS}/dataset.json" ]]; then
@@ -412,7 +486,7 @@ else
             --nnunet_raw /nnunet_nfs/raw \
             --dataset_id   ${DATASET_ID} \
             --dataset_name ${DATASET_NAME} \
-            --symlinks ${CONVERT_REMAP_FLAG} ${CONVERT_ABLATION_FLAGS}
+            --symlinks ${CONVERT_REMAP_FLAG} ${CONVERT_SCHEME_FLAG} ${CONVERT_ABLATION_FLAGS}
 fi
 
 # -- Step 2: plan + preprocess (reads + writes on NFS) -----------------------

@@ -87,3 +87,57 @@ def test_ignore_is_the_highest_value():
     for v in cvt.LABEL_NAMES_RIB_REGIONS.values():
         vals.extend(v if isinstance(v, list) else [v])
     assert cvt.LABEL_NAMES_RIB_REGIONS["ignore"] == max(vals)
+
+
+# ---------------------------------------------------------------------------
+# --oneshot: the 21-class target that makes the hypoplastic-twelfth-rib versus
+# lumbar-rib discrimination measurable at all.
+# ---------------------------------------------------------------------------
+
+def test_oneshot_keeps_the_confusable_pair_apart():
+    """THE WHOLE POINT OF THE SCHEME. rib12 and lumbar_rib must be different classes.
+    Pooling them would hide the comparison inside a class that is easy for other
+    reasons, and the model could then be neither right nor wrong about it."""
+    lut = cvt._build_verse_remap_lut(cvt.LABEL_REMAP_ONESHOT_FROM_VERSE)
+    n = cvt.LABEL_NAMES_ONESHOT
+    assert lut[45] == n["rib12_left"] and lut[57] == n["rib12_right"]
+    assert lut[74] == n["lumbar_rib_left"] and lut[75] == n["lumbar_rib_right"]
+    assert lut[45] != lut[74] and lut[57] != lut[75]
+
+
+def test_oneshot_names_the_vertebra_that_names_the_rib():
+    """T12 and L1 must be separable classes: the costal facet on the BODY is what says
+    whether the small rib beside it is a twelfth or a lumbar one."""
+    lut = cvt._build_verse_remap_lut(cvt.LABEL_REMAP_ONESHOT_FROM_VERSE)
+    n = cvt.LABEL_NAMES_ONESHOT
+    assert lut[19] == n["T12"] and lut[20] == n["L1"] and lut[19] != lut[20]
+    for src, name in ((17, "T10"), (18, "T11"), (24, "L5"), (25, "L6")):
+        assert lut[src] == n[name]
+
+
+def test_oneshot_pools_ribs_one_to_eleven():
+    """Only the twelfth is confusable. Ribs 1-11 are pooled so the network is not asked
+    to number them, which is the same non-local problem as vertebral identity."""
+    lut = cvt._build_verse_remap_lut(cvt.LABEL_REMAP_ONESHOT_FROM_VERSE)
+    n = cvt.LABEL_NAMES_ONESHOT
+    for src in range(34, 45):
+        assert lut[src] == n["rib_left"]
+    for src in range(46, 57):
+        assert lut[src] == n["rib_right"]
+
+
+def test_oneshot_label_values_are_contiguous_and_ignore_is_last():
+    """nnU-Net builds its output head from the sorted label values, so a gap or a
+    non-maximal ignore label silently misaligns channels against class ids."""
+    vals = sorted(cvt.LABEL_NAMES_ONESHOT.values())
+    assert vals == list(range(len(vals))), vals
+    assert cvt.LABEL_NAMES_ONESHOT["ignore"] == max(vals)
+
+
+def test_oneshot_drops_what_is_outside_the_question():
+    """Cervical and upper thoracic vertebrae, coccyx, soft tissue and hardware are not
+    classes here and must fall to background rather than leak through as stray ids that
+    nnU-Net's integrity check would reject."""
+    lut = cvt._build_verse_remap_lut(cvt.LABEL_REMAP_ONESHOT_FROM_VERSE)
+    for src in (1, 7, 16, 27, 60, 73, 76, 79):
+        assert lut[src] == 0, src

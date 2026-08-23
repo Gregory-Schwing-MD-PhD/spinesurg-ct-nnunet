@@ -629,6 +629,91 @@ def _rib_bearing_vertebrae(arr, zooms, reach_mm=4.0):
     return hit
 
 
+# ── ONE-SHOT AT THE JUNCTION (--oneshot) ──────────────────────────────
+#
+# THE EXPERIMENT THIS SCHEME EXISTS TO MAKE POSSIBLE. The claim under
+# test is that a sufficiently powerful network can tell a HYPOPLASTIC
+# TWELFTH RIB from a LUMBAR RIB in one pass, from morphology alone. The
+# existing one-shot target (--no_remap) cannot be used to test it,
+# because it has no thoracic classes and no rib classes: the two things
+# to be distinguished are both absent, so the model can be neither right
+# nor wrong about them.
+#
+# WHY THE CLAIM IS REASONABLE, which the count-free argument understated.
+# Vertebral IDENTITY is not local -- L5 and L6 are the same bone under
+# two counts, and no patch can settle which. But THORACIC versus LUMBAR
+# is not that kind of question. They are morphologically different bones
+# and every discriminating feature is patch-local:
+#
+#   costal facets on the BODY   thoracic only; the decisive feature. A
+#                               T12 body carries one, an L1 body does not,
+#                               so the vertebra tells you what the rib is.
+#   costotransverse joint       a rib meets the process across a JOINT; a
+#                               transverse process is continuous with the
+#                               pedicle. Joint versus continuity is visible.
+#   process morphology          thoracic processes are short, thick and
+#                               club-shaped, pointing posterolaterally;
+#                               lumbar are long, flat and blade-like, with
+#                               mammillary and accessory processes.
+#
+# So the discrimination is available to a network with the receptive
+# field to see a vertebra together with what is attached to it. Whether
+# it LEARNS it at 16 lumbar-rib cases is the empirical question, and the
+# point of running it.
+#
+# THE TWELFTH RIB GETS ITS OWN CLASS, separately from ribs 1-11, because
+# the confusable pair is specifically {hypoplastic twelfth rib, lumbar
+# rib}. Collapsing all thoracic ribs together would hide the comparison
+# inside a class that is easy for other reasons.
+#
+# WHAT REMAINS OUT OF REACH, and should be said in the talk rather than
+# discovered in the results: L5 versus L6 is still a count, and no
+# morphology settles it. A one-shot model can be expected to get the
+# thoracolumbar junction right and still be undecidable at the
+# lumbosacral one. That is a sharper and more interesting claim than
+# either "one shot works" or "one shot fails".
+_OS = {}
+_OS_NAMES = {"background": 0}
+_i = 0
+
+
+def _os_add(name, src_ids):
+    global _i
+    _i += 1
+    _OS_NAMES[name] = _i
+    for sid in src_ids:
+        _OS[sid] = _i
+
+
+# thoracic levels around the junction, kept distinct: the costal facet is
+# what names the rib, so the vertebra has to be nameable
+_os_add("T10", [17])
+_os_add("T11", [18])
+_os_add("T12", [19])
+for _n, _v in (("L1", 20), ("L2", 21), ("L3", 22), ("L4", 23), ("L5", 24), ("L6", 25)):
+    _os_add(_n, [_v])
+_os_add("sacrum", [26, 29])
+# ribs 1-11 pooled; the TWELFTH kept apart, because it is the confusable one
+_os_add("rib_left", list(range(34, 45)))
+_os_add("rib_right", list(range(46, 57)))
+_os_add("rib12_left", [45])
+_os_add("rib12_right", [57])
+_os_add("lumbar_rib_left", [74])
+_os_add("lumbar_rib_right", [75])
+_os_add("left_hip", [30])
+_os_add("right_hip", [31])
+_os_add("femur", [32, 33])
+_i += 1
+_OS_NAMES["ignore"] = _i
+_OS[VERSE_IGNORE] = _i
+
+LABEL_NAMES_ONESHOT = dict(_OS_NAMES)
+LABEL_REMAP_ONESHOT_FROM_VERSE: Dict[int, int] = dict(_OS)
+# thoracic vertebrae above T10 are outside the question and drop to
+# background; they are also outside most of these fields of view
+del _OS, _OS_NAMES, _i
+
+
 def _build_verse_remap_lut(remap: Dict[int, int],
                            max_label: int = _MAX_SOURCE_LABEL) -> np.ndarray:
     """Build a vectorized lookup table for VerSe-native label remapping.
@@ -1090,6 +1175,14 @@ def main():
                          "flagging then happen in code, downstream, where they "
                          "are auditable. Incompatible with --no_remap and with "
                          "--drop_ignore_label.")
+    p.add_argument("--oneshot", action="store_true",
+                    help="One-shot at the thoracolumbar junction: T10-T12 and L1-L6 as "
+                         "distinct classes, ribs 1-11 pooled, the TWELFTH rib kept apart "
+                         "from the lumbar rib. This is the target that makes the "
+                         "hypoplastic-twelfth-rib versus lumbar-rib discrimination "
+                         "measurable at all -- the existing one-shot scheme has neither "
+                         "thoracic nor rib classes, so it can be neither right nor wrong "
+                         "about them.")
     p.add_argument("--rib_regions", action="store_true",
                     help="The count-free scheme, with the vertebra class split into "
                          "rib-bearing and not, expressed as nnU-Net REGIONS rather than "
@@ -1101,6 +1194,12 @@ def main():
                          "bears a rib, which exclusive classes cannot express.")
     p.add_argument("--regen_splits_only", action="store_true")
     args = p.parse_args()
+
+    if args.oneshot and (args.no_remap or args.drop_ignore_label
+                         or args.countfree or args.rib_regions):
+        log.error("--oneshot defines its own label scheme and is incompatible with the "
+                  "other scheme flags.")
+        raise SystemExit(2)
 
     if args.rib_regions and (args.no_remap or args.drop_ignore_label
                              or args.countfree):
@@ -1158,7 +1257,18 @@ def main():
     # VerSe-native, so a remap LUT is ALWAYS built (label files are always
     # physically rewritten). Unlisted VerSe ids drop to background — see
     # _build_verse_remap_lut.
-    if args.rib_regions:
+    if args.oneshot:
+        label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_ONESHOT_FROM_VERSE)
+        active_label_names = LABEL_NAMES_ONESHOT
+        log.info("Label scheme: ONE-SHOT AT THE JUNCTION, %d classes.",
+                 len(LABEL_NAMES_ONESHOT))
+        log.info("  -> the twelfth rib is a class of its own, separate from the lumbar "
+                 "rib, because that pair IS the discrimination under test. Thoracic "
+                 "levels are kept distinct because the costal facet on the body is what "
+                 "names the rib attached to it.")
+        log.info("  -> L5 versus L6 remains a COUNT and no morphology settles it. Expect "
+                 "the junction to be learnable and the lumbosacral one not.")
+    elif args.rib_regions:
         label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_RIB_REGIONS_FROM_VERSE)
         active_label_names = LABEL_NAMES_RIB_REGIONS
         log.info("Label scheme: RIB-BEARING REGIONS. Vertebrae split into rib-bearing "
