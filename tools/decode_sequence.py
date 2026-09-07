@@ -84,16 +84,40 @@ def decode_case(pred_path: Path, npz_path: Path, names: dict[str, int], gt_path:
     sac_id = names.get("sacrum")
     rib_ids = {n: names[n] for n in RIBS if n in names}
 
-    vert = np.isin(seg, vert_ids)
-    cc, n = ndimage.label(vert, structure=np.ones((3, 3, 3)))
+    # INSTANCES PER NAME CLASS, not per union: adjacent vertebrae touch at the facets, so the
+    # union of vertebra classes is one connected blob for the whole column (the self-test on
+    # ground truth returned a single instance per record). The network's per-name output
+    # separates neighbours by construction; two neighbours given the SAME name stay apart
+    # because their centroids are a body height apart, while fragments of one vertebra
+    # (a detached spinous process) share a name and a centroid and are merged.
+    comps = []                                        # (name_id, mask, z_mm)
+    for vid in vert_ids:
+        m_all = seg == vid
+        if m_all.sum() < MIN_VOX:
+            continue
+        cc, n = ndimage.label(m_all, structure=np.ones((3, 3, 3)))
+        parts = []
+        for lab in range(1, n + 1):
+            m = cc == lab
+            if m.sum() < MIN_VOX // 3:
+                continue
+            idx = np.argwhere(m)
+            parts.append([m, float(idx[:, axis].mean() * zooms[axis] * sign)])
+        parts.sort(key=lambda p: -p[1])
+        merged = []
+        for m, z in parts:                             # same name within 12 mm = one vertebra
+            if merged and abs(merged[-1][1] - z) < 12.0:
+                merged[-1][0] |= m
+                idx = np.argwhere(merged[-1][0])
+                merged[-1][1] = float(idx[:, axis].mean() * zooms[axis] * sign)
+            else:
+                merged.append([m, z])
+        comps += [(vid, m, z) for m, z in merged]
     inst = []
-    for lab in range(1, n + 1):
-        m = cc == lab
+    for vid, m, z_mm in comps:
         nv = int(m.sum())
         if nv < MIN_VOX:
             continue
-        idx = np.argwhere(m)
-        z_mm = float(idx[:, axis].mean() * zooms[axis] * sign)
         mean_p = probs[:, m].astype(np.float32).mean(1)          # (C,)
         p_thor = float(mean_p[thor_ids].sum()); p_lum = float(mean_p[lum_ids].sum())
         p_sac = float(mean_p[sac_id]) if sac_id is not None else 0.0
