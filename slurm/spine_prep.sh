@@ -619,6 +619,32 @@ except Exception as e:
     print(f"fail: {e}")
 PY
 )
+# LSTV benchmark schemes (SCHEME=oneshot|rib_regions|countfree) define their own label
+# dicts in tools/convert_hf_to_nnunet.py; validate against that table, not the 802/803 ones.
+# Without this branch every LSTV prep ended "FAILED" after a complete, correct preprocess
+# (Dataset810, 2026-09-07), which then poisoned the folds' afterok dependency.
+if [[ -n "${SCHEME}" ]]; then
+    DS_JSON_OK=$(singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
+        python - "${NFS_RAW_DS}/dataset.json" "${SCHEME}" <<'PY' 2>/dev/null || echo "fail"
+import json, sys
+sys.path.insert(0, "/workspace/tools")
+import convert_hf_to_nnunet as cvt
+table = {"oneshot": cvt.LABEL_NAMES_ONESHOT, "countfree": cvt.LABEL_NAMES_COUNTFREE,
+         "rib_regions": getattr(cvt, "LABEL_NAMES_RIB_REGIONS", {})}[sys.argv[2]]
+d = json.load(open(sys.argv[1]))
+labels = d.get("labels", {})
+norm = {k: (int(v) if not isinstance(v, list) else tuple(v)) for k, v in labels.items()}
+if sys.argv[2] == "rib_regions":
+    print("ok (rib_regions, region scheme: keys checked)" if set(norm) == set(table) else
+          f"label-mismatch (rib_regions): keys {sorted(set(norm) ^ set(table))}")
+elif norm == {k: int(v) for k, v in table.items()}:
+    print(f"ok ({sys.argv[2]}, {len(norm)} classes)")
+else:
+    mism = [f"{k}: got={norm.get(k)} expected={table.get(k)}" for k in sorted(set(norm) | set(table)) if norm.get(k) != table.get(k)]
+    print(f"label-mismatch ({sys.argv[2]}): {'; '.join(mism)}")
+PY
+)
+fi
 if [[ "${DS_JSON_OK}" != ok* ]]; then
     echo "ERROR: dataset.json sanity check FAILED: ${DS_JSON_OK}" >&2
     if [[ "${DROP_IGNORE_LABEL}" == "1" ]]; then
