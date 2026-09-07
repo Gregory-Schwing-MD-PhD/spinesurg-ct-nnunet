@@ -372,10 +372,20 @@ def _read_lstv_cases_json(json_path: Path
             canon = _canonicalize_subtype_str(sub)
             case_to_subtype[cid] = canon
             all_case_ids.add(cid)
-        oversample_pool = sorted(
-            cid for cid, sub in case_to_subtype.items()
-            if sub in _OVERSAMPLE_SUBTYPES
-        )
+        pool = {cid for cid, sub in case_to_subtype.items() if sub in _OVERSAMPLE_SUBTYPES}
+        # THE THORACOLUMBAR HALF OF THE POOL. A lumbar rib sits in 16 of 802 records and a
+        # T13 in fewer, and most of those records are "normal" by lumbosacral subtype, so
+        # a subtype-only pool never shows them to the sampler more than uniformly. Under
+        # the one-shot scheme those are the classes the benchmark exists to learn, so any
+        # case whose attributes flag a lumbar rib or a T13 joins the pool too.
+        attrs = data.get("case_to_attrs") or {}
+        if isinstance(attrs, dict):
+            for cid, at in attrs.items():
+                if isinstance(at, dict) and (at.get("has_lumbar_rib") or at.get("has_t13")):
+                    pool.add(cid)
+                    all_case_ids.add(cid)
+                    case_to_subtype.setdefault(cid, _SUBTYPE_NORMAL)
+        oversample_pool = sorted(pool)
     else:
         case_ids_dict = data.get("case_ids") or {}
         if not isinstance(case_ids_dict, dict): return None

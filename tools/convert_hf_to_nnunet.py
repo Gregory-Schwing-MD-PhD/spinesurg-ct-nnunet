@@ -1066,6 +1066,10 @@ def _build_case_indices(
             case_to_attrs[case_id]   = {
                 "n_lumbar_labels": int(rec.get("n_lumbar_labels", 0) or 0),
                 "has_l6":          bool(rec.get("has_l6", False)),
+                # thoracolumbar variants: the trainer's oversampling pool and the
+                # preflight's per-fold rarity check both read these
+                "has_lumbar_rib":  bool(rec.get("has_lumbar_rib", False)),
+                "lumbar_rib_side": str(rec.get("lumbar_rib_side", "") or ""),
                 "lstv_label":      str(rec.get("lstv_label", "")),
                 "lstv_pelvic":     str(rec.get("lstv_pelvic", "")),
                 "lstv_vertebral":  str(rec.get("lstv_vertebral", "")),
