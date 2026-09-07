@@ -826,8 +826,24 @@ def _refine_subtype_for_record_config(patient_subtype: str,
 
 
 def _load_manifest_records(hf_dir: Path) -> Dict[str, List[Dict]]:
-    """Load manifests grouped by split name (train/validation/test)."""
+    """Load manifests grouped by split name (train/validation/test).
+
+    A RELEASE TREE (Zenodo/Hugging Face v7 onward) ships ONE manifest.json and no held-out
+    test split: every record is training material and the folds in splits_5fold.json carry
+    the validation assignment. When none of the three split manifests exist but
+    manifest.json does, every record is loaded as "train"."""
     out: Dict[str, List[Dict]] = {}
+    single = hf_dir / "manifest.json"
+    if single.exists() and not any((hf_dir / fn).exists() for fn in
+                                    ("manifest_train.json", "manifest_validation.json",
+                                     "manifest_test.json")):
+        data = json.loads(single.read_text())
+        if isinstance(data, dict):
+            data = data.get("records", data.get("cases", list(data.values())))
+        recs = [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+        log.info("release tree: loaded %d records from manifest.json as train; "
+                 "validation comes from the folds, no held-out test", len(recs))
+        return {"train": recs, "validation": [], "test": []}
     for split, fn in (
         ("train",      "manifest_train.json"),
         ("validation", "manifest_validation.json"),

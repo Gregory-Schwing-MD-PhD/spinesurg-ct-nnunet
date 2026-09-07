@@ -49,13 +49,21 @@ export LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC:-0.5}"
 # -----------------------------------------------------------------------------
 
 # ----- Config (match Stage A) -----------------------------------------------
-DATASET_ID=802
-DATASET_NAME="SpineSurgCTFull"
-CONFIG="3d_fullres"
+# Every one of these is overridable from the environment so that the LSTV benchmark arms
+# (Dataset810/811/812, ResEnc-L) run through the same script as the 802/803 baselines.
+DATASET_ID="${DATASET_ID:-802}"
+DATASET_NAME="${DATASET_NAME:-SpineSurgCTFull}"
+CONFIG="${CONFIG:-3d_fullres}"
 TRAINER="${TRAINER:-nnUNetTrainerWandB_1000ep_LSTVOversample}"
-PLANNER="nnUNetPlannerResEncM"
-GPU_MEMORY_TARGET_GB=100
-PLANS="nnUNetResEncUNetPlans_${GPU_MEMORY_TARGET_GB}G"
+PLANNER="${PLANNER:-nnUNetPlannerResEncM}"
+GPU_MEMORY_TARGET_GB="${GPU_MEMORY_TARGET_GB:-100}"
+case "${PLANNER}" in
+    nnUNetPlannerResEncM)  PLANS="nnUNetResEncUNetPlans_${GPU_MEMORY_TARGET_GB}G"   ;;
+    nnUNetPlannerResEncL)  PLANS="nnUNetResEncUNetLPlans_${GPU_MEMORY_TARGET_GB}G"  ;;
+    nnUNetPlannerResEncXL) PLANS="nnUNetResEncUNetXLPlans_${GPU_MEMORY_TARGET_GB}G" ;;
+    ExperimentPlanner)     PLANS="nnUNetPlans"                                     ;;
+    *) echo "ERROR: unknown planner ${PLANNER}" >&2; exit 1 ;;
+esac
 NNUNET_EXPORT_POOL=12
 NNUNET_DA_WORKERS=12
 
