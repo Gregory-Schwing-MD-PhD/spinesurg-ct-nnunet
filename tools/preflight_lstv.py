@@ -133,6 +133,8 @@ def split_checks(splits_path, lstv_cases_path):
         check("splits file present", False, str(p))
         return
     folds = json.loads(p.read_text())
+    if isinstance(folds, dict):            # release splits_5fold.json: {"folds": [...], "patient_subtypes": {...}}
+        folds = folds.get("folds", [])
     check("splits file present", True, f"{len(folds)} fold(s)")
 
     q = Path(lstv_cases_path)
@@ -140,8 +142,9 @@ def split_checks(splits_path, lstv_cases_path):
         check("lstv_cases.json present for stratification checking", False, str(q))
         return
     lc = json.loads(q.read_text())
-    attrs = lc.get("case_to_attrs", {}) or {}
-    subt = lc.get("case_to_subtype", {}) or {}
+    # lstv_cases.json keys cases; the release splits file keys patient tokens under other names
+    attrs = lc.get("case_to_attrs") or lc.get("patient_attrs") or {}
+    subt = lc.get("case_to_subtype") or lc.get("patient_subtypes") or {}
 
     def is_rare(c):
         a = attrs.get(c, {}) or {}

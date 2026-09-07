@@ -7,10 +7,15 @@
 #SBATCH --mem=250G
 #SBATCH --gres=gpu:nvidia_h200:1
 #SBATCH --time=48:00:00
+#SBATCH --signal=B:USR1@1200
 #SBATCH --output=logs/spine_train_f%x_%j.out
 #SBATCH --error=logs/spine_train_f%x_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=go2432@wayne.edu
+# SELF-REQUEUE. 500 epochs of ResEnc-L run past the 48 h a job asks for. Twenty minutes
+# before the limit SLURM sends USR1 to this shell; the trap resubmits the same fold with the
+# same environment, and the new job resumes from checkpoint_latest.pth (the --c path below).
+# A fold that finishes writes checkpoint_final.pth and the next submission is a no-op.
 # =============================================================================
 # SpineSurg-CT  --  Stage B (single fold)
 # =============================================================================
@@ -41,7 +46,7 @@ if ! [[ "${FOLD}" =~ ^[0-4]$ ]]; then
 fi
 
 # ----- TOGGLES ---------------------------------------------------------------
-export SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT:-0}"
+export SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT:-1}"   # write validation predictions; the evaluation needs them
 export WANDB_INIT_MAX_RETRIES="${WANDB_INIT_MAX_RETRIES:-5}"
 export WANDB_INIT_TIMEOUT_SEC="${WANDB_INIT_TIMEOUT_SEC:-180}"
 export WANDB_ALLOW_OFFLINE="${WANDB_ALLOW_OFFLINE:-1}"
@@ -179,12 +184,25 @@ echo " Started    : $(date)"
 echo "================================================================"
 
 # ----- Train ----------------------------------------------------------------
+requeue_self() {
+    echo "[fold ${FOLD}] wall-time limit approaching at $(date); resubmitting to resume from checkpoint_latest.pth"
+    cd "${PROJECT_ROOT}"
+    sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}" \
+        slurm/spine_train_fold.sh
+    # let the trainer reach its next checkpoint write (every 50 epochs) rather than killing it now
+    wait "${TRAIN_PID}" || true
+    exit 0
+}
+trap requeue_self USR1
+
 singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
     nnUNetv2_train ${DATASET_ID} ${CONFIG} ${FOLD} \
         -tr ${TRAINER} \
         -p  ${PLANS} \
         --npz \
-        ${RESUME_FLAG}
+        ${RESUME_FLAG} &
+TRAIN_PID=$!
+wait "${TRAIN_PID}"
 
 # If we got here, training completed (otherwise nnUNetv2_train would have
 # exited non-zero and set -e would have killed us). Final checkpoint should
