@@ -265,8 +265,8 @@ def test_lut_published_remap_correct(convert_mod):
         assert int(lut[src]) == dst, (
             f"VerSe {src} -> {int(lut[src])}, expected {dst}")
     # Non-training VerSe ids (thoracic/cervical/coccyx/T13/S1/femur/rib/
-    # soft-tissue/lumbar-rib) MUST drop to background, not pass through.
-    for src in (5, 15, 27, 28, 29, 32, 33, 40, 60, 74, 75):
+    # lumbar-rib/hardware) MUST drop to background, not pass through.
+    for src in (5, 15, 27, 28, 29, 32, 33, 40, 59, 60, 61, 62, 68):
         assert int(lut[src]) == 0, (
             f"non-training VerSe {src} must -> 0, got {int(lut[src])}")
 

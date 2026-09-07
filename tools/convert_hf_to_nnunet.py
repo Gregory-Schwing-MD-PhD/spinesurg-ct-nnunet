@@ -41,11 +41,15 @@ named constants):
                sacrum = 26,  coccyx = 27,  T13 = 28,  S1 = 29
   pelvis/limb: left_hip = 30, right_hip = 31, femur_left = 32,
                femur_right = 33
-  ribs = 34-57,  soft-tissue = 58-73,  lumbar ribs = 74/75
+  ribs = 34-46 left, 47-59 right (thirteen per side; 46/59 are the
+               thirteenth rib, empty in this cohort),  lumbar ribs = 60/61,
+               hardware = 62-68
   ignore = 255
+(v10 scheme, September 2026. Earlier releases put ribs at 34-57,
+soft tissue at 58-73 and lumbar ribs at 74/75; those ids are gone.)
 Only the lumbar bodies (20-25), sacrum (26), hips (30/31) and ignore
 (255) are training classes; EVERY OTHER nonzero VerSe id (thoracic /
-cervical vertebrae, coccyx, T13, S1, femurs, ribs, soft-tissue) is
+cervical vertebrae, coccyx, T13, S1, femurs, ribs, hardware) is
 dropped to background at convert time. See LABEL_REMAP_MERGED_FROM_VERSE
 / LABEL_REMAP_UNMERGED_FROM_VERSE.
 
@@ -262,8 +266,12 @@ LABEL_NAMES_UNMERGED = {
 #                sacrum = 26,  coccyx = 27,  T13 = 28,  S1 = 29
 #   pelvis/limb: left_hip = 30, right_hip = 31, femur_left = 32,
 #                femur_right = 33
-#   ribs = 34-57,  soft-tissue = 58-73,  lumbar ribs = 74/75
+#   ribs = 34-46 left, 47-59 right (13 per side; 46/59 = rib 13),
+#   lumbar ribs = 60/61,  hardware = 62-68
 #   ignore = 255
+VERSE_RIB_L = tuple(range(34, 47))      # rib_left_1 .. rib_left_13
+VERSE_RIB_R = tuple(range(47, 60))      # rib_right_1 .. rib_right_13
+VERSE_LUMBAR_RIB_L, VERSE_LUMBAR_RIB_R = 60, 61
 VERSE_L1        = 20
 VERSE_L2        = 21
 VERSE_L3        = 22
@@ -310,8 +318,8 @@ _CF_RIB_L, _CF_RIB_R = 3, 4
 _CF_SACRUM, _CF_HIP_L, _CF_HIP_R, _CF_FEMUR, _CF_IGNORE = 5, 6, 7, 8, 9
 
 # Every vertebra 1..25 plus T13 (28) collapses to one class. Sacrum (26)
-# and the carved S1 (29) are one sacrum. Coccyx (27), soft tissue
-# (58-73) and hardware (76-79) drop to background.
+# and the carved S1 (29) are one sacrum. Coccyx (27) and hardware
+# (62-68) drop to background.
 LABEL_REMAP_COUNTFREE_FROM_VERSE: Dict[int, int] = {
     **{i: _CF_VERTEBRA for i in range(1, 26)},      # C1..L6
     28: _CF_VERTEBRA,                               # T13
@@ -320,9 +328,10 @@ LABEL_REMAP_COUNTFREE_FROM_VERSE: Dict[int, int] = {
     VERSE_LEFT_HIP: _CF_HIP_L,
     VERSE_RIGHT_HIP: _CF_HIP_R,
     32: _CF_FEMUR, 33: _CF_FEMUR,
-    **{i: _CF_RIB_L for i in range(34, 46)},        # ribs 1-12 left
-    **{i: _CF_RIB_R for i in range(46, 58)},        # ribs 1-12 right
-    74: _CF_RIB_L, 75: _CF_RIB_R,                   # lumbar ribs: still ribs
+    **{i: _CF_RIB_L for i in VERSE_RIB_L},          # ribs 1-13 left
+    **{i: _CF_RIB_R for i in VERSE_RIB_R},          # ribs 1-13 right
+    VERSE_LUMBAR_RIB_L: _CF_RIB_L,                  # lumbar ribs: still ribs
+    VERSE_LUMBAR_RIB_R: _CF_RIB_R,
     VERSE_IGNORE: _CF_IGNORE,
 }
 
@@ -515,8 +524,8 @@ LABEL_NAMES_NO_IGNORE = {
 
 # The maximum label value the VerSe-native source NIfTIs are expected to
 # contain (ignore = 255). The LUT spans the full 0..255 range so every
-# VerSe id — including ribs (34-57), soft-tissue (58-73) and lumbar ribs
-# (74/75) that are NOT training classes — has an explicit destination.
+# VerSe id — including ribs (34-59), lumbar ribs (60/61) and hardware
+# (62-68) that are NOT training classes — has an explicit destination.
 _MAX_SOURCE_LABEL = 255
 
 
@@ -587,19 +596,19 @@ LABEL_REMAP_RIB_REGIONS_FROM_VERSE: Dict[int, int] = {
     VERSE_LEFT_HIP: _RR_HIP_L,
     VERSE_RIGHT_HIP: _RR_HIP_R,
     32: _RR_FEMUR, 33: _RR_FEMUR,
-    **{i: _RR_RIB_L for i in range(34, 46)},
-    **{i: _RR_RIB_R for i in range(46, 58)},
-    74: _RR_RIB_L, 75: _RR_RIB_R,
+    **{i: _RR_RIB_L for i in VERSE_RIB_L},
+    **{i: _RR_RIB_R for i in VERSE_RIB_R},
+    VERSE_LUMBAR_RIB_L: _RR_RIB_L, VERSE_LUMBAR_RIB_R: _RR_RIB_R,
     VERSE_IGNORE: _RR_IGNORE,
 }
 
-_RIB_IDS = tuple(range(34, 58)) + (74, 75)
+_RIB_IDS = VERSE_RIB_L + VERSE_RIB_R + (VERSE_LUMBAR_RIB_L, VERSE_LUMBAR_RIB_R)
 
 
 def _rib_bearing_vertebrae(arr, zooms, reach_mm=4.0):
     """Which source vertebra ids have a rib articulating with them.
 
-    A LUMBAR RIB COUNTS. Ids 74 and 75 are ribs borne on a lumbar body,
+    A LUMBAR RIB COUNTS. Ids 60 and 61 are ribs borne on a lumbar body,
     and treating them as anything else would be deciding the very
     question this scheme exists to leave open: a rib on the first
     lumbar-type vertebra makes that vertebra rib-bearing, which shortens
@@ -690,16 +699,20 @@ def _os_add(name, src_ids):
 _os_add("T10", [17])
 _os_add("T11", [18])
 _os_add("T12", [19])
+_os_add("T13", [28])
 for _n, _v in (("L1", 20), ("L2", 21), ("L3", 22), ("L4", 23), ("L5", 24), ("L6", 25)):
     _os_add(_n, [_v])
 _os_add("sacrum", [26, 29])
-# ribs 1-11 pooled; the TWELFTH kept apart, because it is the confusable one
-_os_add("rib_left", list(range(34, 45)))
-_os_add("rib_right", list(range(46, 57)))
-_os_add("rib12_left", [45])
-_os_add("rib12_right", [57])
-_os_add("lumbar_rib_left", [74])
-_os_add("lumbar_rib_right", [75])
+# ribs 1-11 pooled; the TWELFTH kept apart, because it is the confusable one;
+# the THIRTEENTH (a rib on T13, not a lumbar rib) kept apart for the same reason
+_os_add("rib_left", list(VERSE_RIB_L[:11]))
+_os_add("rib_right", list(VERSE_RIB_R[:11]))
+_os_add("rib12_left", [VERSE_RIB_L[11]])
+_os_add("rib12_right", [VERSE_RIB_R[11]])
+_os_add("rib13_left", [VERSE_RIB_L[12]])
+_os_add("rib13_right", [VERSE_RIB_R[12]])
+_os_add("lumbar_rib_left", [VERSE_LUMBAR_RIB_L])
+_os_add("lumbar_rib_right", [VERSE_LUMBAR_RIB_R])
 _os_add("left_hip", [30])
 _os_add("right_hip", [31])
 _os_add("femur", [32, 33])

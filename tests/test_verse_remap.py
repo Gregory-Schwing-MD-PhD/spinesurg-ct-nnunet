@@ -57,9 +57,10 @@ _SAMPLE_SRC = [0, 20, 21, 22, 23, 24, 25, 26, 30, 31, 255]
 #   32  = femur_left
 #   33  = femur_right
 #   40  = a rib
-#   60  = soft-tissue
-#   74  = lumbar rib
-_NON_TRAINING_SRC = [5, 15, 27, 28, 29, 32, 33, 40, 60, 74, 75]
+#   59  = rib_right_13
+#   60  = lumbar rib
+#   62, 68 = hardware
+_NON_TRAINING_SRC = [5, 15, 27, 28, 29, 32, 33, 40, 59, 60, 61, 62, 68]
 
 
 def _merged_lut():

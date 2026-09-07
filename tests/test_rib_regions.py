@@ -43,11 +43,11 @@ def test_a_vertebra_without_one_is_not():
 
 
 def test_a_lumbar_rib_makes_its_vertebra_rib_bearing():
-    """THE CASE THE WHOLE SCHEME EXISTS FOR. Ids 74/75 are ribs borne on a lumbar body.
+    """THE CASE THE WHOLE SCHEME EXISTS FOR. Ids 60/61 are ribs borne on a lumbar body.
     Treating them as anything but ribs would decide the transitional question inside the
     label, which is exactly what must not happen: a rib on the first lumbar-type vertebra
     shortens the rib-free interval to four, and that IS the phenotype."""
-    arr = _spine(first=20, with_rib_on=(20,), rib_id=74)
+    arr = _spine(first=20, with_rib_on=(20,), rib_id=60)
     assert cvt._rib_bearing_vertebrae(arr, SP) == {20}
 
 
@@ -100,9 +100,12 @@ def test_oneshot_keeps_the_confusable_pair_apart():
     reasons, and the model could then be neither right nor wrong about it."""
     lut = cvt._build_verse_remap_lut(cvt.LABEL_REMAP_ONESHOT_FROM_VERSE)
     n = cvt.LABEL_NAMES_ONESHOT
-    assert lut[45] == n["rib12_left"] and lut[57] == n["rib12_right"]
-    assert lut[74] == n["lumbar_rib_left"] and lut[75] == n["lumbar_rib_right"]
-    assert lut[45] != lut[74] and lut[57] != lut[75]
+    assert lut[45] == n["rib12_left"] and lut[58] == n["rib12_right"]
+    assert lut[60] == n["lumbar_rib_left"] and lut[61] == n["lumbar_rib_right"]
+    assert lut[45] != lut[60] and lut[58] != lut[61]
+    # and a thirteenth rib (on a T13) is neither a twelfth rib nor a lumbar rib
+    assert lut[46] == n["rib13_left"] and lut[59] == n["rib13_right"]
+    assert lut[46] not in (lut[45], lut[60]) and lut[59] not in (lut[58], lut[61])
 
 
 def test_oneshot_names_the_vertebra_that_names_the_rib():
@@ -122,7 +125,7 @@ def test_oneshot_pools_ribs_one_to_eleven():
     n = cvt.LABEL_NAMES_ONESHOT
     for src in range(34, 45):
         assert lut[src] == n["rib_left"]
-    for src in range(46, 57):
+    for src in range(47, 58):
         assert lut[src] == n["rib_right"]
 
 
@@ -139,5 +142,5 @@ def test_oneshot_drops_what_is_outside_the_question():
     classes here and must fall to background rather than leak through as stray ids that
     nnU-Net's integrity check would reject."""
     lut = cvt._build_verse_remap_lut(cvt.LABEL_REMAP_ONESHOT_FROM_VERSE)
-    for src in (1, 7, 16, 27, 60, 73, 76, 79):
+    for src in (1, 7, 16, 27, 62, 64, 66, 68):
         assert lut[src] == 0, src
