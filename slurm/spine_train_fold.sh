@@ -39,6 +39,14 @@
 
 set -euo pipefail
 
+# The singularity that works on the GPU nodes is the 3.8.6 in the nextflow conda env (the
+# one spine_prep.sh uses). The user-local singularity-ce 4.0.2 that is first in PATH fails
+# to extract the image there ("fork/exec /usr/bin/singularity: no such file"), which is
+# what killed five folds on 2026-09-07 right after staging.
+export PATH="${HOME}/mambaforge/envs/nextflow/bin:${PATH}"
+unset LD_LIBRARY_PATH PYTHONPATH
+which singularity
+
 FOLD="${FOLD:-0}"
 if ! [[ "${FOLD}" =~ ^[0-4]$ ]]; then
     echo "ERROR: FOLD must be 0..4, got '${FOLD}'" >&2

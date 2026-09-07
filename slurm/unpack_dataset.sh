@@ -22,6 +22,12 @@
 # =============================================================================
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
+# The singularity that works on the compute nodes is the 3.8.6 in the nextflow conda env
+# (what spine_prep.sh uses). The user-local singularity-ce 4.0.2 first in PATH fails to
+# extract the image there ("fork/exec /usr/bin/singularity: no such file").
+export PATH="${HOME}/mambaforge/envs/nextflow/bin:${PATH}"
+unset LD_LIBRARY_PATH PYTHONPATH
+which singularity
 DATASET_ID="${DATASET_ID:-810}"
 DATASET_NAME="${DATASET_NAME:-SpineSurgLSTVOneShot}"
 DS="Dataset$(printf '%03d' "$DATASET_ID")_${DATASET_NAME}"
