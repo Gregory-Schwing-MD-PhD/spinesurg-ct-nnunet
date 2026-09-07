@@ -116,28 +116,41 @@ fi
 WANDB_API_KEY=""
 [[ -f "${HOME}/.wandb/token" ]] && WANDB_API_KEY="$(cat ${HOME}/.wandb/token)"
 
-# ----- Local scratch --------------------------------------------------------
-if [[ -n "${SLURM_TMPDIR:-}" && -d "${SLURM_TMPDIR}" ]]; then
-    LOCAL_SCRATCH="${SLURM_TMPDIR}"
-elif [[ -d "/scratch/${USER}" ]]; then
-    LOCAL_SCRATCH="/scratch/${USER}/job_${SLURM_JOB_ID}_f${FOLD}"; mkdir -p "${LOCAL_SCRATCH}"
+# ----- Where the data is read from --------------------------------------------
+# STAGE_LOCAL=1 copies the preprocessed and raw trees to node-local scratch first (the old
+# behaviour). Default is 0: read straight from NFS. Dataset810 is 222 GB packed and about a
+# terabyte once nnU-Net unpacks it; two folds on one GPU node filled /tmp and both died at
+# container start (2026-09-07). With the .npy unpacked once by slurm/unpack_dataset.sh, the
+# trainer memory-maps patches from NFS and copies nothing.
+STAGE_LOCAL="${STAGE_LOCAL:-0}"
+if [[ "${STAGE_LOCAL}" == "1" ]]; then
+    if [[ -n "${SLURM_TMPDIR:-}" && -d "${SLURM_TMPDIR}" ]]; then
+        LOCAL_SCRATCH="${SLURM_TMPDIR}"
+    elif [[ -d "/scratch/${USER}" ]]; then
+        LOCAL_SCRATCH="/scratch/${USER}/job_${SLURM_JOB_ID}_f${FOLD}"; mkdir -p "${LOCAL_SCRATCH}"
+    else
+        LOCAL_SCRATCH="/tmp/${USER}_${SLURM_JOB_ID}_f${FOLD}"; mkdir -p "${LOCAL_SCRATCH}"
+    fi
+    trap 'rm -rf "${LOCAL_SCRATCH}" "${SINGULARITY_TMPDIR:-/nonexistent}"' EXIT
+    LOCAL_NNUNET="${LOCAL_SCRATCH}/nnunet"
+    LOCAL_PREP="${LOCAL_NNUNET}/preprocessed"
+    LOCAL_RAW="${LOCAL_NNUNET}/raw"
+    mkdir -p "${LOCAL_PREP}" "${LOCAL_RAW}"
+    LOCAL_PREP_DS="${LOCAL_PREP}/${DS_DIR_NAME}"
+    LOCAL_RAW_DS="${LOCAL_RAW}/${DS_DIR_NAME}"
+    echo "[fold ${FOLD}] staging preprocessed -> ${LOCAL_PREP_DS}"
+    mkdir -p "${LOCAL_PREP_DS}"
+    rsync -aW --no-compress "${NFS_PREP_DS}/" "${LOCAL_PREP_DS}/"
+    echo "[fold ${FOLD}] staging raw -> ${LOCAL_RAW_DS} (needed for LSTV scanner)"
+    mkdir -p "${LOCAL_RAW_DS}"
+    rsync -aW --no-compress "${NFS_RAW_DS}/" "${LOCAL_RAW_DS}/"
 else
-    LOCAL_SCRATCH="/tmp/${USER}_${SLURM_JOB_ID}_f${FOLD}"; mkdir -p "${LOCAL_SCRATCH}"
+    LOCAL_NNUNET="${NNUNET_NFS}"
+    echo "[fold ${FOLD}] reading preprocessed and raw straight from ${NNUNET_NFS} (STAGE_LOCAL=0)"
+    if ! ls "${NFS_PREP_DS}"/nnUNetPlans_3d_fullres/*.npy >/dev/null 2>&1; then
+        echo "WARN: no .npy in ${NFS_PREP_DS}; run slurm/unpack_dataset.sh first so folds do not race to unpack" >&2
+    fi
 fi
-LOCAL_NNUNET="${LOCAL_SCRATCH}/nnunet"
-LOCAL_PREP="${LOCAL_NNUNET}/preprocessed"
-LOCAL_RAW="${LOCAL_NNUNET}/raw"
-mkdir -p "${LOCAL_PREP}" "${LOCAL_RAW}"
-LOCAL_PREP_DS="${LOCAL_PREP}/${DS_DIR_NAME}"
-LOCAL_RAW_DS="${LOCAL_RAW}/${DS_DIR_NAME}"
-
-echo "[fold ${FOLD}] staging preprocessed -> ${LOCAL_PREP_DS}"
-mkdir -p "${LOCAL_PREP_DS}"
-rsync -aW --no-compress "${NFS_PREP_DS}/" "${LOCAL_PREP_DS}/"
-
-echo "[fold ${FOLD}] staging raw -> ${LOCAL_RAW_DS} (needed for LSTV scanner)"
-mkdir -p "${LOCAL_RAW_DS}"
-rsync -aW --no-compress "${NFS_RAW_DS}/" "${LOCAL_RAW_DS}/"
 
 # ----- Singularity env ------------------------------------------------------
 export SINGULARITYENV_TMPDIR="/workspace/tmp"
