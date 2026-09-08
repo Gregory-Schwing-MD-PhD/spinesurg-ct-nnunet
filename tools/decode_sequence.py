@@ -74,43 +74,38 @@ def _height_vox(m: np.ndarray, axis: int) -> tuple[int, int]:
     return int(idx.min()), int(idx.max())
 
 
-def split_tall_component(m: np.ndarray, axis: int, zoom_mm: float, body_mm: float) -> list[np.ndarray]:
-    """Split one connected component that holds more than one body. `body_mm` is the typical
-    single-vertebra height IN THIS CASE (median over the case's own components), so a tilted
-    or unusually tall vertebra is not split by a fixed millimetre rule. A component taller
-    than TALL_RATIO bodies is cut into round(height / body) pieces at the deepest waists of
-    its slice-area profile (the discs), each at least 0.6 body from the next cut."""
+def split_tall_component(m: np.ndarray, axis: int, zooms, body_mm: float) -> list[np.ndarray]:
+    """Split one connected component that holds more than one body. Two neighbouring
+    vertebrae with the same name touch only at the facet joints, a few millimetres thick,
+    so eroding the component by 2-4 mm severs them while each body survives; every voxel is
+    then given to the nearest surviving seed. `body_mm` is the typical single-vertebra
+    height IN THIS CASE (median over its own components). Guards: only components taller
+    than TALL_RATIO bodies are tried, and the pieces must be STACKED (z-centroids at least
+    half a body apart); a body and its posterior elements overlap in z and are kept whole."""
     lo, hi = _height_vox(m, axis)
-    height_mm = (hi - lo + 1) * zoom_mm
+    height_mm = (hi - lo + 1) * zooms[axis]
     if body_mm <= 0 or height_mm <= TALL_RATIO * body_mm:
         return [m]
-    n_bodies = max(2, int(round(height_mm / body_mm)))
-    profile = m.sum(axis=tuple(i for i in range(3) if i != axis)).astype(float)[lo:hi + 1]
-    k = max(1, int(round(3.0 / zoom_mm)))                     # ~3 mm smoothing
-    sm = np.convolve(profile, np.ones(2 * k + 1) / (2 * k + 1), mode="same")
-    min_gap = max(2, int(round(0.6 * body_mm / zoom_mm)))
-    cands = [i for i in range(min_gap, len(sm) - min_gap)
-             if sm[i] <= sm[i - 1] and sm[i] <= sm[i + 1]
-             and sm[i] < 0.7 * min(sm[i - min_gap:i].max(), sm[i + 1:i + 1 + min_gap].max())]
-    cuts: list[int] = []
-    for i in sorted(cands, key=lambda j: sm[j]):              # deepest waist first
-        if all(abs(i - c) >= min_gap for c in cuts):
-            cuts.append(i)
-        if len(cuts) == n_bodies - 1:
-            break
-    if not cuts:
-        return [m]
-    pieces, start = [], lo
-    for c in sorted(cuts) + [hi - lo + 1]:
-        end = lo + c
-        sl = [slice(None)] * 3
-        sl[axis] = slice(start, end)
-        piece = np.zeros_like(m)
-        piece[tuple(sl)] = m[tuple(sl)]
-        if piece.sum() >= MIN_VOX // 3:
-            pieces.append(piece)
-        start = end
-    return pieces or [m]
+    vox = float(min(zooms))
+    for r_mm in (2.0, 3.0, 4.0, 5.0):
+        it = max(1, int(round(r_mm / vox)))
+        er = ndimage.binary_erosion(m, structure=np.ones((3, 3, 3)), iterations=it)
+        cc, n = ndimage.label(er, structure=np.ones((3, 3, 3)))
+        if n < 2:
+            continue
+        sizes = ndimage.sum(er, cc, range(1, n + 1))
+        seeds = [k + 1 for k, sz in enumerate(sizes) if sz >= MIN_VOX // 3]
+        if len(seeds) < 2:
+            continue
+        zc = sorted(float(np.argwhere(cc == k)[:, axis].mean()) * zooms[axis] for k in seeds)
+        if min(b - a for a, b in zip(zc, zc[1:])) < 0.5 * body_mm:
+            continue                                   # pieces overlap in z: not two bodies
+        seed_map = np.where(np.isin(cc, seeds), cc, 0)
+        _, idx = ndimage.distance_transform_edt(seed_map == 0, return_indices=True)
+        owner = seed_map[tuple(idx)] * m
+        pieces = [owner == k for k in seeds]
+        return [p for p in pieces if p.sum() >= MIN_VOX // 3] or [m]
+    return [m]
 
 
 def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], gt_path: Path | None):
@@ -150,9 +145,9 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
         if m_all.sum() < MIN_VOX:
             continue
         cc, n = ndimage.label(m_all, structure=np.ones((3, 3, 3)))
-        raw[vid] = [cc == lab for lab in range(1, n + 1) if (cc == lab).sum() >= MIN_VOX]
+        raw[vid] = [cc == lab for lab in range(1, n + 1) if (cc == lab).sum() >= MIN_VOX // 3]
     heights = [(_height_vox(m, axis)[1] - _height_vox(m, axis)[0] + 1) * zooms[axis]
-               for ms in raw.values() for m in ms]
+               for ms in raw.values() for m in ms if m.sum() >= MIN_VOX]   # whole bodies only
     body_mm = float(np.median(heights)) if len(heights) >= 3 else 35.0
 
     comps = []                                        # (name_id, mask, z_mm)
@@ -163,19 +158,32 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
             # (an L6 called L5 next to the true L5, or a competitor with no L6 class). The
             # sequence would then be one body short, so a component much taller than this
             # case's typical body is split at the waists of its craniocaudal area profile.
-            for piece in split_tall_component(m, axis, zooms[axis], body_mm):
+            for piece in split_tall_component(m, axis, zooms, body_mm):
                 idx = np.argwhere(piece)
                 parts.append([piece, float(idx[:, axis].mean() * zooms[axis] * sign)])
         parts.sort(key=lambda p: -p[1])
-        merged = []
-        for m, z in parts:                             # same name within 12 mm = one vertebra
-            if merged and abs(merged[-1][1] - z) < 12.0:
-                merged[-1][0] |= m
-                idx = np.argwhere(merged[-1][0])
-                merged[-1][1] = float(idx[:, axis].mean() * zooms[axis] * sign)
+        # fragments of ONE vertebra (a body cut off from its posterior elements by hardware,
+        # a detached spinous process) share a name and overlap in height; two bodies with
+        # the same name are stacked and do not. Merge same-name parts whose z-extents overlap
+        # by at least a third of the smaller one, or whose centroids are within 12 mm.
+        merged = []                                    # [mask, z_mm, (lo, hi) in mm]
+        for m, z in parts:
+            lo, hi = _height_vox(m, axis)
+            ext = (lo * zooms[axis], (hi + 1) * zooms[axis])
+            hit = None
+            for g in merged:
+                ov = min(ext[1], g[2][1]) - max(ext[0], g[2][0])
+                small = min(ext[1] - ext[0], g[2][1] - g[2][0])
+                if abs(g[1] - z) < 12.0 or (small > 0 and ov >= 0.33 * small):
+                    hit = g; break
+            if hit is not None:
+                hit[0] |= m
+                idx = np.argwhere(hit[0])
+                hit[1] = float(idx[:, axis].mean() * zooms[axis] * sign)
+                hit[2] = (min(ext[0], hit[2][0]), max(ext[1], hit[2][1]))
             else:
-                merged.append([m, z])
-        comps += [(vid, m, z) for m, z in merged]
+                merged.append([m, z, ext])
+        comps += [(vid, m, z) for m, z, _ in merged]
     inst = []
     for vid, m, z_mm in comps:
         nv = int(m.sum())
