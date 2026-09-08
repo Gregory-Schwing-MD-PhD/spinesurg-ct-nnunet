@@ -1,0 +1,23 @@
+{
+  "_comment": "NVIDIA VISTA3D label_dict ids (vista3d/data/jsons/label_dict.json) -> Dataset810 one-shot names. Keys are the native ids as strings. VISTA3D has no L6, T13, thirteenth rib or lumbar-rib class. sacrum (97) and vertebrae S1 (127) union onto our sacrum; femora pool.",
+  "40": "T10",
+  "39": "T11",
+  "38": "T12",
+  "37": "L1",
+  "36": "L2",
+  "35": "L3",
+  "34": "L4",
+  "33": "L5",
+  "97": "sacrum",
+  "127": "sacrum",
+  "63": "rib_left", "64": "rib_left", "65": "rib_left", "66": "rib_left", "67": "rib_left", "68": "rib_left",
+  "69": "rib_left", "70": "rib_left", "71": "rib_left", "72": "rib_left", "73": "rib_left",
+  "74": "rib12_left",
+  "75": "rib_right", "76": "rib_right", "77": "rib_right", "78": "rib_right", "79": "rib_right", "80": "rib_right",
+  "81": "rib_right", "82": "rib_right", "83": "rib_right", "84": "rib_right", "85": "rib_right",
+  "86": "rib12_right",
+  "95": "left_hip",
+  "96": "right_hip",
+  "93": "femur",
+  "94": "femur"
+}

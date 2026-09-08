@@ -66,18 +66,60 @@ def load_probs(npz_path: Path):
     return z[key]                       # (C, ...) in nnU-Net's internal (transposed) order
 
 
-def decode_case(pred_path: Path, npz_path: Path, names: dict[str, int], gt_path: Path | None):
+MAX_BODY_MM = 55.0     # no single thoracolumbar vertebra spans more than this craniocaudally
+
+
+def split_tall_component(m: np.ndarray, axis: int, zoom_mm: float) -> list[np.ndarray]:
+    """Split one connected component that is taller than a vertebra at the minima of its
+    slice-area profile along the superior axis (the discs between fused-by-name bodies).
+    Returns [m] unchanged when it is not tall or when no waist is found."""
+    idx = np.nonzero(m.any(axis=tuple(i for i in range(3) if i != axis)))[0]
+    lo, hi = int(idx.min()), int(idx.max())
+    if (hi - lo + 1) * zoom_mm <= MAX_BODY_MM:
+        return [m]
+    profile = m.sum(axis=tuple(i for i in range(3) if i != axis)).astype(float)[lo:hi + 1]
+    k = max(1, int(round(3.0 / zoom_mm)))                     # ~3 mm smoothing
+    sm = np.convolve(profile, np.ones(2 * k + 1) / (2 * k + 1), mode="same")
+    min_gap = int(round(20.0 / zoom_mm))                      # bodies are at least 20 mm apart
+    cuts = []
+    for i in range(min_gap, len(sm) - min_gap):
+        left, right = sm[i - min_gap:i].max(), sm[i + 1:i + 1 + min_gap].max()
+        if sm[i] < 0.6 * min(left, right) and sm[i] <= sm[i - 1] and sm[i] <= sm[i + 1]:
+            if not cuts or i - cuts[-1] >= min_gap:
+                cuts.append(i)
+    if not cuts:
+        return [m]
+    pieces, start = [], lo
+    for c in cuts + [hi - lo + 1]:
+        end = lo + c
+        sl = [slice(None)] * 3
+        sl[axis] = slice(start, end)
+        piece = np.zeros_like(m)
+        piece[tuple(sl)] = m[tuple(sl)]
+        if piece.sum() >= MIN_VOX // 3:
+            pieces.append(piece)
+        start = end
+    return pieces or [m]
+
+
+def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], gt_path: Path | None):
     img = nib.load(str(pred_path))
     seg = np.asanyarray(img.dataobj).astype(np.int16)
     zooms = np.asarray(img.header.get_zooms()[:3], float)
     axis, sign = sup_axis(img)
-    probs = load_probs(npz_path)
-    # nnU-Net stores probabilities in its own axis order (transposed); align to the NIfTI array
-    if probs.shape[1:] != seg.shape:
-        if probs.shape[1:][::-1] == seg.shape:
-            probs = np.transpose(probs, (0, 3, 2, 1))
-        else:
-            raise ValueError(f"probability shape {probs.shape} does not match {seg.shape}")
+    n_classes = max(names.values()) + 1
+    if npz_path is None:
+        # one-hot: a hard-label system (a competitor, or ground truth). The mean softmax over
+        # an instance of name class v is then exactly e_v, so no (C, X, Y, Z) array is built.
+        probs = None
+    else:
+        probs = load_probs(npz_path)
+        # nnU-Net stores probabilities in its own axis order (transposed); align to the NIfTI array
+        if probs.shape[1:] != seg.shape:
+            if probs.shape[1:][::-1] == seg.shape:
+                probs = np.transpose(probs, (0, 3, 2, 1))
+            else:
+                raise ValueError(f"probability shape {probs.shape} does not match {seg.shape}")
     vert_ids = [names[n] for n in THORACIC + LUMBAR if n in names]
     thor_ids = [names[n] for n in THORACIC if n in names]
     lum_ids = [names[n] for n in LUMBAR if n in names]
@@ -101,8 +143,13 @@ def decode_case(pred_path: Path, npz_path: Path, names: dict[str, int], gt_path:
             m = cc == lab
             if m.sum() < MIN_VOX // 3:
                 continue
-            idx = np.argwhere(m)
-            parts.append([m, float(idx[:, axis].mean() * zooms[axis] * sign)])
+            # TWO NEIGHBOURS GIVEN THE SAME NAME TOUCH AT THE FACETS AND FORM ONE COMPONENT
+            # (an L6 called L5 next to the true L5, or a competitor with no L6 class). The
+            # sequence would then be one body short, so a component taller than any single
+            # vertebra is split at the waist of its craniocaudal area profile.
+            for piece in split_tall_component(m, axis, zooms[axis]):
+                idx = np.argwhere(piece)
+                parts.append([piece, float(idx[:, axis].mean() * zooms[axis] * sign)])
         parts.sort(key=lambda p: -p[1])
         merged = []
         for m, z in parts:                             # same name within 12 mm = one vertebra
@@ -118,7 +165,10 @@ def decode_case(pred_path: Path, npz_path: Path, names: dict[str, int], gt_path:
         nv = int(m.sum())
         if nv < MIN_VOX:
             continue
-        mean_p = probs[:, m].astype(np.float32).mean(1)          # (C,)
+        if probs is None:                                          # one-hot: e_vid
+            mean_p = np.zeros(n_classes, dtype=np.float32); mean_p[vid] = 1.0
+        else:
+            mean_p = probs[:, m].astype(np.float32).mean(1)      # (C,)
         p_thor = float(mean_p[thor_ids].sum()); p_lum = float(mean_p[lum_ids].sum())
         p_sac = float(mean_p[sac_id]) if sac_id is not None else 0.0
         tot = max(p_thor + p_lum + p_sac, 1e-6)
@@ -177,6 +227,10 @@ def main() -> int:
     ap.add_argument("--labels_dir", type=Path, default=None)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--onehot", action="store_true",
+                    help="no softmax on disk (a competitor's hard labels): build one-hot "
+                         "probabilities from the label map, so the decoder reads its names as "
+                         "certainties and the posterior collapses to that system's own count")
     a = ap.parse_args()
     names = names_from(a.dataset_json)
     preds = sorted(a.predictions_dir.glob("*.nii.gz"))
@@ -185,11 +239,11 @@ def main() -> int:
     rows = []
     for p in preds:
         npz = p.with_suffix("").with_suffix(".npz")
-        if not npz.exists():
+        if not npz.exists() and not a.onehot:
             print("no npz for", p.name); continue
         gt = (a.labels_dir / p.name) if a.labels_dir else None
         try:
-            rows.append(decode_case(p, npz, names, gt))
+            rows.append(decode_case(p, None if a.onehot else npz, names, gt))
         except Exception as e:  # noqa: BLE001
             rows.append({"case": p.name.replace(".nii.gz", ""), "error": repr(e)})
         print(rows[-1].get("case"), rows[-1].get("rib_free_map", rows[-1].get("error")), rows[-1].get("gt_rib_free", ""), flush=True)

@@ -1,0 +1,14 @@
+{
+  "_comment": "SPINEPS / VERIDAH CT vertebra INSTANCE mask (VerSe ids, TPTBox Vertebra_Instance) -> Dataset810 one-shot names. Keys are native ids as strings: 17-19 = T10-T12, 28 = T13, 20-25 = L1-L6, 26 = sacrum. VERIDAH is the one competitor that can name an L6 and a T13, so those map to their own classes rather than to a miss. SPINEPS segments no ribs, hips or femora; the Möller binary rib mask from the same container has no per-level numbering, so ribs are scored from his rib-to-vertebra assignment separately (benchmark/spineps_ribs_to_oneshot.py, to write) and are absent from this map.",
+  "17": "T10",
+  "18": "T11",
+  "19": "T12",
+  "28": "T13",
+  "20": "L1",
+  "21": "L2",
+  "22": "L3",
+  "23": "L4",
+  "24": "L5",
+  "25": "L6",
+  "26": "sacrum"
+}
