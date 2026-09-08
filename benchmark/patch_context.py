@@ -164,7 +164,9 @@ def render(lab_path: Path, shapes_mm: dict, out_png: Path) -> None:
                     cy = to_mm_y(sac_top) - 30.0 + hmm / 2         # lower edge 3 cm below the sacral top
                 ax.add_patch(Rectangle((cx - wmm / 2, cy - hmm / 2), wmm, hmm, fill=False, ec=col, ls=ls, lw=1.3, label=name.replace("p", "").replace("x", " × ")))
             ax.set_xlabel("mm"); ax.set_ylabel("mm")
-            ax.set_title(("sagittal" if w_ax != others[0] else "coronal") + ", " + title, loc="left", fontsize=8)
+            code = nib.aff2axcodes(img.affine)[proj_axis]          # the axis projected away
+            view = "sagittal" if code in ("L", "R") else "coronal"  # collapse L/R -> sagittal
+            ax.set_title(view + ", " + title, loc="left", fontsize=8)
             ax.grid(False)
     axes[0][0].legend(frameon=False, fontsize=7, loc="lower left", title="patch, voxels", title_fontsize=7)
     fig.suptitle("what one training patch of each shape sees (labels projected; case " + lab_path.name.split("_")[0] + ")", fontsize=9)
