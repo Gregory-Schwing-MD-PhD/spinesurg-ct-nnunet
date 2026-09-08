@@ -60,6 +60,17 @@ def analyse(lab_path: Path, shapes_mm: dict) -> dict:
     centre[axis] = (lo + hi) / 2
     out = {"case": lab_path.name.replace("_label.nii.gz", ""), "spine_extent_mm": round((hi - lo + 1) * zooms[axis], 1)}
     levels_present = [v for v in VERT if (lab == v).any()]
+    # second centring: the lumbosacral junction (superior edge of the sacrum), which is where
+    # the sampler puts the patch for the rare classes; the window extends up the column from it
+    sac = np.argwhere(np.isin(lab, SACRUM))
+    centres = {"mid": centre}
+    if len(sac):
+        _, sgn = sup_axis(img)
+        sac_top = sac[:, axis].max() if sgn > 0 else sac[:, axis].min()
+        c2 = centre.copy()
+        for name0, mm0 in shapes_mm.items():
+            pass
+        centres["ls"] = (c2, sac_top)
     for name, mm in shapes_mm.items():
         half = np.array([mm[0] / zooms[axis] / 2 if i == axis else mm[1 + others.index(i)] / zooms[i] / 2 for i in range(3)])
         a = np.maximum(0, np.round(centre - half).astype(int))
@@ -84,6 +95,25 @@ def analyse(lab_path: Path, shapes_mm: dict) -> dict:
             f"{name}_hip_frac": round(float(np.isin(win, HIPS).sum() / max(1, np.isin(lab, HIPS).sum())), 4),
             f"{name}_anchors": int(bool(sac_in and rib_bearing_in)),
         })
+        if "ls" in centres:
+            c2, sac_top = centres["ls"]
+            _, sgn = sup_axis(img)
+            # window whose lower edge sits 3 cm below the sacral top, so the sacrum's upper part is in
+            span = mm[0] / zooms[axis]
+            lower = sac_top - sgn * (30.0 / zooms[axis])
+            cc = c2.copy(); cc[axis] = lower + sgn * span / 2
+            a = np.maximum(0, np.round(cc - half).astype(int))
+            b = np.minimum(np.array(lab.shape), np.round(cc + half).astype(int))
+            sl = tuple(slice(int(a[i]), int(b[i])) for i in range(3))
+            win = lab[sl]; vol = float(np.prod([b[i] - a[i] for i in range(3)]))
+            whole = sum(1 for v in levels_present if (win == v).sum() == (lab == v).sum())
+            rib_bearing_in = any((win == v).any() for v in range(8, RIB_BEARING_MAX + 1))
+            out.update({
+                f"{name}_ls_fg_frac": round(float((win > 0).sum() / vol), 4),
+                f"{name}_ls_levels_whole": whole,
+                f"{name}_ls_hip_frac": round(float(np.isin(win, HIPS).sum() / max(1, np.isin(lab, HIPS).sum())), 4),
+                f"{name}_ls_anchors": int(bool(np.isin(win, SACRUM).any() and rib_bearing_in)),
+            })
     return out
 
 
@@ -161,6 +191,8 @@ def main() -> int:
     for name in shapes_mm:
         summ[name] = {k: round(float(np.mean([r[f"{name}_{k}"] for r in rows])), 3)
                       for k in ("fg_frac", "levels_whole", "levels_touched", "spine_frac", "hip_frac", "anchors")}
+        summ[name].update({f"ls_{k}": round(float(np.mean([r[f"{name}_ls_{k}"] for r in rows if f"{name}_ls_{k}" in r])), 3)
+                           for k in ("fg_frac", "levels_whole", "hip_frac", "anchors")})
     summ["_n"] = len(rows); summ["_shapes_mm"] = {k: [round(x, 1) for x in v] for k, v in shapes_mm.items()}
     (a.out / "summary.json").write_text(json.dumps(summ, indent=1))
     print(json.dumps(summ, indent=1))
