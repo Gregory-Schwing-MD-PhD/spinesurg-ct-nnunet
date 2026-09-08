@@ -31,7 +31,7 @@ CASES="${CASES:-${PROJECT_ROOT}/benchmark/cases.csv}"
 SIF="${SIF:-${PROJECT_ROOT}/containers/spinesurg-ct.sif}"
 DS="${PROJECT_ROOT}/nnunet/raw/Dataset810_SpineSurgLSTVOneShot"
 PRED_DIR="${PRED_DIR:-${BENCH}/${SYSTEM}/native}"
-PATTERN="${PATTERN:-{case}.nii.gz}"
+PATTERN="${PATTERN:-}"; [[ -n "${PATTERN}" ]] || PATTERN='{case}.nii.gz'   # braces inside ${:-} mis-parse
 NAME_MAP="${NAME_MAP:-${PROJECT_ROOT}/benchmark/mappings/${SYSTEM}.json}"
 CLASS_MAP="${CLASS_MAP:-}"
 [[ "${SYSTEM}" == "totalsegmentator" && -z "${CLASS_MAP}" ]] && CLASS_MAP="${BENCH}/mappings/totalsegmentator_class_map.json"
