@@ -3,7 +3,7 @@
 #SBATCH -q gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=250G
 #SBATCH --gres=gpu:nvidia_h200:1
 #SBATCH --time=48:00:00
@@ -77,8 +77,10 @@ case "${PLANNER}" in
     ExperimentPlanner)     PLANS="nnUNetPlans"                                     ;;
     *) echo "ERROR: unknown planner ${PLANNER}" >&2; exit 1 ;;
 esac
-NNUNET_EXPORT_POOL=12
-NNUNET_DA_WORKERS=12
+# msa nodes: 128 cores for 4 GPUs, so 32 CPUs per fold; the H200 sat idle behind the
+# augmentation pipeline at 12 workers (epoch 19 min, GPU 0% when sampled)
+NNUNET_EXPORT_POOL="${NNUNET_EXPORT_POOL:-12}"
+NNUNET_DA_WORKERS="${NNUNET_DA_WORKERS:-20}"
 
 PROJECT_ROOT="${SLURM_SUBMIT_DIR:-${HOME}/SpineSurg-CT}"
 NNUNET_NFS="${PROJECT_ROOT}/nnunet"
