@@ -137,7 +137,7 @@ def render(lab_path: Path, shapes_mm: dict, out_png: Path) -> None:
     centre = idx.mean(0); centre[axis] = (lo + hi) / 2
     sac = np.argwhere(np.isin(lab, SACRUM))
     sac_top = (sac[:, axis].max() if sign > 0 else sac[:, axis].min()) if len(sac) else None
-    styles = [("#1f4e79", "-"), ("#c0392b", "-"), ("#7f8c8d", "--")]
+    styles = [("#1f4e79", "-"), ("#c0392b", "-"), ("#7f8c8d", "--"), ("#2e8b57", ":")]
     fig, axes = plt.subplots(2, 2, figsize=(7.2, 7.6))
     for row, (mode, title) in enumerate((("mid", "window centred on the column"), ("ls", "window on the lumbosacral junction"))):
         for ax, proj_axis in zip(axes[row], others):
