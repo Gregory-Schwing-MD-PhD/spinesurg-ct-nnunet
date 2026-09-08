@@ -32,7 +32,9 @@ is quoted).
 | NV-Segment-CT (VISTA3D lineage, NVIDIA) | 127 classes incl. vertebrae C1–L5, S1, sacrum, ribs 1–12/side, hips, femora | `run_vista3d.sh` (MONAI bundle batch inference, env `vista3d`, checkpoint cached from HF `nvidia/NV-Segment-CT`) | env built 2026-09-08; smoke pending |
 
 None of the competitors has a lumbar-rib class; TotalSegmentator, VISTA3D and RibSeg have
-no L6 and no T13. Those are scored as what they are: the lumbar rib lands in their rib-12
+no L6 and no T13. Möller's rib assignment can hand a rib to L1 (TPTBox gives L1 a RIB id, 52)
+but to nothing below it, and his `Vertebra_Instance.RIB` raises on L2 and lower, so a rib on
+L2 is unreachable in his stack by construction. Those are scored as what they are: the lumbar rib lands in their rib-12
 or rib-11 call (visible in the rib confusion), and the sixth body lands in L5 (the
 tall-component split in the decoder still counts it, so the **count** is compared fairly
 while the **name** is a miss).
