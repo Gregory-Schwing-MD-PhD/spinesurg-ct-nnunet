@@ -35,9 +35,19 @@ mkdir -p "${NATIVE}" "${WORK}" "${PROJECT_ROOT}/logs"
 trap 'rm -rf "${WORK}"' EXIT
 [[ -d "${SPINEPS_SEGMENTOR_MODELS}" ]] || { echo "ERROR: no models at ${SPINEPS_SEGMENTOR_MODELS}" >&2; exit 1; }
 
-echo "bench_spineps shard ${SHARD}/${N_SHARDS} on $(hostname) $(date); models: $(ls ${SPINEPS_SEGMENTOR_MODELS} | tr '\n' ' ')"
+# the release zips unpack one level deep (ct/CT_semantic, CT_instance/CT_instance,
+# ct_labeling/ct_labeling); fetch_weights.sh flattens them, and the models are passed as
+# absolute folders (spineps accepts a path wherever it accepts a model name)
+MODEL_SEMANTIC="${MODEL_SEMANTIC:-${SPINEPS_SEGMENTOR_MODELS}/CT_semantic}"
+MODEL_INSTANCE="${MODEL_INSTANCE:-${SPINEPS_SEGMENTOR_MODELS}/CT_instance}"
+MODEL_LABELING="${MODEL_LABELING:-${SPINEPS_SEGMENTOR_MODELS}/ct_labeling}"
+for m in "${MODEL_SEMANTIC}" "${MODEL_INSTANCE}" "${MODEL_LABELING}"; do
+    [[ -f "${m}/inference_config.json" ]] || { echo "ERROR: no inference_config.json in ${m}" >&2; exit 1; }
+done
+echo "bench_spineps shard ${SHARD}/${N_SHARDS} on $(hostname) $(date); models: ${MODEL_SEMANTIC} ${MODEL_INSTANCE} ${MODEL_LABELING}"
 python "${PROJECT_ROOT}/benchmark/run_spineps_cases.py" --cases "${CASES}" --out_dir "${NATIVE}" --work "${WORK}" \
-    --shard "${SHARD}" --n_shards "${N_SHARDS}" --limit "${LIMIT}" --extra "${EXTRA}"
+    --shard "${SHARD}" --n_shards "${N_SHARDS}" --limit "${LIMIT}" --extra "${EXTRA}" \
+    --model_semantic "${MODEL_SEMANTIC}" --model_instance "${MODEL_INSTANCE}" --model_labeling "${MODEL_LABELING}"
 rc=$?
 echo "exit ${rc} $(date); $(ls ${NATIVE}/*_seg-vert_msk.nii.gz 2>/dev/null | wc -l) native predictions so far"
 exit ${rc}
