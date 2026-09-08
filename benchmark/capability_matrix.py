@@ -64,7 +64,7 @@ def main() -> int:
         y0, y1 = min(ours_only) - 0.5, max(ours_only) + 0.5
         ax.add_patch(plt.Rectangle((len(SYSTEMS) - 1.5, y0), 1, y1 - y0, fill=False, lw=1.6, ec="k"))
         ax.text(len(SYSTEMS) - 0.38, (y0 + y1) / 2, "ours alone", rotation=-90, va="center", ha="left", fontsize=7.5, clip_on=False)
-    fig.text(0.01, 0.01, "hatched: in the released labels (thirteen ribs per side); the arm that names them is queued behind the one-shot folds", fontsize=6.5, ha="left", va="bottom")
+    fig.text(0.01, 0.01, "hatched: in the released labels (thirteen ribs per side) and in the arm now training (Dataset813); filled once its folds report", fontsize=6.5, ha="left", va="bottom")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     a.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(a.out.with_suffix(".pdf")); fig.savefig(a.out.with_suffix(".png"), dpi=200)

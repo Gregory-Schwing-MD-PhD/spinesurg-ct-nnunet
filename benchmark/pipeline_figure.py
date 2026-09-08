@@ -34,15 +34,15 @@ def main() -> int:
     ap.add_argument("--out", required=True, type=Path)
     a = ap.parse_args()
     fig, ax = plt.subplots(figsize=(7.6, 4.4))
-    ax.set_xlim(0, 13); ax.set_ylim(-0.3, 6.5); ax.axis("off")
+    ax.set_xlim(0, 13.3); ax.set_ylim(-0.3, 6.5); ax.axis("off")
 
     rows = {"comp": 5.4, "base": 3.5, "ours": 1.3}
-    for key, lab in (("comp", "a competitor\n(fixed vocabulary)"), ("base", "our merged baseline\n(May 2026)"),
+    for key, lab in (("comp", "a competitor\n(fixed vocabulary)"), ("base", "merged baseline\n(May 2026)"),
                      ("ours", "ours: one-shot identity\n+ sequence decoder")):
         ax.text(0.05, rows[key] + 0.45, lab, ha="left", va="center", fontsize=7.5, fontweight="bold")
 
     # shared input
-    box(ax, 2.35, 3.5, 1.0, 0.9, "CT", fc="0.92")
+    box(ax, 2.45, 3.5, 0.9, 0.9, "CT", fc="0.92")
     xa, xb = 3.35, 4.2
 
     y = rows["comp"]
@@ -51,16 +51,16 @@ def main() -> int:
     arrow(ax, xa, 3.95 + 0.25, xb, y + 0.45); arrow(ax, 6.9, y + 0.45, 7.4, y + 0.45)
 
     y = rows["base"]
-    box(ax, xb, y, 2.7, 0.9, "semantic net\nL1–L4, last lumbar, sacrum", fc="w", fs=6.6)
+    box(ax, xb, y, 2.7, 0.9, "semantic net\nL1–L4, last lumbar, sacrum", fc="w", fs=6.2)
     box(ax, 7.4, y, 5.3, 0.9, "never shifts a level, by construction, but cannot\nsay whether the bottom body is L5, L6 or S1", fc="0.96", fs=7)
     arrow(ax, xa, 3.95, xb, y + 0.45); arrow(ax, 6.9, y + 0.45, 7.4, y + 0.45)
 
     y = rows["ours"]
-    box(ax, xb, y - 0.2, 3.15, 1.3, "semantic net, 22 classes\nT10–T13, L1–L6, sacrum,\nribs 1–11 | 12 | 13 | lumbar rib,\nhips, femur", fc="w", lw=1.4, fs=6.2)
-    box(ax, 7.75, y - 0.2, 2.35, 1.3, "instances and\ntype posteriors\nthoracic / lumbar / sacral\n+ rib contact", fc="w", fs=6.2)
-    box(ax, 10.45, y - 0.2, 2.5, 1.3, "monotone decode:\nposterior over the count,\nreadings A / B / C,\ndouble shift reported", fc="w", lw=1.4, fs=6.2)
-    arrow(ax, xa, 3.95 - 0.25, xb, y + 0.45); arrow(ax, 7.35, y + 0.45, 7.75, y + 0.45); arrow(ax, 10.1, y + 0.45, 10.45, y + 0.45)
-    ax.text(7.55, y + 1.2, "softmax", ha="center", va="bottom", fontsize=6.3)
+    box(ax, xb, y - 0.2, 3.45, 1.3, "semantic net, 43 classes\nT10–T13, L1–L6, sacrum, disc space,\nribs 1–13 per side, lumbar rib,\nhips, femur", fc="w", lw=1.4, fs=6.0)
+    box(ax, 8.0, y - 0.2, 2.35, 1.3, "instances and\ntype posteriors\nthoracic / lumbar / sacral\n+ rib contact", fc="w", fs=6.2)
+    box(ax, 10.7, y - 0.2, 2.5, 1.3, "monotone decode:\nposterior over the count,\nreadings A / B / C,\ndouble shift reported", fc="w", lw=1.4, fs=6.2)
+    arrow(ax, xa, 3.95 - 0.25, xb, y + 0.45); arrow(ax, 7.65, y + 0.45, 8.0, y + 0.45); arrow(ax, 10.35, y + 0.45, 10.7, y + 0.45)
+    ax.text(7.82, y + 1.2, "softmax", ha="center", va="bottom", fontsize=6.3)
     ax.text(xb, 0.55, "sampler: half of every queue from the 39 variant carriers; the patch is forced onto L6 or the lumbar rib",
             fontsize=6.3, ha="left", va="top", style="italic")
     ax.text(xb, 0.2, "names come from local appearance (T12 vs L1: AUC 0.99 on shape alone); only the count is inferred, with a probability",
