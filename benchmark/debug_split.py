@@ -75,7 +75,8 @@ def main() -> int:
         seeds.sort(key=lambda t: -t[1])
         gaps = [round(a_ - b_, 1) for (_, a_), (_, b_) in zip(seeds, seeds[1:])]
         print(f"r={r_mm} mm ({it} it): {n3} comps, seeds (vox, z) {seeds[:6]}, gaps {gaps}, need >= {0.5*body_mm:.1f}")
-    pieces = ds.split_tall_component(big, axis, zooms, body_mm)
+    med_vol = float(np.median([int((cc == k + 1).sum()) for k in range(n) if sizes[k] >= ds.MIN_VOX] or [0]))
+    pieces = ds.split_tall_component(big, axis, zooms, body_mm, med_vol)
     print("split_tall_component ->", len(pieces), "pieces", [int(p.sum()) for p in pieces])
     return 0
 

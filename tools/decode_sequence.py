@@ -67,7 +67,10 @@ def load_probs(npz_path: Path):
     return z[key]                       # (C, ...) in nnU-Net's internal (transposed) order
 
 
-TALL_RATIO = 1.6       # a component this many typical body heights tall holds two bodies
+TALL_RATIO = 1.3       # height along the superior axis, in typical single-vertebra extents
+TALL_VOL = 1.6         # or volume, in median single-vertebra volumes
+SEED_GAP = 0.4         # stacked seeds must be this many body heights apart (tilted spines
+                       # shorten the projected gap, so it is well under one body)
 
 
 def _height_vox(m: np.ndarray, axis: int) -> tuple[int, int]:
@@ -75,31 +78,37 @@ def _height_vox(m: np.ndarray, axis: int) -> tuple[int, int]:
     return int(idx.min()), int(idx.max())
 
 
-def split_tall_component(m: np.ndarray, axis: int, zooms, body_mm: float) -> list[np.ndarray]:
+def split_tall_component(m: np.ndarray, axis: int, zooms, body_mm: float, med_vol: float) -> list[np.ndarray]:
     """Split one connected component that holds more than one body. Two neighbouring
     vertebrae with the same name touch only at the facet joints, a few millimetres thick,
-    so eroding the component by 2-4 mm severs them while each body survives; every voxel is
-    then given to the nearest surviving seed. `body_mm` is the typical single-vertebra
-    height IN THIS CASE (median over its own components). Guards: only components taller
-    than TALL_RATIO bodies are tried, and the pieces must be STACKED (z-centroids at least
-    half a body apart); a body and its posterior elements overlap in z and are kept whole."""
+    so eroding the component by 2-8 mm severs them while each body survives; every voxel is
+    then given to the nearest surviving seed. A component is a candidate when it is taller
+    than TALL_RATIO typical extents of this case or bigger than TALL_VOL median volumes
+    (extents along the scanner axis shrink on tilted spines; volume does not). Guards: the
+    seeds that count are at least a tenth of the largest, and they must be STACKED (z-centroids
+    at least SEED_GAP bodies apart); a body and its posterior elements overlap in z and are
+    kept whole. On ground truth with L6 renamed L5 this recovers the sixth body on 0376, 1053
+    and the instrumented 0068 (benchmark/debug_split.py)."""
     lo, hi = _height_vox(m, axis)
     height_mm = (hi - lo + 1) * zooms[axis]
-    if body_mm <= 0 or height_mm <= TALL_RATIO * body_mm:
+    vol = int(m.sum())
+    tall = (body_mm > 0 and height_mm > TALL_RATIO * body_mm) or (med_vol > 0 and vol > TALL_VOL * med_vol)
+    if not tall:
         return [m]
     vox = float(min(zooms))
-    for r_mm in (2.0, 3.0, 4.0, 5.0):
+    for r_mm in (2.0, 3.0, 4.0, 5.0, 6.0, 8.0):
         it = max(1, int(round(r_mm / vox)))
         er = ndimage.binary_erosion(m, structure=np.ones((3, 3, 3)), iterations=it)
         cc, n = ndimage.label(er, structure=np.ones((3, 3, 3)))
         if n < 2:
             continue
         sizes = ndimage.sum(er, cc, range(1, n + 1))
-        seeds = [k + 1 for k, sz in enumerate(sizes) if sz >= MIN_VOX // 3]
+        floor = max(MIN_VOX, 0.1 * float(sizes.max()))
+        seeds = [k + 1 for k, sz in enumerate(sizes) if sz >= floor]
         if len(seeds) < 2:
             continue
         zc = sorted(float(np.argwhere(cc == k)[:, axis].mean()) * zooms[axis] for k in seeds)
-        if min(b - a for a, b in zip(zc, zc[1:])) < 0.5 * body_mm:
+        if min(b - a for a, b in zip(zc, zc[1:])) < SEED_GAP * body_mm:
             continue                                   # pieces overlap in z: not two bodies
         seed_map = np.where(np.isin(cc, seeds), cc, 0)
         _, idx = ndimage.distance_transform_edt(seed_map == 0, return_indices=True)
@@ -147,9 +156,10 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
             continue
         cc, n = ndimage.label(m_all, structure=np.ones((3, 3, 3)))
         raw[vid] = [cc == lab for lab in range(1, n + 1) if (cc == lab).sum() >= MIN_VOX // 3]
-    heights = [(_height_vox(m, axis)[1] - _height_vox(m, axis)[0] + 1) * zooms[axis]
-               for ms in raw.values() for m in ms if m.sum() >= MIN_VOX]   # whole bodies only
+    whole = [m for ms in raw.values() for m in ms if m.sum() >= MIN_VOX]      # whole bodies only
+    heights = [(_height_vox(m, axis)[1] - _height_vox(m, axis)[0] + 1) * zooms[axis] for m in whole]
     body_mm = float(np.median(heights)) if len(heights) >= 3 else 35.0
+    med_vol = float(np.median([int(m.sum()) for m in whole])) if len(whole) >= 3 else 0.0
 
     comps = []                                        # (name_id, mask, z_mm)
     for vid, masks in raw.items():
@@ -159,7 +169,7 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
             # (an L6 called L5 next to the true L5, or a competitor with no L6 class). The
             # sequence would then be one body short, so a component much taller than this
             # case's typical body is split at the waists of its craniocaudal area profile.
-            for piece in split_tall_component(m, axis, zooms, body_mm):
+            for piece in split_tall_component(m, axis, zooms, body_mm, med_vol):
                 idx = np.argwhere(piece)
                 parts.append([piece, float(idx[:, axis].mean() * zooms[axis] * sign)])
         parts.sort(key=lambda p: -p[1])
