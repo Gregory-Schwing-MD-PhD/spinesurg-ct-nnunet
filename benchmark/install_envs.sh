@@ -13,7 +13,14 @@ if ! conda env list | grep -qE '^spineps '; then
     mamba create -y -n spineps python=3.11 >/dev/null
     conda activate spineps
     pip install --quiet torch torchvision --index-url https://download.pytorch.org/whl/cu124
-    pip install --quiet spineps
+    # pip would build numpy from source for blosc2 (nnunetv2 dep) and the login node's gcc is
+    # too old: take the two as conda binaries first, then prefer wheels
+    mamba install -y -q -c conda-forge "numpy<2.3" python-blosc2
+    pip install --quiet --prefer-binary spineps
+    # Möller's rib-to-vertebra assignment / rib length / stump features (TPTBox based). Not a
+    # pip package (no setup.py): cloned to ~/rib-segmentation and put on PYTHONPATH by the runner
+    pip install --quiet --prefer-binary TPTBox
+    [[ -d "${HOME}/rib-segmentation" ]] || git clone --depth 1 https://github.com/Hendrik-code/rib-segmentation "${HOME}/rib-segmentation"
     python -c "import spineps, torch; print('spineps', getattr(spineps, '__version__', '?'), 'torch', torch.__version__, torch.version.cuda)"
     conda deactivate
 else

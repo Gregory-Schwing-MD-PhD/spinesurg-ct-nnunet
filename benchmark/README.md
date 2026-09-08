@@ -28,8 +28,8 @@ is quoted).
 | TotalSegmentator v2 (`total`) | vertebrae C1–L5 + S1, sacrum, ribs 1–12/side, hips, femora | `run_totalsegmentator.sh` (4-shard GPU array; container + weights from the dataset build) | ready |
 | SPINEPS-CT + VERIDAH | vertebra instances in VerSe ids incl. **L6 (25) and T13 (28)**; no ribs/pelvis | `~/CTSpinoPelvic1K/slurm/spineps_bench.sh` (existing; container `ctspinopelvic1k-spineps.sif` bakes the CT weights) then `score.sh` with `PATTERN='{case}_seg-vert_msk.nii.gz'` | container to pull; rib assignment map to write |
 | Möller rib nnU-Net + rib-segmentation | binary ribs, rib→vertebra assignment, rib length, stump features | same SPINEPS job (`RIB_MODEL=…`) | with SPINEPS |
-| RibSeg v2 (PointNet++) | ribs 1–12 per side from a binary rib mask | `~/CTSpinoPelvic1K/slurm/ribseg.sh` (needs `third_party/RibSeg` + weights; not on the grid yet) | to set up |
-| VISTA3D (NVIDIA/MONAI) | 127 classes incl. vertebrae C1–L5, S1, sacrum, ribs 1–12/side, hips, femora | MONAI bundle in a new conda env (`vista3d`), runner to write | to set up |
+| RibSeg v2 (PointNet++) | ribs 1–12 per side from sparse rib voxels | `~/CTSpinoPelvic1K/slurm/ribseg.sh`; repo cloned to `~/CTSpinoPelvic1K/third_party/RibSeg` | **no released checkpoint** (the README's `c2_a` is a local training dir); would need training on RibSeg v2 (Google Drive) first, so it is last in line |
+| NV-Segment-CT (VISTA3D lineage, NVIDIA) | 127 classes incl. vertebrae C1–L5, S1, sacrum, ribs 1–12/side, hips, femora | `run_vista3d.sh` (MONAI bundle batch inference, env `vista3d`, checkpoint cached from HF `nvidia/NV-Segment-CT`) | env built 2026-09-08; smoke pending |
 
 None of the competitors has a lumbar-rib class; TotalSegmentator, VISTA3D and RibSeg have
 no L6 and no T13. Those are scored as what they are: the lumbar rib lands in their rib-12
