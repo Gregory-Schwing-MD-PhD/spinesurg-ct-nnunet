@@ -115,6 +115,17 @@ LEFT_HIP_LABEL = 8
 RIGHT_HIP_LABEL = 9
 IGNORE_LABEL = 10  # not a network output; only appears in seg via masking
 
+# The one-shot scheme (Dataset810, SPINESURG_LABEL_SCHEME=oneshot) puts the same anatomy at
+# other ids and adds the classes the benchmark exists to learn. Resolved at import, like
+# the trainer's own constants, from the same environment variable.
+import os as _os
+_SCHEME_ENV = _os.environ.get("SPINESURG_LABEL_SCHEME", "").strip().lower()
+LUMBAR_RIB_LABELS: tuple = ()
+if _SCHEME_ENV in ("oneshot", "one-shot", "810", "lstv_oneshot"):
+    L1_LABEL, L2_LABEL, L3_LABEL, L4_LABEL, L5_LABEL, L6_LABEL = 5, 6, 7, 8, 9, 10
+    SACRUM_LABEL, LEFT_HIP_LABEL, RIGHT_HIP_LABEL, IGNORE_LABEL = 11, 20, 21, 23
+    LUMBAR_RIB_LABELS = (18, 19)
+
 
 # class_locations entries can be either a single class id (int) or a
 # tuple-of-ids (region-based training). Our detection signatures look
@@ -150,6 +161,12 @@ def _is_lumbarization_signature(class_locations: ClassLocations) -> bool:
     """Lumbarization has an L6 vertebral body. No other subtype produces
     L6 voxels in our label scheme, so L6 voxels => lumb."""
     return _has_voxels(class_locations, L6_LABEL)
+
+
+def _is_lumbar_rib_signature(class_locations: ClassLocations) -> bool:
+    """A lumbar rib has its own class under the one-shot scheme; its presence is the
+    signature, and it is the rarest thing the network has to learn (16 of 802 records)."""
+    return any(_has_voxels(class_locations, k) for k in LUMBAR_RIB_LABELS)
 
 
 def _is_sacralization_count_signature(class_locations: ClassLocations) -> bool:
@@ -204,6 +221,12 @@ def select_lstv_biased_class(
     # Lumbarization takes priority: lumb's defining anatomy (L6) is rarer
     # and harder for the model to learn than sacr_count's, so when both
     # signatures somehow fire we want L6 to win the bias slot.
+    # Lumbar rib first: the rarest class of all, and one a uniform sampler almost never
+    # lands a patch on. Same probability as the L6 bias; side chosen at random.
+    if LUMBAR_RIB_LABELS and _is_lumbar_rib_signature(class_locations):
+        if bias_l6_prob > 0 and random_uniform() < bias_l6_prob:
+            present = [k for k in LUMBAR_RIB_LABELS if _has_voxels(class_locations, k)]
+            return present[int(random_uniform() * len(present)) % len(present)]
     if _is_lumbarization_signature(class_locations):
         if bias_l6_prob > 0 and random_uniform() < bias_l6_prob:
             return L6_LABEL

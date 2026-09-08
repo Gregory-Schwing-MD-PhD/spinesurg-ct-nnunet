@@ -146,9 +146,12 @@ if [[ "${STAGE_LOCAL}" == "1" ]]; then
     mkdir -p "${LOCAL_PREP}" "${LOCAL_RAW}"
     LOCAL_PREP_DS="${LOCAL_PREP}/${DS_DIR_NAME}"
     LOCAL_RAW_DS="${LOCAL_RAW}/${DS_DIR_NAME}"
-    echo "[fold ${FOLD}] staging preprocessed -> ${LOCAL_PREP_DS}"
+    echo "[fold ${FOLD}] staging preprocessed (packed .npz only; unpacked locally by the trainer) -> ${LOCAL_PREP_DS}"
     mkdir -p "${LOCAL_PREP_DS}"
-    rsync -aW --no-compress "${NFS_PREP_DS}/" "${LOCAL_PREP_DS}/"
+    # the .npy unpacked on NFS by slurm/unpack_dataset.sh are ~1 TB; copying the 222 GB of
+    # .npz and letting nnU-Net unpack on the node's 1.7 TB /tmp fits ONE fold per node
+    rsync -aW --no-compress --exclude '*.npy' "${NFS_PREP_DS}/" "${LOCAL_PREP_DS}/"
+    df -h "${LOCAL_SCRATCH}" | tail -1
     echo "[fold ${FOLD}] staging raw -> ${LOCAL_RAW_DS} (needed for LSTV scanner)"
     mkdir -p "${LOCAL_RAW_DS}"
     rsync -aW --no-compress "${NFS_RAW_DS}/" "${LOCAL_RAW_DS}/"
@@ -175,6 +178,10 @@ export SINGULARITYENV_WANDB_INIT_MAX_RETRIES="${WANDB_INIT_MAX_RETRIES}"
 export SINGULARITYENV_WANDB_INIT_TIMEOUT_SEC="${WANDB_INIT_TIMEOUT_SEC}"
 export SINGULARITYENV_WANDB_ALLOW_OFFLINE="${WANDB_ALLOW_OFFLINE}"
 export SINGULARITYENV_LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}"
+export SINGULARITYENV_SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-merged}"
+# the biased dataloader is not baked into the image: bound in above, and importable from
+# /workspace/tools as a second route
+export SINGULARITYENV_PYTHONPATH="/workspace/tools"
 export SINGULARITYENV_WANDB_RUN_ID="${DS_DIR_NAME}_${TRAINER}_${PLANS}_f${FOLD}"
 export OMP_NUM_THREADS=4
 
@@ -190,6 +197,7 @@ SING_BINDS=(
     --bind "${NNUNET_NFS}:/nnunet_nfs"
     --bind "${HOME}/.wandb:${HOME}/.wandb"
     --bind "${WANDB_TRAINER_HOST}:${WANDB_TRAINER_CONTAINER}"
+    --bind "${PROJECT_ROOT}/tools/lstv_biased_dataloader.py:${WANDB_TRAINER_CONTAINER%/*}/lstv_biased_dataloader.py"
     --pwd  /workspace
 )
 
@@ -208,7 +216,7 @@ echo "================================================================"
 requeue_self() {
     echo "[fold ${FOLD}] wall-time limit approaching at $(date); resubmitting to resume from checkpoint_latest.pth"
     cd "${PROJECT_ROOT}"
-    sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}" \
+    sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}",SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-merged}",STAGE_LOCAL="${STAGE_LOCAL:-0}" \
         slurm/spine_train_fold.sh
     # let the trainer reach its next checkpoint write (every 50 epochs) rather than killing it now
     wait "${TRAIN_PID}" || true
