@@ -27,6 +27,8 @@ def main() -> int:
     ap.add_argument("--plans", required=True, type=Path)
     ap.add_argument("--patch", nargs=3, type=int, default=[384, 256, 256])
     ap.add_argument("--config", default="3d_fullres")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="write a NEW plans file here (its plans_name set to the file stem) instead of editing in place")
     a = ap.parse_args()
     p = json.loads(a.plans.read_text())
     c = p["configurations"][a.config]
@@ -42,13 +44,18 @@ def main() -> int:
     sp = c["spacing"]
     print(f"old patch {old} = {[round(o * s / 10, 1) for o, s in zip(old, sp)]} cm, {old[0]*old[1]*old[2]/1e6:.1f}M voxels")
     print(f"new patch {a.patch} = {[round(o * s / 10, 1) for o, s in zip(a.patch, sp)]} cm, {a.patch[0]*a.patch[1]*a.patch[2]/1e6:.1f}M voxels")
-    if a.patch[0] * a.patch[1] * a.patch[2] > 1.05 * old[0] * old[1] * old[2]:
+    if a.patch[0] * a.patch[1] * a.patch[2] > 1.05 * 256 * 320 * 320:
         raise SystemExit("new patch is more than 5% larger than the planned one; it would not fit the memory target")
+    c["patch_size"] = list(a.patch)
+    c.setdefault("_notes", []).append(f"patch reshaped from {old} to {list(a.patch)} by tools/reshape_patch.py: same voxel budget, craniocaudal reach")
+    if a.out is not None:
+        p["plans_name"] = a.out.name.replace(".json", "")     # nnU-Net resolves the file from this name
+        a.out.write_text(json.dumps(p, indent=2))
+        print("wrote", a.out, "plans_name", p["plans_name"])
+        return 0
     bak = a.plans.with_suffix(".json.orig")
     if not bak.exists():
         shutil.copy2(a.plans, bak)
-    c["patch_size"] = list(a.patch)
-    c.setdefault("_notes", []).append(f"patch reshaped from {old} to {list(a.patch)} by tools/reshape_patch.py: same voxel budget, craniocaudal reach")
     a.plans.write_text(json.dumps(p, indent=2))
     print("wrote", a.plans, "(backup", bak.name + ")")
     return 0

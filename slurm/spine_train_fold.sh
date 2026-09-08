@@ -77,6 +77,8 @@ case "${PLANNER}" in
     ExperimentPlanner)     PLANS="nnUNetPlans"                                     ;;
     *) echo "ERROR: unknown planner ${PLANNER}" >&2; exit 1 ;;
 esac
+# a sibling plans file (patch-shape ablation, slurm/make_plan_variants.sh): results land in their own dir
+PLANS="${PLANS_OVERRIDE:-${PLANS}}"
 # msa nodes: 128 cores for 4 GPUs, so 32 CPUs per fold; the H200 sat idle behind the
 # augmentation pipeline at 12 workers (epoch 19 min, GPU 0% when sampled)
 NNUNET_EXPORT_POOL="${NNUNET_EXPORT_POOL:-12}"
