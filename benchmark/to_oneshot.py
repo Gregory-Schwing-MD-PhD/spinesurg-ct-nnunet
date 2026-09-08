@@ -36,6 +36,8 @@ def build_lut(class_map: dict | None, name_map: dict, oneshot: dict) -> np.ndarr
     native_name = {int(k): v for k, v in (class_map or {}).items()}
     pairs = {}
     for key, target in name_map.items():
+        if key.startswith("_"):                     # "_comment" and friends
+            continue
         if target not in oneshot:
             raise KeyError(f"{target!r} is not a one-shot label")
         if key.lstrip("-").isdigit():

@@ -66,31 +66,42 @@ def load_probs(npz_path: Path):
     return z[key]                       # (C, ...) in nnU-Net's internal (transposed) order
 
 
-MAX_BODY_MM = 55.0     # no single thoracolumbar vertebra spans more than this craniocaudally
+TALL_RATIO = 1.6       # a component this many typical body heights tall holds two bodies
 
 
-def split_tall_component(m: np.ndarray, axis: int, zoom_mm: float) -> list[np.ndarray]:
-    """Split one connected component that is taller than a vertebra at the minima of its
-    slice-area profile along the superior axis (the discs between fused-by-name bodies).
-    Returns [m] unchanged when it is not tall or when no waist is found."""
+def _height_vox(m: np.ndarray, axis: int) -> tuple[int, int]:
     idx = np.nonzero(m.any(axis=tuple(i for i in range(3) if i != axis)))[0]
-    lo, hi = int(idx.min()), int(idx.max())
-    if (hi - lo + 1) * zoom_mm <= MAX_BODY_MM:
+    return int(idx.min()), int(idx.max())
+
+
+def split_tall_component(m: np.ndarray, axis: int, zoom_mm: float, body_mm: float) -> list[np.ndarray]:
+    """Split one connected component that holds more than one body. `body_mm` is the typical
+    single-vertebra height IN THIS CASE (median over the case's own components), so a tilted
+    or unusually tall vertebra is not split by a fixed millimetre rule. A component taller
+    than TALL_RATIO bodies is cut into round(height / body) pieces at the deepest waists of
+    its slice-area profile (the discs), each at least 0.6 body from the next cut."""
+    lo, hi = _height_vox(m, axis)
+    height_mm = (hi - lo + 1) * zoom_mm
+    if body_mm <= 0 or height_mm <= TALL_RATIO * body_mm:
         return [m]
+    n_bodies = max(2, int(round(height_mm / body_mm)))
     profile = m.sum(axis=tuple(i for i in range(3) if i != axis)).astype(float)[lo:hi + 1]
     k = max(1, int(round(3.0 / zoom_mm)))                     # ~3 mm smoothing
     sm = np.convolve(profile, np.ones(2 * k + 1) / (2 * k + 1), mode="same")
-    min_gap = int(round(20.0 / zoom_mm))                      # bodies are at least 20 mm apart
-    cuts = []
-    for i in range(min_gap, len(sm) - min_gap):
-        left, right = sm[i - min_gap:i].max(), sm[i + 1:i + 1 + min_gap].max()
-        if sm[i] < 0.6 * min(left, right) and sm[i] <= sm[i - 1] and sm[i] <= sm[i + 1]:
-            if not cuts or i - cuts[-1] >= min_gap:
-                cuts.append(i)
+    min_gap = max(2, int(round(0.6 * body_mm / zoom_mm)))
+    cands = [i for i in range(min_gap, len(sm) - min_gap)
+             if sm[i] <= sm[i - 1] and sm[i] <= sm[i + 1]
+             and sm[i] < 0.7 * min(sm[i - min_gap:i].max(), sm[i + 1:i + 1 + min_gap].max())]
+    cuts: list[int] = []
+    for i in sorted(cands, key=lambda j: sm[j]):              # deepest waist first
+        if all(abs(i - c) >= min_gap for c in cuts):
+            cuts.append(i)
+        if len(cuts) == n_bodies - 1:
+            break
     if not cuts:
         return [m]
     pieces, start = [], lo
-    for c in cuts + [hi - lo + 1]:
+    for c in sorted(cuts) + [hi - lo + 1]:
         end = lo + c
         sl = [slice(None)] * 3
         sl[axis] = slice(start, end)
@@ -132,22 +143,27 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
     # separates neighbours by construction; two neighbours given the SAME name stay apart
     # because their centroids are a body height apart, while fragments of one vertebra
     # (a detached spinous process) share a name and a centroid and are merged.
-    comps = []                                        # (name_id, mask, z_mm)
+    # pass 1: raw connected components per name class, and the case's own typical body height
+    raw = {}                                          # vid -> [mask, ...]
     for vid in vert_ids:
         m_all = seg == vid
         if m_all.sum() < MIN_VOX:
             continue
         cc, n = ndimage.label(m_all, structure=np.ones((3, 3, 3)))
+        raw[vid] = [cc == lab for lab in range(1, n + 1) if (cc == lab).sum() >= MIN_VOX]
+    heights = [(_height_vox(m, axis)[1] - _height_vox(m, axis)[0] + 1) * zooms[axis]
+               for ms in raw.values() for m in ms]
+    body_mm = float(np.median(heights)) if len(heights) >= 3 else 35.0
+
+    comps = []                                        # (name_id, mask, z_mm)
+    for vid, masks in raw.items():
         parts = []
-        for lab in range(1, n + 1):
-            m = cc == lab
-            if m.sum() < MIN_VOX // 3:
-                continue
+        for m in masks:
             # TWO NEIGHBOURS GIVEN THE SAME NAME TOUCH AT THE FACETS AND FORM ONE COMPONENT
             # (an L6 called L5 next to the true L5, or a competitor with no L6 class). The
-            # sequence would then be one body short, so a component taller than any single
-            # vertebra is split at the waist of its craniocaudal area profile.
-            for piece in split_tall_component(m, axis, zooms[axis]):
+            # sequence would then be one body short, so a component much taller than this
+            # case's typical body is split at the waists of its craniocaudal area profile.
+            for piece in split_tall_component(m, axis, zooms[axis], body_mm):
                 idx = np.argwhere(piece)
                 parts.append([piece, float(idx[:, axis].mean() * zooms[axis] * sign)])
         parts.sort(key=lambda p: -p[1])
