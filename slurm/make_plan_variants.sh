@@ -25,10 +25,14 @@ PLANS="${PLANS:-nnUNetResEncUNetLPlans_100G}"
 DS="Dataset$(printf '%03d' ${DATASET_ID})_${DATASET_NAME}"
 P="nnunet/preprocessed/${DS}"
 [[ -f "${P}/${PLANS}.json.orig" ]] || { echo "ERROR: ${P}/${PLANS}.json.orig missing (reshape_plans.sh not run?)" >&2; exit 1; }
-python3 tools/reshape_patch.py --plans "${P}/${PLANS}.json.orig" --patch 256 320 320 --out "${P}/${PLANS}_p256.json"
-python3 tools/reshape_patch.py --plans "${P}/${PLANS}.json.orig" --patch 448 224 224 --out "${P}/${PLANS}_p448.json"
+# VARIANTS: space-separated "name:d0,d1,d2" (voxels, column axis first); default = the
+# planner's shape as control and a longer column. p512 = 512x192x192 (41 cm x 14.5 cm, 18.9M
+# voxels) is the extreme column: the hips are cut at the acetabula, which is the price it pays.
+VARIANTS="${VARIANTS:-p256:256,320,320 p448:448,224,224}"
 COMMON="DATASET_ID=${DATASET_ID},DATASET_NAME=${DATASET_NAME},PLANNER=nnUNetPlannerResEncL,GPU_MEMORY_TARGET_GB=100,TRAINER=nnUNetTrainerWandB_500ep_LSTVOversample,LSTV_OVERSAMPLE_FRAC=0.5,SPINESURG_LABEL_SCHEME=fullribs,STAGE_LOCAL=0"
-for v in p256 p448; do
+for spec in ${VARIANTS}; do
+    v="${spec%%:*}"; dims="${spec##*:}"
+    python3 tools/reshape_patch.py --plans "${P}/${PLANS}.json.orig" --patch ${dims//,/ } --out "${P}/${PLANS}_${v}.json" || exit 1
     j=$(sbatch --parsable --export=ALL,FOLD=0,${COMMON},PLANS_OVERRIDE=${PLANS}_${v} slurm/spine_train_fold.sh)
-    echo "ablation fold 0 ${v}: job ${j}"
+    echo "ablation fold 0 ${v} (${dims}): job ${j}"
 done
