@@ -270,16 +270,17 @@ elif _SCHEME == "fullribs":
     _ANATOMY_NAMES = (["T10", "T11", "T12", "T13", "L1", "L2", "L3", "L4", "L5", "L6", "sacrum"]
                       + [f"rib_left_{k}" for k in range(1, 12)] + ["rib12_left", "rib13_left"]
                       + [f"rib_right_{k}" for k in range(1, 12)] + ["rib12_right", "rib13_right"]
-                      + ["lumbar_rib_left", "lumbar_rib_right", "left_hip", "right_hip", "femur"])
-    _FG_CLASS_IDS    = list(range(1, 43))
+                      + ["lumbar_rib_left", "lumbar_rib_right", "left_hip", "right_hip", "femur",
+                         "disc_space"])                  # derived intervertebral space, id 43
+    _FG_CLASS_IDS    = list(range(1, 44))
     _LUMBAR_IDS      = [5, 6, 7, 8, 9, 10]          # L1..L6
     _PELVIS_IDS      = [11, 40, 41, 42]             # sacrum, hips, femur
     _L4_LABEL_ID     = 8
     _L5_LABEL_ID     = 9
     _L6_LABEL_ID     = 10
     _SACRUM_LABEL_ID = 11
-    _IGNORE_LABEL    = 43
-    _DEFAULT_NUM_OUTPUT_CLASSES = 43
+    _IGNORE_LABEL    = 44
+    _DEFAULT_NUM_OUTPUT_CLASSES = 44
 elif _SCHEME == "oneshot":
     # Dataset810 — the LSTV one-shot scheme (tools/convert_hf_to_nnunet.py,
     # LABEL_NAMES_ONESHOT): thoracic levels T10..T13 and lumbar levels L1..L6 distinct,

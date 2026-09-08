@@ -760,6 +760,12 @@ _fr_add("lumbar_rib_right", [VERSE_LUMBAR_RIB_R])
 _fr_add("left_hip", [30])
 _fr_add("right_hip", [31])
 _fr_add("femur", [32, 33])
+# the intervertebral space, DERIVED at write time from the per-level source ids (see
+# _derive_disc_space): with it, every vertebra is its own connected component of the
+# vertebra classes, so one body can only ever carry one name, by construction of the
+# instance step rather than by hoping the network never splits a body between two names
+_i += 1
+_FR_NAMES["disc_space"] = _i
 _i += 1
 _FR_NAMES["ignore"] = _i
 _FR[VERSE_IGNORE] = _i
@@ -795,7 +801,9 @@ def _build_verse_remap_lut(remap: Dict[int, int],
 
 def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray,
                            derive_disc: bool = False,
-                           rib_regions: bool = False) -> None:
+                           rib_regions: bool = False,
+                           disc_value: Optional[int] = None,
+                           ignore_value: Optional[int] = None) -> None:
     """Read source label NIfTI, apply the remap LUT, write to dst.
 
     Used when the dataset.json label scheme differs from the source
@@ -839,8 +847,8 @@ def _remap_and_write_label(src: Path, dst: Path, lut: np.ndarray,
         # restore exactly the leak it exists to close. It IS gated away from the
         # ignore region: the ignore contract is what makes partial annotation safe,
         # and nothing may supervise a region that was never annotated.
-        disc_v = _RR_DISC if rib_regions else _CF_DISC
-        ign_v = _RR_IGNORE if rib_regions else _CF_IGNORE
+        disc_v = disc_value if disc_value is not None else (_RR_DISC if rib_regions else _CF_DISC)
+        ign_v = ignore_value if ignore_value is not None else (_RR_IGNORE if rib_regions else _CF_IGNORE)
         arr_remapped[disc & (arr_remapped != ign_v)] = disc_v
 
     out = nib.Nifti1Image(arr_remapped, img.affine, img.header)
@@ -980,6 +988,8 @@ def _build_case_indices(
     include_configs: Optional[frozenset] = None,
     derive_disc: bool = False,
     rib_regions: bool = False,
+    disc_value: Optional[int] = None,
+    ignore_value: Optional[int] = None,
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Dict],
            List[str], List[str], int, Dict[str, int],
            Dict[str, int], int, Dict[str, int]]:
@@ -1077,7 +1087,9 @@ def _build_case_indices(
                         _remap_and_write_label(label_src, label_dst,
                                                 label_remap_lut,
                                                 derive_disc=derive_disc,
-                                                rib_regions=rib_regions)
+                                                rib_regions=rib_regions,
+                                                disc_value=disc_value,
+                                                ignore_value=ignore_value)
                         remap_stats["n_remapped"] += 1
                     else:
                         _link_or_copy(label_src, label_dst, use_symlinks)
@@ -1445,8 +1457,10 @@ def main():
         images_tr, labels_tr, images_ts, labels_ts,
         use_symlinks=args.symlinks, do_link=do_link,
         label_remap_lut=label_remap_lut,
-        derive_disc=args.countfree or args.rib_regions,
+        derive_disc=args.countfree or args.rib_regions or args.fullribs,
         rib_regions=args.rib_regions,
+        disc_value=(active_label_names.get("disc_space") if args.fullribs else None),
+        ignore_value=(active_label_names.get("ignore") if args.fullribs else None),
         include_configs=include_configs,
     )
 
