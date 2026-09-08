@@ -378,9 +378,10 @@ CONVERT_SCHEME_FLAG=""
 case "${SCHEME}" in
     "")            ;;
     oneshot)       CONVERT_SCHEME_FLAG="--oneshot" ;;
+    fullribs)      CONVERT_SCHEME_FLAG="--fullribs" ;;
     rib_regions)   CONVERT_SCHEME_FLAG="--rib_regions" ;;
     countfree)     CONVERT_SCHEME_FLAG="--countfree" ;;
-    *) echo "ERROR: SCHEME must be oneshot, rib_regions or countfree (got '${SCHEME}')" >&2
+    *) echo "ERROR: SCHEME must be oneshot, fullribs, rib_regions or countfree (got '${SCHEME}')" >&2
        exit 1 ;;
 esac
 if [[ -n "${CONVERT_SCHEME_FLAG}" ]]; then
@@ -629,7 +630,7 @@ if [[ -n "${SCHEME}" ]]; then
 import json, sys
 sys.path.insert(0, "/workspace/tools")
 import convert_hf_to_nnunet as cvt
-table = {"oneshot": cvt.LABEL_NAMES_ONESHOT, "countfree": cvt.LABEL_NAMES_COUNTFREE,
+table = {"oneshot": cvt.LABEL_NAMES_ONESHOT, "fullribs": cvt.LABEL_NAMES_FULLRIBS, "countfree": cvt.LABEL_NAMES_COUNTFREE,
          "rib_regions": getattr(cvt, "LABEL_NAMES_RIB_REGIONS", {})}[sys.argv[2]]
 d = json.load(open(sys.argv[1]))
 labels = d.get("labels", {})

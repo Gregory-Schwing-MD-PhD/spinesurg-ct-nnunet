@@ -726,6 +726,47 @@ LABEL_REMAP_ONESHOT_FROM_VERSE: Dict[int, int] = dict(_OS)
 # background; they are also outside most of these fields of view
 del _OS, _OS_NAMES, _i
 
+# FULL RIBS (Dataset813, 2026-09-08): the one-shot scheme with EVERY rib named per
+# side, one to thirteen, as the released labels have them. No public system that
+# numbers ribs may keep that over us; the twelfth and thirteenth keep the one-shot
+# names (rib12_left ...) so the same scorers and decoder run unchanged, and ribs
+# one to eleven are rib_left_1 ... rib_left_11 (TotalSegmentator's convention, so
+# the competitor maps are one line each). Ribs above the field of view (most of
+# one to seven on these scans) are simply rare classes.
+_FR = {}
+_FR_NAMES = {"background": 0}
+_i = 0
+
+
+def _fr_add(name, src_ids):
+    global _i
+    _i += 1
+    _FR_NAMES[name] = _i
+    for sid in src_ids:
+        _FR[sid] = _i
+
+
+for _n, _v in (("T10", 17), ("T11", 18), ("T12", 19), ("T13", 28),
+               ("L1", 20), ("L2", 21), ("L3", 22), ("L4", 23), ("L5", 24), ("L6", 25)):
+    _fr_add(_n, [_v])
+_fr_add("sacrum", [26, 29])
+for _side, _ids in (("left", VERSE_RIB_L), ("right", VERSE_RIB_R)):
+    for _k in range(11):
+        _fr_add(f"rib_{_side}_{_k + 1}", [_ids[_k]])
+    _fr_add(f"rib12_{_side}", [_ids[11]])
+    _fr_add(f"rib13_{_side}", [_ids[12]])
+_fr_add("lumbar_rib_left", [VERSE_LUMBAR_RIB_L])
+_fr_add("lumbar_rib_right", [VERSE_LUMBAR_RIB_R])
+_fr_add("left_hip", [30])
+_fr_add("right_hip", [31])
+_fr_add("femur", [32, 33])
+_i += 1
+_FR_NAMES["ignore"] = _i
+_FR[VERSE_IGNORE] = _i
+LABEL_NAMES_FULLRIBS = dict(_FR_NAMES)
+LABEL_REMAP_FULLRIBS_FROM_VERSE: Dict[int, int] = dict(_FR)
+del _FR, _FR_NAMES, _i
+
 
 def _build_verse_remap_lut(remap: Dict[int, int],
                            max_label: int = _MAX_SOURCE_LABEL) -> np.ndarray:
@@ -1225,8 +1266,19 @@ def main():
                          "part the count is anchored on. Nested regions let the network "
                          "be certain a thing is a vertebra while uncertain whether it "
                          "bears a rib, which exclusive classes cannot express.")
+    p.add_argument("--fullribs", action="store_true",
+                    help="The one-shot scheme with every rib named per side, one to "
+                         "thirteen (rib_left_1 ... rib_left_11, rib12_left, rib13_left, "
+                         "and the same on the right), the lumbar rib kept separate. 42 "
+                         "foreground classes, ignore = 43. Dataset813.")
     p.add_argument("--regen_splits_only", action="store_true")
     args = p.parse_args()
+
+    if args.fullribs and (args.no_remap or args.drop_ignore_label
+                          or args.countfree or args.rib_regions or args.oneshot):
+        log.error("--fullribs defines its own label scheme and is incompatible with the "
+                  "other scheme flags.")
+        raise SystemExit(2)
 
     if args.oneshot and (args.no_remap or args.drop_ignore_label
                          or args.countfree or args.rib_regions):
@@ -1301,6 +1353,11 @@ def main():
                  "names the rib attached to it.")
         log.info("  -> L5 versus L6 remains a COUNT and no morphology settles it. Expect "
                  "the junction to be learnable and the lumbosacral one not.")
+    elif args.fullribs:
+        label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_FULLRIBS_FROM_VERSE)
+        active_label_names = LABEL_NAMES_FULLRIBS
+        log.info("Label scheme: ONE-SHOT WITH EVERY RIB NAMED, %d classes.",
+                 len(LABEL_NAMES_FULLRIBS))
     elif args.rib_regions:
         label_remap_lut = _build_verse_remap_lut(LABEL_REMAP_RIB_REGIONS_FROM_VERSE)
         active_label_names = LABEL_NAMES_RIB_REGIONS

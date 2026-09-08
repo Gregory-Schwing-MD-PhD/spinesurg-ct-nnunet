@@ -140,7 +140,7 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
     thor_ids = [names[n] for n in THORACIC if n in names]
     lum_ids = [names[n] for n in LUMBAR if n in names]
     sac_id = names.get("sacrum")
-    rib_ids = {n: names[n] for n in RIBS if n in names}
+    rib_ids = {n: i for n, i in names.items() if n in RIBS or n.startswith(("rib_left_", "rib_right_"))}
 
     # INSTANCES PER NAME CLASS, not per union: adjacent vertebrae touch at the facets, so the
     # union of vertebra classes is one connected blob for the whole column (the self-test on

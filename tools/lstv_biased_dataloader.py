@@ -121,7 +121,11 @@ IGNORE_LABEL = 10  # not a network output; only appears in seg via masking
 import os as _os
 _SCHEME_ENV = _os.environ.get("SPINESURG_LABEL_SCHEME", "").strip().lower()
 LUMBAR_RIB_LABELS: tuple = ()
-if _SCHEME_ENV in ("oneshot", "one-shot", "810", "lstv_oneshot"):
+if _SCHEME_ENV in ("fullribs", "full-ribs", "813", "lstv_fullribs"):
+    L1_LABEL, L2_LABEL, L3_LABEL, L4_LABEL, L5_LABEL, L6_LABEL = 5, 6, 7, 8, 9, 10
+    SACRUM_LABEL, LEFT_HIP_LABEL, RIGHT_HIP_LABEL, IGNORE_LABEL = 11, 40, 41, 43
+    LUMBAR_RIB_LABELS = (38, 39)
+elif _SCHEME_ENV in ("oneshot", "one-shot", "810", "lstv_oneshot"):
     L1_LABEL, L2_LABEL, L3_LABEL, L4_LABEL, L5_LABEL, L6_LABEL = 5, 6, 7, 8, 9, 10
     SACRUM_LABEL, LEFT_HIP_LABEL, RIGHT_HIP_LABEL, IGNORE_LABEL = 11, 20, 21, 23
     LUMBAR_RIB_LABELS = (18, 19)

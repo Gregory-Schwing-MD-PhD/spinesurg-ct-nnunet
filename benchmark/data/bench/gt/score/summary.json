@@ -1,0 +1,148 @@
+{
+ "n_cases": 802,
+ "n_transitional": 39,
+ "dice_mean": {
+  "all": {
+   "T10": 1.0,
+   "T11": 1.0,
+   "T12": 1.0,
+   "L1": 1.0,
+   "L2": 1.0,
+   "L3": 1.0,
+   "L4": 1.0,
+   "L5": 1.0,
+   "sacrum": 1.0,
+   "rib_left": 1.0,
+   "rib_right": 1.0,
+   "rib12_left": 1.0,
+   "rib12_right": 1.0,
+   "left_hip": 1.0,
+   "right_hip": 1.0,
+   "femur": 1.0,
+   "lumbar_rib_left": 1.0,
+   "lumbar_rib_right": 1.0,
+   "L6": 1.0
+  },
+  "typical": {
+   "T10": 1.0,
+   "T11": 1.0,
+   "T12": 1.0,
+   "L1": 1.0,
+   "L2": 1.0,
+   "L3": 1.0,
+   "L4": 1.0,
+   "L5": 1.0,
+   "sacrum": 1.0,
+   "rib_left": 1.0,
+   "rib_right": 1.0,
+   "rib12_left": 1.0,
+   "rib12_right": 1.0,
+   "left_hip": 1.0,
+   "right_hip": 1.0,
+   "femur": 1.0,
+   "L6": 1.0
+  },
+  "transitional": {
+   "T10": 1.0,
+   "T11": 1.0,
+   "T12": 1.0,
+   "L1": 1.0,
+   "L2": 1.0,
+   "L3": 1.0,
+   "L4": 1.0,
+   "sacrum": 1.0,
+   "rib_left": 1.0,
+   "rib_right": 1.0,
+   "rib12_left": 1.0,
+   "rib12_right": 1.0,
+   "left_hip": 1.0,
+   "right_hip": 1.0,
+   "femur": 1.0,
+   "L5": 1.0,
+   "lumbar_rib_left": 1.0,
+   "lumbar_rib_right": 1.0,
+   "L6": 1.0
+  }
+ },
+ "rib_free_count": {
+  "all": {
+   "n": 802,
+   "exact": 1.0,
+   "error_histogram": {
+    "0": 802
+   }
+  },
+  "typical": {
+   "n": 763,
+   "exact": 1.0,
+   "error_histogram": {
+    "0": 763
+   }
+  },
+  "transitional": {
+   "n": 39,
+   "exact": 1.0,
+   "error_histogram": {
+    "0": 39
+   }
+  }
+ },
+ "rib_confusion_pct_of_gt_voxels": {
+  "rib12_left": {
+   "rib12_left": 100.0
+  },
+  "rib12_right": {
+   "rib12_right": 100.0
+  },
+  "lumbar_rib_left": {
+   "lumbar_rib_left": 100.0
+  },
+  "lumbar_rib_right": {
+   "lumbar_rib_right": 100.0
+  }
+ },
+ "rare_class_emission": {
+  "rib12_left": {
+   "gt_cases": 787,
+   "emitted_on_gt_cases": 787,
+   "emitted_where_absent": 0,
+   "missed": []
+  },
+  "rib12_right": {
+   "gt_cases": 788,
+   "emitted_on_gt_cases": 788,
+   "emitted_where_absent": 0,
+   "missed": []
+  },
+  "rib13_left": {
+   "gt_cases": 0,
+   "emitted_on_gt_cases": 0,
+   "emitted_where_absent": 0,
+   "missed": []
+  },
+  "rib13_right": {
+   "gt_cases": 0,
+   "emitted_on_gt_cases": 0,
+   "emitted_where_absent": 0,
+   "missed": []
+  },
+  "lumbar_rib_left": {
+   "gt_cases": 13,
+   "emitted_on_gt_cases": 13,
+   "emitted_where_absent": 0,
+   "missed": []
+  },
+  "lumbar_rib_right": {
+   "gt_cases": 16,
+   "emitted_on_gt_cases": 16,
+   "emitted_where_absent": 0,
+   "missed": []
+  },
+  "T13": {
+   "gt_cases": 0,
+   "emitted_on_gt_cases": 0,
+   "emitted_where_absent": 0,
+   "missed": []
+  }
+ }
+}

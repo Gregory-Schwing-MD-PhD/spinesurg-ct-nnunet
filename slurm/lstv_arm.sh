@@ -40,6 +40,7 @@ DRY="${DRY:-0}"
 # in accuracy rather than as an error -- the worst kind.
 case "${ARM}" in
     oneshot)     DS_ID=810; DS_NAME=SpineSurgLSTVOneShot   ;;
+    fullribs)    DS_ID=813; DS_NAME=SpineSurgLSTVFullRibs  ;;
     rib_regions) DS_ID=811; DS_NAME=SpineSurgLSTVRibRegions ;;
     countfree)   DS_ID=812; DS_NAME=SpineSurgLSTVCountFree  ;;
     *)

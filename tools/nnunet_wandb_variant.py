@@ -232,6 +232,8 @@ def _resolve_label_scheme() -> str:
         return "unmerged"
     if v in ("oneshot", "one-shot", "810", "lstv_oneshot"):
         return "oneshot"
+    if v in ("fullribs", "full-ribs", "813", "lstv_fullribs"):
+        return "fullribs"
     # Anything else (unset / "merged" / "803" / typos) -> merged (default).
     return "merged"
 
@@ -243,7 +245,7 @@ _SCHEME = _resolve_label_scheme()
 # _ANATOMY_NAMES is parallel to _FG_CLASS_IDS so that
 # _ANATOMY_NAMES[cid - 1] yields the human-readable name for the
 # foreground class with ID cid.
-if _SCHEME in ("unmerged", "oneshot"):
+if _SCHEME in ("unmerged", "oneshot", "fullribs"):
     # Dataset802 — legacy 10-class scheme; L5 and L6 are distinct.
     # Foreground class IDs are 1..9 (9 classes).
     _ANATOMY_NAMES = ["L1", "L2", "L3", "L4", "L5", "L6",
@@ -263,6 +265,21 @@ if _SCHEME in ("unmerged", "oneshot"):
     # Network output channel count under the Dataset802 label schema:
     # background + 9 foreground classes (ignore is masked, not classified).
     _DEFAULT_NUM_OUTPUT_CLASSES = 10
+elif _SCHEME == "fullribs":
+    # Dataset813 — the one-shot scheme with every rib named per side (LABEL_NAMES_FULLRIBS).
+    _ANATOMY_NAMES = (["T10", "T11", "T12", "T13", "L1", "L2", "L3", "L4", "L5", "L6", "sacrum"]
+                      + [f"rib_left_{k}" for k in range(1, 12)] + ["rib12_left", "rib13_left"]
+                      + [f"rib_right_{k}" for k in range(1, 12)] + ["rib12_right", "rib13_right"]
+                      + ["lumbar_rib_left", "lumbar_rib_right", "left_hip", "right_hip", "femur"])
+    _FG_CLASS_IDS    = list(range(1, 43))
+    _LUMBAR_IDS      = [5, 6, 7, 8, 9, 10]          # L1..L6
+    _PELVIS_IDS      = [11, 40, 41, 42]             # sacrum, hips, femur
+    _L4_LABEL_ID     = 8
+    _L5_LABEL_ID     = 9
+    _L6_LABEL_ID     = 10
+    _SACRUM_LABEL_ID = 11
+    _IGNORE_LABEL    = 43
+    _DEFAULT_NUM_OUTPUT_CLASSES = 43
 elif _SCHEME == "oneshot":
     # Dataset810 — the LSTV one-shot scheme (tools/convert_hf_to_nnunet.py,
     # LABEL_NAMES_ONESHOT): thoracic levels T10..T13 and lumbar levels L1..L6 distinct,
@@ -688,7 +705,7 @@ def _class_id_to_name(cid: int) -> str:
 # stays uncluttered. Other classes (L1-L3, hips) would be near-zero
 # noise on the relevant subgroups anyway.
 
-if _SCHEME in ("unmerged", "oneshot"):
+if _SCHEME in ("unmerged", "oneshot", "fullribs"):
     # Unmerged (Dataset802) rebuttal block: anchor on GT-L6 over lumb cases
     # and ask where those voxels get classified. The `as_L5_frac` entry is
     # THE rebuttal metric — direct multi-class classification collapses L6
@@ -768,7 +785,16 @@ def _build_ce_class_weights(num_classes: int) -> Optional[torch.Tensor]:
     if num_classes is None or num_classes <= 0:
         return None
 
-    if _SCHEME == "oneshot":
+    if _SCHEME == "fullribs":
+        # Full ribs (Dataset813): the one-shot weights, ribs one to eleven at 1.
+        weights = {0: 0.5}
+        for cid, nm in enumerate(_ANATOMY_NAMES, start=1):
+            weights[cid] = {"T12": 1.5, "T13": 2.5, "L5": 1.5, "L6": 3.0, "sacrum": 1.5,
+                            "rib12_left": 2.0, "rib12_right": 2.0,
+                            "rib13_left": 2.5, "rib13_right": 2.5,
+                            "lumbar_rib_left": 3.0, "lumbar_rib_right": 3.0}.get(nm, 1.0)
+        name_to_id = {"background": 0, **{nm: cid for cid, nm in enumerate(_ANATOMY_NAMES, start=1)}}
+    elif _SCHEME == "oneshot":
         # One-shot (Dataset810): 22 foreground channels. Boost what is rare and what the
         # benchmark exists to learn: L6, T13, the twelfth and thirteenth ribs, the lumbar
         # ribs, and the sacrum at the junction. Everything else is 1.
@@ -779,7 +805,7 @@ def _build_ce_class_weights(num_classes: int) -> Optional[torch.Tensor]:
                             "rib13_left": 2.5, "rib13_right": 2.5,
                             "lumbar_rib_left": 3.0, "lumbar_rib_right": 3.0}.get(nm, 1.0)
         name_to_id = {"background": 0, **{nm: cid for cid, nm in enumerate(_ANATOMY_NAMES, start=1)}}
-    elif _SCHEME in ("unmerged", "oneshot"):
+    elif _SCHEME in ("unmerged", "oneshot", "fullribs"):
         # Unmerged (Dataset802) — L5 and L6 are distinct channels. Restore
         # the pre-merge rare-class boost: L6 is the rare class (present only
         # on lumbarized 6-lumbar spines) and needs a strong upweight; L5 a
@@ -1160,7 +1186,9 @@ class _WandBMixin:
         label_keys = {str(k) for k in labels}
         n_fg = sum(1 for k in labels
                    if str(k).lower() not in ("ignore", "background"))
-        if "rib12_left" in label_keys or "lumbar_rib_left" in label_keys:
+        if "rib_left_1" in label_keys:
+            detected = "fullribs"
+        elif "rib12_left" in label_keys or "lumbar_rib_left" in label_keys:
             detected = "oneshot"
         elif "L6" in label_keys or n_fg == 9:
             detected = "unmerged"
@@ -1793,7 +1821,7 @@ class _WandBMixin:
         # expected ~0 because direct classification collapses L6 onto L5.
         lumb_cases = self._val_subgroup_dice.get(_SUBTYPE_LUMB, [])
         if lumb_cases:
-            if _SCHEME in ("unmerged", "oneshot"):
+            if _SCHEME in ("unmerged", "oneshot", "fullribs"):
                 ll_idx = _FG_CLASS_IDS.index(_L6_LABEL_ID)
                 ll_vals = [c[ll_idx] for c in lumb_cases if c[ll_idx] is not None]
                 if ll_vals:
@@ -1882,7 +1910,7 @@ class _WandBMixin:
         threshold = _HALLUC_VOXEL_THRESHOLD
         # The bottom lumbar class is guaranteed absent from sacr_count GT
         # (4-lumbar anatomy). Merged: last_lumbar (5). Unmerged: L6 (6).
-        if _SCHEME in ("unmerged", "oneshot"):
+        if _SCHEME in ("unmerged", "oneshot", "fullribs"):
             absent_cid = _L6_LABEL_ID
             key = "L6_specificity_on_sacr_count"
         else:
@@ -1919,7 +1947,7 @@ class _WandBMixin:
                 or self._val_subgroup_confusion_by_pred is None):
             return out
 
-        if _SCHEME in ("unmerged", "oneshot"):
+        if _SCHEME in ("unmerged", "oneshot", "fullribs"):
             # Unmerged (802) rebuttal block: GT-L6 on lumb cases, where do
             # those voxels get classified? `as_L5_frac` is THE collapse
             # evidence (GT-L6 predicted as L5).
@@ -1995,7 +2023,7 @@ class _WandBMixin:
                         cls_parts.append(f"{cn}={v:.2f}" if v is not None else f"{cn}=---")
                     self.print_to_log_file(f"  {sub} per-class: [{', '.join(cls_parts)}]")
 
-            if _SCHEME in ("unmerged", "oneshot"):
+            if _SCHEME in ("unmerged", "oneshot", "fullribs"):
                 # ── unmerged (802) rebuttal headline: L6 collapse ──────
                 l6_dice = payload.get("val/headline/L6_dice_on_lumbarization")
                 l6_n    = payload.get("val/headline/L6_n_lumbarization_cases")
@@ -2250,6 +2278,7 @@ class _WandBMixin:
             "trainer_version": "v20",
             "label_scheme": ("merged_last_lumbar" if _SCHEME == "merged"
                              else "oneshot_22class" if _SCHEME == "oneshot"
+                             else "fullribs_42class" if _SCHEME == "fullribs"
                              else "unmerged_l5_l6"),
             "label_scheme_env": _SCHEME,
             "anatomy_mapping": dict(enumerate(_ANATOMY_NAMES, start=1)),
