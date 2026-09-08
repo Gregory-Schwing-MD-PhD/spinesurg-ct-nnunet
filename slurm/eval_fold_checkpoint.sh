@@ -91,10 +91,16 @@ export XDG_RUNTIME_DIR="${SINGULARITY_TMPDIR}/runtime"
 mkdir -p "${SINGULARITY_TMPDIR}" "${XDG_RUNTIME_DIR}" "${PROJECT_ROOT}/tmp"
 trap "rm -rf ${SINGULARITY_TMPDIR}" EXIT
 
+# imagesTr holds symlinks written inside the prep container, where the HF export was bound
+# at /data/hf_export (spine_prep.sh); they dangle on the host, so bind the same route here
+HF_EXPORT_DIR="${HF_EXPORT_DIR:-${HOME}/data/CTSpinoPelvic1K}"
+[[ -d "${HF_EXPORT_DIR}/ct" ]] || { echo "ERROR: no ct/ under HF_EXPORT_DIR=${HF_EXPORT_DIR}" >&2; exit 1; }
+
 SING_BINDS=(
     --nv
     --bind "${PROJECT_ROOT}:/workspace"
     --bind "${NNUNET_NFS}:/nnunet_nfs"
+    --bind "${HF_EXPORT_DIR}:/data/hf_export"
     --bind "${WANDB_TRAINER_HOST}:${WANDB_TRAINER_CONTAINER}"
     --bind "${PROJECT_ROOT}/tools/lstv_biased_dataloader.py:${WANDB_TRAINER_CONTAINER%/*}/lstv_biased_dataloader.py"
     --pwd  /workspace
