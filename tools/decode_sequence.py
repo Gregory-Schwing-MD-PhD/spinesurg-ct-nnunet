@@ -40,6 +40,7 @@ import numpy as np
 from scipy import ndimage
 
 MIN_VOX = 300
+MIN_INSTANCE_MM3 = 2000.0   # smallest thing that can be a vertebra piece (2 cm^3)
 REACH_MM = 4.0
 THORACIC = ("T10", "T11", "T12", "T13")
 LUMBAR = ("L1", "L2", "L3", "L4", "L5", "L6")
@@ -163,31 +164,29 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
                 parts.append([piece, float(idx[:, axis].mean() * zooms[axis] * sign)])
         parts.sort(key=lambda p: -p[1])
         # fragments of ONE vertebra (a body cut off from its posterior elements by hardware,
-        # a detached spinous process) share a name and overlap in height; two bodies with
-        # the same name are stacked and do not. Merge same-name parts whose z-extents overlap
-        # by at least a third of the smaller one, or whose centroids are within 12 mm.
-        merged = []                                    # [mask, z_mm, (lo, hi) in mm]
+        # a detached spinous process) share a name and sit within half a body of each other;
+        # two bodies with the same name are a whole body apart. Height overlap is NOT the
+        # test: a vertebra's articular processes overlap the next body in height.
+        merged = []                                    # [mask, z_mm]
         for m, z in parts:
-            lo, hi = _height_vox(m, axis)
-            ext = (lo * zooms[axis], (hi + 1) * zooms[axis])
-            hit = None
-            for g in merged:
-                ov = min(ext[1], g[2][1]) - max(ext[0], g[2][0])
-                small = min(ext[1] - ext[0], g[2][1] - g[2][0])
-                if abs(g[1] - z) < 12.0 or (small > 0 and ov >= 0.33 * small):
-                    hit = g; break
+            hit = next((g for g in merged if abs(g[1] - z) < 0.5 * body_mm), None)
             if hit is not None:
                 hit[0] |= m
                 idx = np.argwhere(hit[0])
                 hit[1] = float(idx[:, axis].mean() * zooms[axis] * sign)
-                hit[2] = (min(ext[0], hit[2][0]), max(ext[1], hit[2][1]))
             else:
-                merged.append([m, z, ext])
-        comps += [(vid, m, z) for m, z, _ in merged]
+                merged.append([m, z])
+        comps += [(vid, m, z) for m, z in merged]
+    # an instance must be a piece of bone, not a speck: at least MIN_INSTANCE_MM3, and at
+    # least a fifth of this case's median instance (label noise at another level otherwise
+    # becomes a vertebra)
+    vox_mm3 = float(np.prod(zooms))
+    vols = [int(m.sum()) * vox_mm3 for _, m, _ in comps]
+    floor_mm3 = max(MIN_INSTANCE_MM3, 0.2 * float(np.median(vols))) if vols else MIN_INSTANCE_MM3
     inst = []
     for vid, m, z_mm in comps:
         nv = int(m.sum())
-        if nv < MIN_VOX:
+        if nv < MIN_VOX or nv * vox_mm3 < floor_mm3:
             continue
         if probs is None:                                          # one-hot: e_vid
             mean_p = np.zeros(n_classes, dtype=np.float32); mean_p[vid] = 1.0
