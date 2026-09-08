@@ -118,10 +118,14 @@ def analyse(lab_path: Path, shapes_mm: dict) -> dict:
 
 
 def render(lab_path: Path, shapes_mm: dict, out_png: Path) -> None:
+    """Coronal and sagittal projections of the labels with the three windows to scale.
+    The column axis is always vertical with superior up; windows are centred on the column
+    at the middle of the labelled spine (top row) and at the lumbosacral junction (bottom)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
+    plt.rcParams.update({"font.family": "sans-serif", "font.size": 8})
     img = nib.load(str(lab_path))
     lab = np.asanyarray(img.dataobj).astype(np.int16)
     zooms = np.asarray(img.header.get_zooms()[:3], float)
@@ -129,35 +133,41 @@ def render(lab_path: Path, shapes_mm: dict, out_png: Path) -> None:
     others = [i for i in range(3) if i != axis]
     vert = np.isin(lab, VERT)
     idx = np.argwhere(vert)
-    centre = idx.mean(0); lo, hi = idx[:, axis].min(), idx[:, axis].max(); centre[axis] = (lo + hi) / 2
-    # two projections through the label volume: along each of the two in-plane axes
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 4.2))
+    lo, hi = idx[:, axis].min(), idx[:, axis].max()
+    centre = idx.mean(0); centre[axis] = (lo + hi) / 2
+    sac = np.argwhere(np.isin(lab, SACRUM))
+    sac_top = (sac[:, axis].max() if sign > 0 else sac[:, axis].min()) if len(sac) else None
     styles = [("#1f4e79", "-"), ("#c0392b", "-"), ("#7f8c8d", "--")]
-    for ax, proj_axis in zip(axes, others):
-        keep = [i for i in range(3) if i != proj_axis]        # axes shown: one in-plane + the column
-        mip = (lab > 0).max(axis=proj_axis).astype(float)
-        vmip = vert.max(axis=proj_axis).astype(float)
-        show = mip * 0.35 + vmip * 0.65
-        # orient: column vertical, superior up
-        if keep.index(axis) == 0:
-            show = show.T; h_ax, w_ax = axis, keep[1]
-        else:
-            h_ax, w_ax = axis, keep[0]
-        if sign < 0:
-            pass
-        extent = [0, show.shape[1] * zooms[w_ax], 0, show.shape[0] * zooms[h_ax]]
-        ax.imshow(show, cmap="gray_r", origin="lower" if sign > 0 else "upper", extent=extent, aspect="equal", interpolation="nearest")
-        cy = centre[h_ax] * zooms[h_ax]; cx = centre[w_ax] * zooms[w_ax]
-        if sign < 0:
-            cy = show.shape[0] * zooms[h_ax] - cy
-        for (name, mm), (col, ls) in zip(shapes_mm.items(), styles):
-            wmm = mm[1 + others.index(w_ax)]; hmm = mm[0]
-            ax.add_patch(Rectangle((cx - wmm / 2, cy - hmm / 2), wmm, hmm, fill=False, ec=col, ls=ls, lw=1.4, label=name))
-        ax.set_xlabel("mm"); ax.set_ylabel("mm")
-        ax.set_title("coronal" if proj_axis != others[0] else "sagittal", loc="left", fontsize=9)
-        ax.grid(False)
-    axes[0].legend(frameon=False, fontsize=7, loc="lower left")
-    fig.suptitle("one training patch of each shape, centred on the column (labels, projected)", fontsize=9)
+    fig, axes = plt.subplots(2, 2, figsize=(7.2, 7.6))
+    for row, (mode, title) in enumerate((("mid", "window centred on the column"), ("ls", "window on the lumbosacral junction"))):
+        for ax, proj_axis in zip(axes[row], others):
+            w_ax = [i for i in others if i != proj_axis][0]
+            body = np.isin(lab, SACRUM + HIPS + list(range(34, 62))).max(axis=proj_axis).astype(float)
+            vmip = vert.max(axis=proj_axis).astype(float)
+            show = body * 0.3 + vmip * 0.7
+            kept = [i for i in range(3) if i != proj_axis]          # array axes of `show`
+            if kept.index(axis) == 1:                              # column must be the row axis
+                show = show.T
+            n_rows = show.shape[0]
+            if sign < 0:                                           # superior at high row index -> flip
+                show = show[::-1]
+            extent = [0, show.shape[1] * zooms[w_ax], 0, n_rows * zooms[axis]]
+            ax.imshow(show, cmap="gray_r", origin="lower", extent=extent, aspect="equal", interpolation="nearest", vmin=0, vmax=1)
+            def to_mm_y(row_idx):
+                return (row_idx if sign > 0 else (n_rows - 1 - row_idx)) * zooms[axis]
+            cx = centre[w_ax] * zooms[w_ax]
+            for (name, mm), (col, ls) in zip(shapes_mm.items(), styles):
+                wmm = mm[1 + others.index(w_ax)]; hmm = mm[0]
+                if mode == "mid" or sac_top is None:
+                    cy = to_mm_y(centre[axis])
+                else:
+                    cy = to_mm_y(sac_top) - 30.0 + hmm / 2         # lower edge 3 cm below the sacral top
+                ax.add_patch(Rectangle((cx - wmm / 2, cy - hmm / 2), wmm, hmm, fill=False, ec=col, ls=ls, lw=1.3, label=name.replace("p", "").replace("x", " × ")))
+            ax.set_xlabel("mm"); ax.set_ylabel("mm")
+            ax.set_title(("sagittal" if w_ax != others[0] else "coronal") + ", " + title, loc="left", fontsize=8)
+            ax.grid(False)
+    axes[0][0].legend(frameon=False, fontsize=7, loc="lower left", title="patch, voxels", title_fontsize=7)
+    fig.suptitle("what one training patch of each shape sees (labels projected; case " + lab_path.name.split("_")[0] + ")", fontsize=9)
     fig.tight_layout()
     fig.savefig(out_png, dpi=200); fig.savefig(out_png.with_suffix(".pdf"))
 
@@ -170,6 +180,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--render", default="0376")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--render_only", action="store_true")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     shapes_mm = {}
@@ -177,6 +188,8 @@ def main() -> int:
         v = [int(x) for x in s.split(",")]
         shapes_mm["p" + "x".join(map(str, v))] = (v[0] * SPACING[0], v[1] * SPACING[1], v[2] * SPACING[2])
     (a.out / "shapes_mm.json").write_text(json.dumps(shapes_mm, indent=1))
+    if a.render_only:
+        render(a.labels / f"{a.render}_label.nii.gz", shapes_mm, a.out / f"fig_patch_context_{a.render}.png"); print("rendered", a.render); return 0
     files = sorted(a.labels.glob("*_label.nii.gz"))
     if a.limit:
         files = files[: a.limit]
