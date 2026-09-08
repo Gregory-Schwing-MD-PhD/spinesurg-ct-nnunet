@@ -71,11 +71,17 @@ def predict_ribs(cases: list[dict], work: Path, model_dir: Path, folds: tuple[in
 def measure(case: str, rib_path: Path, vert_path: Path, sem_path: Path, out_dir: Path, calc_orientation: bool) -> list[dict]:
     from TPTBox import NII
     from run import run_all_steps                       # ~/rib-segmentation/run.py, his orchestration
+    from instance_rib_assignment.assign_ribs_to_vert import assign_ribs_to_vert_segmentation
     rib = NII.load(str(rib_path), seg=True)
     vert = NII.load(str(vert_path), seg=True)
     sem = NII.load(str(sem_path), seg=True)
     if rib.shape != vert.shape:                         # nnU-Net writes on the CT grid, SPINEPS on its own
         rib = rib.resample_from_to(vert)
+    # his assignment step once on its own, so the two combined masks are kept on disk
+    # (ribs carrying Vertebra_Instance.RIB ids; sides as Location.Rib_Left/Right)
+    sem_seg, inst_seg = assign_ribs_to_vert_segmentation(rib.copy(), vert.copy(), sem.copy(), verbose=False)
+    inst_seg.save(str(out_dir / f"{case}_rib-inst_msk.nii.gz"), verbose=False)
+    sem_seg.save(str(out_dir / f"{case}_rib-sem_msk.nii.gz"), verbose=False)
     results = run_all_steps(rib, vert, sem, poi=None, calc_orientation=calc_orientation, verbose=False)
     rows = []
     for d in results:

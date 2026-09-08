@@ -47,6 +47,10 @@ echo "score ${SYSTEM}: preds ${PRED_DIR} (${PATTERN}) $(date)"
 if [[ "${NAME_MAP}" == "identity" ]]; then
     # already in the one-shot space (our own network): score in place
     ONESHOT="${PRED_DIR}"
+elif [[ "${SYSTEM}" == spineps* ]]; then
+    # vertebra instances + Möller's rib assignment composed into one volume per case
+    run python /workspace/benchmark/spineps_to_oneshot.py --cases "${CASES}" --native "${PRED_DIR}" \
+        --ribs "${RIBS_DIR:-${BENCH}/spineps/ribs}" --dataset_json "${DS}/dataset.json" --out_dir "${ONESHOT}" || exit 1
 else
     CM=(); [[ -n "${CLASS_MAP}" ]] && CM=(--class_map "${CLASS_MAP}")
     run python /workspace/benchmark/to_oneshot.py --cases "${CASES}" --pred_dir "${PRED_DIR}" \
