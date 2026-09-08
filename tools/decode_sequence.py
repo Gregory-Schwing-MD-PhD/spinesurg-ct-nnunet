@@ -169,24 +169,28 @@ def decode_case(pred_path: Path, npz_path: Path | None, names: dict[str, int], g
             # (an L6 called L5 next to the true L5, or a competitor with no L6 class). The
             # sequence would then be one body short, so a component much taller than this
             # case's typical body is split at the waists of its craniocaudal area profile.
-            for piece in split_tall_component(m, axis, zooms, body_mm, med_vol):
+            pieces = split_tall_component(m, axis, zooms, body_mm, med_vol)
+            for piece in pieces:
                 idx = np.argwhere(piece)
-                parts.append([piece, float(idx[:, axis].mean() * zooms[axis] * sign)])
+                parts.append([piece, float(idx[:, axis].mean() * zooms[axis] * sign), len(pieces) > 1])
         parts.sort(key=lambda p: -p[1])
         # fragments of ONE vertebra (a body cut off from its posterior elements by hardware,
         # a detached spinous process) share a name and sit within half a body of each other;
         # two bodies with the same name are a whole body apart. Height overlap is NOT the
         # test: a vertebra's articular processes overlap the next body in height.
-        merged = []                                    # [mask, z_mm]
-        for m, z in parts:
-            hit = next((g for g in merged if abs(g[1] - z) < 0.5 * body_mm), None)
+        # Pieces that came out of a split are two bodies by construction and are never
+        # re-merged (on a tilted spine their projected centroids can sit closer than half a
+        # body: 1053 in the self-test).
+        merged = []                                    # [mask, z_mm, from_split]
+        for m, z, split in parts:
+            hit = None if split else next((g for g in merged if not g[2] and abs(g[1] - z) < 0.5 * body_mm), None)
             if hit is not None:
                 hit[0] |= m
                 idx = np.argwhere(hit[0])
                 hit[1] = float(idx[:, axis].mean() * zooms[axis] * sign)
             else:
-                merged.append([m, z])
-        comps += [(vid, m, z) for m, z in merged]
+                merged.append([m, z, split])
+        comps += [(vid, m, z) for m, z, _ in merged]
     # an instance must be a piece of bone, not a speck: at least MIN_INSTANCE_MM3, and at
     # least a fifth of this case's median instance (label noise at another level otherwise
     # becomes a vertebra)
