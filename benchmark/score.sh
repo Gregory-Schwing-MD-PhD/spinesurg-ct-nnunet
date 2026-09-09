@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --time=14:00:00
 #SBATCH --output=logs/bench_score_%j.out
 #SBATCH --error=logs/bench_score_%j.err
 #
