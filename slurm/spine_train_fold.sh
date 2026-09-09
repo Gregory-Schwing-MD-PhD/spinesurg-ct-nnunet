@@ -134,7 +134,14 @@ WANDB_API_KEY=""
 # terabyte once nnU-Net unpacks it; two folds on one GPU node filled /tmp and both died at
 # container start (2026-09-07). With the .npy unpacked once by slurm/unpack_dataset.sh, the
 # trainer memory-maps patches from NFS and copies nothing.
-STAGE_LOCAL="${STAGE_LOCAL:-0}"
+STAGE_LOCAL="${STAGE_LOCAL:-0}"; STAGE_LOCAL_REQUESTED="${STAGE_LOCAL}"
+if [[ "${STAGE_LOCAL}" == "auto" ]]; then
+    # stage only if this node can hold one unpacked copy (~1.1 TB) with margin; a second
+    # staged fold on the same node would fill /tmp and kill both
+    free_gb=$(( $(df -k --output=avail /tmp | tail -1) / 1024 / 1024 ))
+    if [[ ${free_gb} -ge 1300 ]]; then STAGE_LOCAL=1; else STAGE_LOCAL=0; fi
+    echo "[fold ${FOLD}] STAGE_LOCAL=auto -> ${STAGE_LOCAL} (/tmp free ${free_gb} GB)"
+fi
 if [[ "${STAGE_LOCAL}" == "1" ]]; then
     if [[ -n "${SLURM_TMPDIR:-}" && -d "${SLURM_TMPDIR}" ]]; then
         LOCAL_SCRATCH="${SLURM_TMPDIR}"
@@ -168,7 +175,11 @@ else
 fi
 
 # ----- Singularity env ------------------------------------------------------
-export SINGULARITYENV_TMPDIR="/workspace/tmp"
+# Python multiprocessing puts its listener sockets under TMPDIR; on NFS (/workspace/tmp)
+# they vanished mid-run and every augmentation worker died (all four Dataset810 folds,
+# 2026-09-08). Node-local, per job.
+JOB_TMP="/tmp/${USER}_job_${SLURM_JOB_ID}_f${FOLD}_tmp"; mkdir -p "${JOB_TMP}"
+export SINGULARITYENV_TMPDIR="${JOB_TMP}"
 export SINGULARITYENV_nnUNet_raw="/nnunet_local/raw"
 export SINGULARITYENV_nnUNet_preprocessed="/nnunet_local/preprocessed"
 export SINGULARITYENV_nnUNet_results="/nnunet_nfs/results"
@@ -192,7 +203,7 @@ export OMP_NUM_THREADS=4
 export SINGULARITY_TMPDIR="/tmp/${USER}_job_${SLURM_JOB_ID}_f${FOLD}_singularity"
 export XDG_RUNTIME_DIR="${SINGULARITY_TMPDIR}/runtime"
 mkdir -p "${SINGULARITY_TMPDIR}" "${XDG_RUNTIME_DIR}"
-trap "rm -rf ${SINGULARITY_TMPDIR}" EXIT
+trap "rm -rf ${SINGULARITY_TMPDIR} ${JOB_TMP}" EXIT
 
 SING_BINDS=(
     --nv
@@ -235,7 +246,21 @@ singularity exec "${SING_BINDS[@]}" "${CONTAINER}" \
         --npz \
         ${RESUME_FLAG} &
 TRAIN_PID=$!
-wait "${TRAIN_PID}"
+wait "${TRAIN_PID}"; TRAIN_RC=$?
+
+# A crash that is not ours (worker death, NFS hiccup, node event) must not cost the run:
+# resubmit to resume from checkpoint_latest.pth, up to RETRY_MAX times.
+RETRY="${RETRY:-0}"; RETRY_MAX="${RETRY_MAX:-6}"
+if [[ ${TRAIN_RC} -ne 0 && ! -f "${FINAL_CKPT}" ]]; then
+    if [[ ${RETRY} -lt ${RETRY_MAX} ]]; then
+        echo "[fold ${FOLD}] training exited ${TRAIN_RC} at $(date); resubmitting (retry $((RETRY+1))/${RETRY_MAX}) to resume"
+        cd "${PROJECT_ROOT}"
+        sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}",SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-merged}",STAGE_LOCAL="${STAGE_LOCAL_REQUESTED:-0}",PLANS_OVERRIDE="${PLANS_OVERRIDE:-}",RETRY=$((RETRY+1))             slurm/spine_train_fold.sh
+        exit ${TRAIN_RC}
+    fi
+    echo "[fold ${FOLD}] training exited ${TRAIN_RC} and retries are exhausted" >&2
+    exit ${TRAIN_RC}
+fi
 
 # If we got here, training completed (otherwise nnUNetv2_train would have
 # exited non-zero and set -e would have killed us). Final checkpoint should
