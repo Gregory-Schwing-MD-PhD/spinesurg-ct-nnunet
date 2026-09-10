@@ -177,8 +177,24 @@ fi
 # ----- Singularity env ------------------------------------------------------
 # Python multiprocessing puts its listener sockets under TMPDIR; on NFS (/workspace/tmp)
 # they vanished mid-run and every augmentation worker died (all four Dataset810 folds,
-# 2026-09-08). Node-local, per job.
-JOB_TMP="/tmp/${USER}_job_${SLURM_JOB_ID}_f${FOLD}_tmp"; mkdir -p "${JOB_TMP}"
+# 2026-09-08). Node-local fixed that -- and then node-local /tmp did the SAME THING on
+# 2026-09-10: folds 40179767 and 40179768, both on msa1, died within one minute of each
+# other at 18h45m and epoch 67 of 500, with
+#     FileNotFoundError: .../pymp-XXXX/listener-YYYY
+# That is not a full disk (761 GB were free); the socket was DELETED. It is created once
+# at startup and never touched again, so any /tmp cleaner with a threshold shorter than
+# the run length removes it and every augmentation worker dies at once.
+#
+# /dev/shm is node-local, RAM-backed and not swept by tmp cleaners. The sockets are a few
+# kilobytes, so this costs nothing against the job's memory. /tmp stays the fallback, and
+# the keep-alive below touches both trees hourly so a cleaner that goes by access time
+# leaves them alone.
+if [[ -d /dev/shm && -w /dev/shm ]]; then
+    JOB_TMP="/dev/shm/${USER}_job_${SLURM_JOB_ID}_f${FOLD}_tmp"
+else
+    JOB_TMP="/tmp/${USER}_job_${SLURM_JOB_ID}_f${FOLD}_tmp"
+fi
+mkdir -p "${JOB_TMP}"
 export SINGULARITYENV_TMPDIR="${JOB_TMP}"
 export SINGULARITYENV_nnUNet_raw="/nnunet_local/raw"
 export SINGULARITYENV_nnUNet_preprocessed="/nnunet_local/preprocessed"
@@ -204,6 +220,17 @@ export SINGULARITY_TMPDIR="/tmp/${USER}_job_${SLURM_JOB_ID}_f${FOLD}_singularity
 export XDG_RUNTIME_DIR="${SINGULARITY_TMPDIR}/runtime"
 mkdir -p "${SINGULARITY_TMPDIR}" "${XDG_RUNTIME_DIR}"
 trap "rm -rf ${SINGULARITY_TMPDIR} ${JOB_TMP}" EXIT
+
+# Keep-alive: re-touch every file in both temp trees hourly, so a cleaner that reaps by
+# access or modification time never sees them go stale. Belt and braces beside /dev/shm,
+# and the only protection SINGULARITY_TMPDIR has, since that must stay on /tmp.
+(
+  while sleep 3600; do
+    find "${JOB_TMP}" "${SINGULARITY_TMPDIR}" -mindepth 0 -exec touch -a -m {} + 2>/dev/null || true
+  done
+) &
+TMP_KEEPALIVE_PID=$!
+trap "kill ${TMP_KEEPALIVE_PID} 2>/dev/null; rm -rf ${SINGULARITY_TMPDIR} ${JOB_TMP}" EXIT
 
 SING_BINDS=(
     --nv
