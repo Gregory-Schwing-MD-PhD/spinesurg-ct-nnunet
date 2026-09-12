@@ -245,7 +245,13 @@ _SCHEME = _resolve_label_scheme()
 # _ANATOMY_NAMES is parallel to _FG_CLASS_IDS so that
 # _ANATOMY_NAMES[cid - 1] yields the human-readable name for the
 # foreground class with ID cid.
-if _SCHEME in ("unmerged", "oneshot", "fullribs"):
+# ONE SCHEME PER BRANCH, and the guard below is what keeps it that way. This test used
+# to read `in ("unmerged", "oneshot", "fullribs")`, which swallowed the two schemes
+# that have their own blocks further down and scored Dataset813 with Dataset802's
+# nine-class constants: label 6 (L2) answered to the name L6, and label 10 -- L6
+# itself -- answered to _IGNORE_LABEL, so every L6 voxel was masked out before the
+# per-case dice was taken. The L6 headline reported L2 for the whole run.
+if _SCHEME == "unmerged":
     # Dataset802 — legacy 10-class scheme; L5 and L6 are distinct.
     # Foreground class IDs are 1..9 (9 classes).
     _ANATOMY_NAMES = ["L1", "L2", "L3", "L4", "L5", "L6",

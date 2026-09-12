@@ -15,6 +15,10 @@ They assert:
     last_lumbar, ignore=9, 9 output channels) — backward compatible.
   * unmerged                  -> the unmerged Dataset802 constants (9 fg,
     distinct L5 and L6, ignore=10, 10 output channels).
+  * oneshot                   -> the Dataset810 constants (22 fg, ignore=23).
+  * fullribs                  -> the Dataset813 constants (43 fg, ignore=44).
+  * and that no two scheme names resolve to the SAME constants, which is what
+    a branch guard swallowing a scheme looks like from the outside.
 
 No GPU, no nnU-Net trainer instantiation. If torch / nnunetv2 are not
 installed in the test environment, the child stubs them with the minimal
@@ -95,6 +99,8 @@ out = {
     "has_last_lumbar_id": hasattr(m, "_LAST_LUMBAR_LABEL_ID"),
     "has_l5_id": hasattr(m, "_L5_LABEL_ID"),
     "has_l6_id": hasattr(m, "_L6_LABEL_ID"),
+    "l6_id": getattr(m, "_L6_LABEL_ID", None),
+    "l5_id": getattr(m, "_L5_LABEL_ID", None),
 }
 print("JSON_BEGIN" + json.dumps(out) + "JSON_END")
 """
@@ -170,6 +176,79 @@ def test_unmerged_constants():
 
 def test_802_alias_selects_unmerged():
     assert _import_under_scheme("802")["scheme"] == "unmerged"
+
+
+
+# ── oneshot (Dataset810) and fullribs (Dataset813) ─────────────────────────
+# These two had constant blocks but no tests, and the branch guard above them
+# listed all three non-merged schemes, so both blocks were dead: Dataset813 was
+# scored with Dataset802's nine classes. Label 6 (L2) answered to the name L6
+# and label 10 -- L6 itself -- answered to _IGNORE_LABEL, so every L6 voxel was
+# masked out before the per-case dice was taken.
+
+def test_fullribs_constants():
+    c = _import_under_scheme("fullribs")
+    assert c["scheme"] == "fullribs"
+    assert c["fg_class_ids"] == list(range(1, 44))
+    assert c["lumbar_ids"] == [5, 6, 7, 8, 9, 10]
+    assert c["pelvis_ids"] == [11, 40, 41, 42]
+    assert c["sacrum_id"] == 11
+    assert c["ignore_label"] == 44
+    assert c["num_output_classes"] == 44
+    # the headline metric must point at the class actually called L6
+    assert c["l6_id"] == 10
+    assert c["anatomy_names"][c["fg_class_ids"].index(c["l6_id"])] == "L6"
+    # ... and the ignore label must not be a real class
+    assert c["ignore_label"] not in c["fg_class_ids"]
+
+
+def test_oneshot_constants():
+    c = _import_under_scheme("oneshot")
+    assert c["scheme"] == "oneshot"
+    assert c["fg_class_ids"] == list(range(1, 23))
+    assert c["lumbar_ids"] == [5, 6, 7, 8, 9, 10]
+    assert c["sacrum_id"] == 11
+    assert c["ignore_label"] == 23
+    assert c["num_output_classes"] == 23
+    assert c["l6_id"] == 10
+    assert c["anatomy_names"][c["fg_class_ids"].index(c["l6_id"])] == "L6"
+
+
+def test_813_and_810_aliases():
+    assert _import_under_scheme("813")["scheme"] == "fullribs"
+    assert _import_under_scheme("810")["scheme"] == "oneshot"
+
+
+def test_every_scheme_resolves_to_its_own_constants():
+    """No two scheme names may produce the same constants.
+
+    This is the shape of the bug that hid for a whole training run: a branch
+    guard listing several schemes swallows the ones with their own blocks
+    below, and they all silently inherit the first block's label ids. Nothing
+    raises -- the numbers are finite and plausible, they just describe a
+    different bone.
+    """
+    schemes = ["merged", "unmerged", "oneshot", "fullribs"]
+    seen = {}
+    for name in schemes:
+        c = _import_under_scheme(name)
+        key = (tuple(c["fg_class_ids"]), c["ignore_label"], c["sacrum_id"])
+        assert key not in seen, (
+            f"{name!r} resolves to the same constants as {seen[key]!r}: "
+            f"{len(c['fg_class_ids'])} fg classes, ignore={c['ignore_label']}. "
+            f"A branch guard is swallowing one of them."
+        )
+        seen[key] = name
+
+
+def test_anatomy_names_parallel_to_class_ids():
+    """_ANATOMY_NAMES[i] names _FG_CLASS_IDS[i]; a mismatch renames every class."""
+    for name in ["merged", "unmerged", "oneshot", "fullribs"]:
+        c = _import_under_scheme(name)
+        assert len(c["anatomy_names"]) == len(c["fg_class_ids"]), (
+            f"{name}: {len(c['anatomy_names'])} names for "
+            f"{len(c['fg_class_ids'])} classes"
+        )
 
 
 if __name__ == "__main__":
