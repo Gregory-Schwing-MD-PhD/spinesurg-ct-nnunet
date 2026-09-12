@@ -240,6 +240,26 @@ def _resolve_label_scheme() -> str:
 
 _SCHEME = _resolve_label_scheme()
 
+# Vertebra-level integrity metrics (tools/level_integrity.py). Optional: a missing module
+# must not take a training run down, so an import failure disables the block and says so.
+try:
+    import level_integrity as _LEVEL_INTEGRITY             # type: ignore
+except Exception:                                          # noqa: BLE001
+    # The plain import above is the real path: slurm/spine_train_fold.sh binds the repo at
+    # /workspace and sets PYTHONPATH=/workspace/tools. This fallback is for running the
+    # module outside that job. It cannot help inside the container -- a bind mount makes the
+    # container path the real one -- so a failure here just disables the block.
+    try:
+        import importlib.util as _ilu
+        import os as _os
+        _p = _os.path.join(_os.path.dirname(_os.path.realpath(__file__)),
+                           "level_integrity.py")
+        _spec = _ilu.spec_from_file_location("level_integrity", _p)
+        _LEVEL_INTEGRITY = _ilu.module_from_spec(_spec)     # type: ignore
+        _spec.loader.exec_module(_LEVEL_INTEGRITY)          # type: ignore
+    except Exception:                                       # noqa: BLE001
+        _LEVEL_INTEGRITY = None
+
 
 # ── Anatomy constants (scheme-dependent; finalized at import time) ─────────
 # _ANATOMY_NAMES is parallel to _FG_CLASS_IDS so that
@@ -547,6 +567,14 @@ def _scan_lstv_case_ids_by_last_lumbar_voxels(labels_dir: str) -> Set[str]:
 
 
 # ── Per-case dice / voxel-count helpers ──────────────────────────────────────
+
+# id -> human name, so every integrity line names a vertebra instead of an integer. Built
+# from the scheme constants rather than hard-coded, which is what went wrong last time.
+_LEVEL_NAMES = {cid: _ANATOMY_NAMES[i] for i, cid in enumerate(_FG_CLASS_IDS)
+                if i < len(_ANATOMY_NAMES)}
+# The merged scheme has no L6 to focus on; resolved once here rather than raising per case.
+_LEVEL_FOCUS_ID = globals().get("_L6_LABEL_ID")
+
 
 def _per_case_dice_per_class(pred_argmax: torch.Tensor, gt: torch.Tensor,
                               ignore_label: int = _IGNORE_LABEL) -> List[Optional[float]]:
@@ -1720,6 +1748,7 @@ class _WandBMixin:
 
     def _reset_subgroup_dice_buffer(self):
         self._val_subgroup_dice = {sub: [] for sub in _KNOWN_SUBTYPES}
+        self._val_level_integrity = []
         self._val_subgroup_voxels = {sub: [] for sub in _KNOWN_SUBTYPES}
         self._val_subgroup_confusion_by_gt = {sub: [] for sub in _KNOWN_SUBTYPES}
         self._val_subgroup_confusion_by_pred = {sub: [] for sub in _KNOWN_SUBTYPES}
@@ -1767,6 +1796,19 @@ class _WandBMixin:
                 confusion_by_pred = _per_case_confusion_by_pred(
                     pred_b, gt_b, num_classes=num_classes)
                 self._val_subgroup_dice.setdefault(subtype, []).append(dice_per_cls)
+                # IS EACH VERTEBRA ONE NAME, AND EACH NAME ONE VERTEBRA? Dice answers
+                # neither. Same patch, same argmax, same target -- a separate question.
+                if (_LEVEL_INTEGRITY is not None and _LUMBAR_IDS
+                        and _LEVEL_FOCUS_ID is not None):
+                    try:
+                        rep = _LEVEL_INTEGRITY.report(
+                            pred_b.numpy(), gt_b.numpy(), _LUMBAR_IDS,
+                            _LEVEL_FOCUS_ID, _LEVEL_NAMES)
+                        rep["_case"] = cid_lookup
+                        rep["_subtype"] = subtype
+                        self._val_level_integrity.append(rep)
+                    except Exception as exc:                      # noqa: BLE001
+                        self.print_to_log_file(f"level integrity: {cid_lookup}: {exc}")
                 self._val_subgroup_voxels.setdefault(subtype, []).append(voxels_per_cls)
                 if self._val_subgroup_confusion_by_gt is None:
                     self._val_subgroup_confusion_by_gt = {s: [] for s in _KNOWN_SUBTYPES}
@@ -1777,6 +1819,79 @@ class _WandBMixin:
         except Exception as exc:
             try: self.print_to_log_file(f"per-subgroup dice: batch failed: {exc}")
             except Exception: pass
+
+    def _log_level_integrity(self, epoch: int) -> Dict[str, float]:
+        """Say, in words, whether the levels came out as levels.
+
+        Three failures that per-class dice cannot show, and that this project cares about
+        more than it cares about dice:
+
+          COLLAPSE  a class's voxels are wholly taken by another -- reported with the name
+                    of the class that took them, not against a fixed list of suspects.
+          SMEAR     one ground-truth body carrying two predicted names. Both names score
+                    about 0.5 and look like a model that needs more epochs.
+          MERGE     one predicted name covering two bodies. decode_sequence has a stop-gap
+                    (split_tall_component); whether it had to fire is worth knowing.
+
+        And the count: how many distinct lumbar names were used for the bodies present.
+        Five names for six bodies is the failure this dataset exists to expose, so it is
+        printed as a sentence rather than left to be inferred.
+        """
+        reps = getattr(self, "_val_level_integrity", None)
+        if _LEVEL_INTEGRITY is None:
+            self.print_to_log_file(
+                "  --- level integrity: tools/level_integrity.py not importable ---")
+            return {}
+        if not reps:
+            return {}
+        agg = _LEVEL_INTEGRITY.aggregate(reps)
+        self.print_to_log_file(f"  --- level integrity (epoch {epoch}) ---")
+        n_bodies = sum(r["purity"]["n_bodies"] for r in reps)
+        n_smear  = sum(r["purity"]["n_smeared"] for r in reps)
+        n_merge  = sum(r["spread"]["n_merged"] for r in reps)
+        wrong    = [r for r in reps if r["count"]["deficit"]]
+        self.print_to_log_file(
+            f"    bodies whole      : {n_bodies - n_smear} of {n_bodies}"
+            f"   (mean purity {agg.get('level_integrity/mean_body_purity', float('nan')):.3f})")
+        self.print_to_log_file(
+            f"    SMEARED bodies    : {n_smear}"
+            + ("   <-- one vertebra carrying two level names" if n_smear else ""))
+        self.print_to_log_file(
+            f"    MERGED names      : {n_merge}"
+            + ("   <-- one level name covering two vertebrae" if n_merge else ""))
+        self.print_to_log_file(
+            f"    count wrong       : {len(wrong)} of {len(reps)} cases"
+            + ("   <-- fewer level names than vertebrae" if wrong else ""))
+        foc = [r["collapse"] for r in reps if r["collapse"].get("present")]
+        if foc:
+            self_f = sum(c["self_frac"] for c in foc) / len(foc)
+            self.print_to_log_file(
+                f"    L6 kept its name  : {100*self_f:.1f}% of L6 voxels  (n={len(foc)} cases)")
+            tally: Dict[str, float] = {}
+            for c in foc:
+                if c["top_other"]:
+                    tally[c["top_other"]["name"]] = tally.get(c["top_other"]["name"], 0.0) + c["top_other"]["frac"]
+            for name, tot in sorted(tally.items(), key=lambda kv: -kv[1])[:3]:
+                self.print_to_log_file(
+                    f"        taken by {name:<10s}: {100*tot/len(foc):.1f}% of L6 voxels"
+                    + ("   <-- COLLAPSE" if tot / len(foc) >= 0.30 else ""))
+        # a few named examples, so a number can be traced to a case
+        shown = 0
+        for r in reps:
+            for b in r["purity"]["smeared"][:1]:
+                self.print_to_log_file(
+                    f"        SMEAR {r['_case']}: {b['name']} is "
+                    f"{100*b['purity']:.0f}% {b['modal_name']} / "
+                    f"{100*b['second_frac']:.0f}% {b['second_name']}")
+                shown += 1
+            for m in r["spread"]["merged"][:1]:
+                self.print_to_log_file(
+                    f"        MERGE {r['_case']}: {m['pred_name']} covers "
+                    f"{', '.join(m['covers_names'])}")
+                shown += 1
+            if shown >= 6:
+                break
+        return agg
 
     def _aggregate_subgroup_dice(self) -> Dict[str, float]:
         """Aggregate per-class dice across val cases per subgroup.
@@ -2057,6 +2172,7 @@ class _WandBMixin:
                         f"= {spec:.3f}  (n_absent={int(spec_n)}{mean_str})  "
                         f"[higher is better; 1.0 = no hallucination]")
 
+                self._log_level_integrity(epoch)
                 self.print_to_log_file(
                     "  --- unmerged confusion block (L6 collapse) ---")
                 self._print_confusion_block(
@@ -2632,7 +2748,36 @@ class _LSTVOversampleMixin:
         if p >= frac:
             self.print_to_log_file(f"LSTV oversample: natural frac {p:.3f} >= target {frac:.3f}"); return
         needed = max(1, int(round((frac * original_n - len(lstv_in_keys)) / (1.0 - frac))))
-        duplicates = [lstv_in_keys[i % len(lstv_in_keys)] for i in range(needed)]
+        # WHICH LSTV CASES GET DUPLICATED, not merely how many. The pool holds five
+        # subtypes and the quota was filled round-robin across all of them, so
+        # lumbarization -- the ONLY subtype that carries an L6 -- received its
+        # proportional share and no more. Measured on job 40200882 that left 2 to 7 of
+        # 306 forced-foreground patches per epoch on an L6, and L6 scored exactly 0.0000
+        # for 37 consecutive epochs while every other lumbar level passed 0.84. The
+        # weight lets lumbarization be drawn above its share without changing the overall
+        # LSTV fraction. Default 1.0 reproduces the previous behaviour exactly.
+        lumb_w = _env_float("SPINESURG_LUMB_DUP_WEIGHT", 1.0)
+        cycle = lstv_in_keys
+        if lumb_w > 1.0:
+            rep = max(1, int(round(lumb_w)))
+            cycle = []
+            n_lumb = 0
+            for k in lstv_in_keys:
+                try: is_lumb = self._subtype_for_case(k) == _SUBTYPE_LUMB
+                except Exception: is_lumb = False
+                cycle.extend([k] * (rep if is_lumb else 1))
+                n_lumb += 1 if is_lumb else 0
+            if n_lumb == 0:
+                cycle = lstv_in_keys
+                self.print_to_log_file(
+                    "LSTV oversample: LUMB_DUP_WEIGHT set but no lumbarization case in "
+                    "this fold; falling back to an even pool")
+            else:
+                self.print_to_log_file(
+                    f"LSTV oversample: lumbarization weighted {rep}x "
+                    f"({n_lumb} of {len(lstv_in_keys)} pool cases -> "
+                    f"{rep*n_lumb}/{len(cycle)} of the duplication cycle)")
+        duplicates = [cycle[i % len(cycle)] for i in range(needed)]
         new_keys = keys_list + duplicates
         try: setattr(keys_owner, keys_attr, new_keys)
         except Exception as exc:
