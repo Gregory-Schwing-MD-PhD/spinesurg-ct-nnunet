@@ -55,7 +55,10 @@ else
     CM=(); [[ -n "${CLASS_MAP}" ]] && CM=(--class_map "${CLASS_MAP}")
     run python /workspace/benchmark/to_oneshot.py --cases "${CASES}" --pred_dir "${PRED_DIR}" \
         --out_dir "${ONESHOT}" --dataset_json "${DS}/dataset.json" --name_map "${NAME_MAP}" \
-        --pattern "${PATTERN}" "${CM[@]}" || exit 1
+        # ${CM[@]} on an EMPTY array is an unbound-variable error under `set -u`,
+        # so a system with no class map -- vista3d -- died on line 56 in one second
+        # while totalsegmentator, which has one, scored fine.
+        --pattern "${PATTERN}" ${CM[@]+"${CM[@]}"} || exit 1
 fi
 run python /workspace/tools/eval_oneshot.py --predictions_dir "${ONESHOT}" --labels_dir "${DS}/labelsTr" \
     --dataset_json "${DS}/dataset.json" --lstv_cases_json "${DS}/lstv_cases.json" \

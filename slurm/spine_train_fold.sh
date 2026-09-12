@@ -209,7 +209,26 @@ export SINGULARITYENV_WANDB_INIT_MAX_RETRIES="${WANDB_INIT_MAX_RETRIES}"
 export SINGULARITYENV_WANDB_INIT_TIMEOUT_SEC="${WANDB_INIT_TIMEOUT_SEC}"
 export SINGULARITYENV_WANDB_ALLOW_OFFLINE="${WANDB_ALLOW_OFFLINE}"
 export SINGULARITYENV_LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}"
-export SINGULARITYENV_SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-merged}"
+# WHICH LABEL SCHEME. The trainer and the biased dataloader both resolve their label
+# constants from this variable at import. A value matching no branch does not raise: it
+# silently leaves the legacy Dataset803 ids in place, where L6=6 -- and 6 is L2 under
+# Dataset813, so patch biasing would target L2 in every case and never once an L6. That is
+# exactly what "merged" did as a default here. Derive it from the dataset instead.
+if [[ -z "${SPINESURG_LABEL_SCHEME:-}" ]]; then
+  case "${DATASET_ID}" in
+    813) SPINESURG_LABEL_SCHEME=fullribs ;;
+    810) SPINESURG_LABEL_SCHEME=oneshot  ;;
+    803) SPINESURG_LABEL_SCHEME=merged   ;;
+    802) SPINESURG_LABEL_SCHEME=unmerged ;;
+    *)   echo "FATAL: no label scheme known for DATASET_ID=${DATASET_ID}." >&2
+         echo "       Set SPINESURG_LABEL_SCHEME explicitly, or add the dataset here." >&2
+         echo "       Guessing costs days of GPU time and reports nothing." >&2
+         exit 2 ;;
+  esac
+fi
+export SPINESURG_LABEL_SCHEME
+echo "   label scheme  : SPINESURG_LABEL_SCHEME=${SPINESURG_LABEL_SCHEME} (from DATASET_ID=${DATASET_ID})"
+export SINGULARITYENV_SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME}"
 # the biased dataloader is not baked into the image: bound in above, and importable from
 # /workspace/tools as a second route
 export SINGULARITYENV_PYTHONPATH="/workspace/tools"
@@ -258,7 +277,7 @@ echo "================================================================"
 requeue_self() {
     echo "[fold ${FOLD}] wall-time limit approaching at $(date); resubmitting to resume from checkpoint_latest.pth"
     cd "${PROJECT_ROOT}"
-    sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}",SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-merged}",STAGE_LOCAL="${STAGE_LOCAL:-0}" \
+    sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}",SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME}",STAGE_LOCAL="${STAGE_LOCAL:-0}" \
         slurm/spine_train_fold.sh
     # let the trainer reach its next checkpoint write (every 50 epochs) rather than killing it now
     wait "${TRAIN_PID}" || true
@@ -282,7 +301,7 @@ if [[ ${TRAIN_RC} -ne 0 && ! -f "${FINAL_CKPT}" ]]; then
     if [[ ${RETRY} -lt ${RETRY_MAX} ]]; then
         echo "[fold ${FOLD}] training exited ${TRAIN_RC} at $(date); resubmitting (retry $((RETRY+1))/${RETRY_MAX}) to resume"
         cd "${PROJECT_ROOT}"
-        sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}",SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-merged}",STAGE_LOCAL="${STAGE_LOCAL_REQUESTED:-0}",PLANS_OVERRIDE="${PLANS_OVERRIDE:-}",RETRY=$((RETRY+1))             slurm/spine_train_fold.sh
+        sbatch --export=ALL,FOLD="${FOLD}",DATASET_ID="${DATASET_ID}",DATASET_NAME="${DATASET_NAME}",PLANNER="${PLANNER}",TRAINER="${TRAINER}",LSTV_OVERSAMPLE_FRAC="${LSTV_OVERSAMPLE_FRAC}",SPINESURG_RUN_VAL_EXPORT="${SPINESURG_RUN_VAL_EXPORT}",SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME}",STAGE_LOCAL="${STAGE_LOCAL_REQUESTED:-0}",PLANS_OVERRIDE="${PLANS_OVERRIDE:-}",RETRY=$((RETRY+1))             slurm/spine_train_fold.sh
         exit ${TRAIN_RC}
     fi
     echo "[fold ${FOLD}] training exited ${TRAIN_RC} and retries are exhausted" >&2

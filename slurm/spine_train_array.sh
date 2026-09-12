@@ -152,8 +152,25 @@ CONFIG="${CONFIG:-3d_fullres}"
 # weights, confusion headline, and loss ignore_index. Default it from
 # DATASET_ID (802 -> unmerged, anything else -> merged) unless the caller set
 # it explicitly. Passed into the container via SINGULARITYENV_ below.
-SPINESURG_LABEL_SCHEME="${SPINESURG_LABEL_SCHEME:-$([[ "${DATASET_ID}" == "802" ]] && echo unmerged || echo merged)}"
+# WHICH LABEL SCHEME. The trainer and the biased dataloader both resolve their label
+# constants from this variable at import. A value matching no branch does not raise: it
+# silently leaves the legacy Dataset803 ids in place, where L6=6 -- and 6 is L2 under
+# Dataset813, so patch biasing would target L2 in every case and never once an L6. That is
+# exactly what "merged" did as a default here. Derive it from the dataset instead.
+if [[ -z "${SPINESURG_LABEL_SCHEME:-}" ]]; then
+  case "${DATASET_ID}" in
+    813) SPINESURG_LABEL_SCHEME=fullribs ;;
+    810) SPINESURG_LABEL_SCHEME=oneshot  ;;
+    803) SPINESURG_LABEL_SCHEME=merged   ;;
+    802) SPINESURG_LABEL_SCHEME=unmerged ;;
+    *)   echo "FATAL: no label scheme known for DATASET_ID=${DATASET_ID}." >&2
+         echo "       Set SPINESURG_LABEL_SCHEME explicitly, or add the dataset here." >&2
+         echo "       Guessing costs days of GPU time and reports nothing." >&2
+         exit 2 ;;
+  esac
+fi
 export SPINESURG_LABEL_SCHEME
+echo "   label scheme  : SPINESURG_LABEL_SCHEME=${SPINESURG_LABEL_SCHEME} (from DATASET_ID=${DATASET_ID})"
 TRAINER="${TRAINER:-nnUNetTrainerWandB_500ep_LSTVOversample}"
 PLANNER="${PLANNER:-nnUNetPlannerResEncM}"
 GPU_MEMORY_TARGET_GB="${GPU_MEMORY_TARGET_GB:-100}"

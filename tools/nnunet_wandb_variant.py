@@ -2649,15 +2649,33 @@ class _LSTVOversampleMixin:
             self.print_to_log_file(f"LSTV oversample: WARNING avg_dup={avg_dup:.0f}x -> overfitting risk")
 
     def get_dataloaders(self):
-        """v20: bias substitution is OFF by default.
+        """Patch-class bias is ON where the label scheme actually carries L6.
 
-        Under merged labels, the LSTVBiasedDataLoader3D's L6-detection
-        logic is meaningless (no L6 voxels exist in the dataset). Set
-        SPINESURG_LSTV_BIAS_ENABLED=1 only if running on a legacy
-        unmerged dataset; otherwise the default-off path produces
-        nnU-Net's standard uniform foreground sampling.
+        WHY THIS DEFAULT CHANGED. It was off, with the note "under merged labels the
+        L6-detection logic is meaningless (no L6 voxels exist in the dataset)". That was
+        true of Dataset803, whose merge dissolved L6. It is false of Dataset813, where L6
+        is label 10 and about 22 of 802 records carry one -- and the flag stayed off, so
+        the one mechanism built to make a 2.7% class learnable was disabled by a premise
+        that had expired.
+
+        WHAT IT COSTS TO LEAVE OFF. nnU-Net's foreground oversampling picks a foreground
+        VOXEL without regard to class. Inside a 384x256x256 patch drawn from a 43-class
+        problem, an L6 body is essentially never the sampled class, so the gradient almost
+        never sees one. Measured over ten runs across every fold, one reaching epoch 83,
+        L6 scored Dice 0.0000 every single time. Not a regression and not early training:
+        the class was never sampled.
+
+        Oversampling LSTV CASES (LSTV_OVERSAMPLE_FRAC) does not substitute for this. It
+        gets the case into the batch; it does not aim the patch at the anomalous vertebra.
+
+        The default is now taken from the label scheme rather than hard-coded: on a scheme
+        that defines L6 the bias is on, on one that does not it stays off, and either way
+        SPINESURG_LSTV_BIAS_ENABLED overrides explicitly.
         """
-        bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=False)
+        _scheme_has_l6 = str(os.environ.get("SPINESURG_LABEL_SCHEME", "")).strip().lower() \
+            in ("fullribs", "full-ribs", "813", "lstv_fullribs",
+                "oneshot", "one-shot", "810", "lstv_oneshot")
+        bias_enabled = _env_truthy("SPINESURG_LSTV_BIAS_ENABLED", default=_scheme_has_l6)
 
         if not bias_enabled:
             return super().get_dataloaders()
@@ -2683,14 +2701,39 @@ class _LSTVOversampleMixin:
                 "trainer module; using nnU-Net default loader.")
             return super().get_dataloaders()
 
+        # CHECK THE IDS AGAINST THE DATASET BEFORE COMMITTING TO THEM. The loader resolves
+        # L6_LABEL at import from SPINESURG_LABEL_SCHEME and falls back to a legacy map when
+        # the value matches no branch -- spine_train_array.sh's "merged" does exactly that,
+        # leaving L6_LABEL=6, which is L2 in Dataset813. The bias would then fire on every
+        # case and never once on an L6, and nothing would say so. Fail here instead.
+        try:
+            import sys as _sys
+            _lm = _sys.modules.get(LSTVBiasedDataLoader3D.__module__)
+            _verify = getattr(_lm, "verify_label_scheme", None)
+            if _verify is not None:
+                _bad = _verify(self.dataset_json, strict=False)
+                if _bad:
+                    self.print_to_log_file(
+                        f"LSTV patch bias: DISABLED -- label ids disagree with dataset.json "
+                        f"{_bad}. Biasing would target the wrong class; falling back to "
+                        f"nnU-Net uniform foreground sampling.")
+                    return super().get_dataloaders()
+                self.print_to_log_file(
+                    f"LSTV patch bias: label ids verified against dataset.json "
+                    f"(scheme={os.environ.get('SPINESURG_LABEL_SCHEME', '<unset>')!r})")
+            else:
+                self.print_to_log_file(
+                    "LSTV patch bias: verify_label_scheme unavailable; ids UNCHECKED.")
+        except Exception as _exc:                                        # noqa: BLE001
+            self.print_to_log_file(f"LSTV patch bias: id check failed ({_exc}); UNCHECKED.")
+
         l6_p = _env_float("SPINESURG_LSTV_BIAS_L6_PROB", 0.60)
         sac_p = _env_float("SPINESURG_LSTV_BIAS_SACRUM_PROB", 0.50)
         self.print_to_log_file(
             f"LSTV patch bias: substituting nnUNetDataLoader3D -> "
             f"LSTVBiasedDataLoader3D for get_dataloaders() "
-            f"(L6 prob={l6_p:.2f}, sacrum prob={sac_p:.2f})  "
-            f"[NOTE: under v20 merged labels, the loader's "
-            f"L6-detection is no-op; bias has no effect on Dataset803]")
+            f"(L6 prob={l6_p:.2f}, sacrum prob={sac_p:.2f}, "
+            f"scheme={os.environ.get('SPINESURG_LABEL_SCHEME', 'default')})")
 
         _trainer_mod.nnUNetDataLoader3D = LSTVBiasedDataLoader3D
         try:
@@ -2739,6 +2782,34 @@ class nnUNetTrainerWandB_1000ep_500iter(_WandBMixin, nnUNetTrainer):
         self.num_epochs = 1000
         self.num_iterations_per_epoch = 500
         self.num_val_iterations_per_epoch = 50
+
+
+class nnUNetTrainerWandB_200ep_LSTVOversample(
+    _LSTVOversampleMixin, _WandBMixin, nnUNetTrainer
+):
+    """200 epochs, otherwise identical to the 500-epoch variant.
+
+    Exists because the 500-epoch schedule does not fit a 2-day partition at this patch
+    size: ~14 min/epoch is 117 hours, the job is killed around epoch 190, and it is killed
+    BEFORE perform_actual_validation writes anything. The decoder that turns this network's
+    voxels into a reading (tools/decode_sequence.py) consumes those validation
+    probabilities, so a run that never validates cannot be evaluated at the level the
+    architecture actually operates on.
+
+    200 epochs anneals fully inside the wall. It is a shorter schedule, not a truncated one:
+    the polynomial decay reaches zero at the final epoch either way.
+    """
+
+    def __init__(self, plans, configuration, fold, dataset_json,
+                 unpack_dataset: bool = True, device=None):
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        self.num_epochs = 200
+        # CHECKPOINT OFTEN. nnU-Net's default is every 50 epochs, which on a partition with
+        # a two-day wall means a killed job resumes from nothing: the previous attempt died
+        # at epoch 26 with only checkpoint_best.pth on disk and `--c` had nothing to attach
+        # to. Five epochs is a 1.1 GB write about every seventy minutes, and it caps the
+        # loss from any kill -- wall clock, preemption, node failure -- at five epochs.
+        self.save_every = 5
 
 
 class nnUNetTrainerWandB_500ep_LSTVOversample(

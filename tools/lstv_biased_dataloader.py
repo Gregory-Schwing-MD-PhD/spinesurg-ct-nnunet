@@ -139,6 +139,49 @@ ClassLocationKey = Union[int, tuple]
 ClassLocations = Dict[ClassLocationKey, "np.ndarray"]
 
 
+def verify_label_scheme(dataset_json, *, strict: bool = True) -> dict:
+    """Check this module's ids against the dataset's labels; raise on disagreement.
+
+    `dataset_json` is nnU-Net's parsed dataset.json (a dict) or a path to it. Returns the
+    mismatches found, {name: (module_id, dataset_id)}. strict=True raises, because a wrong
+    id does not fail -- it trains contentedly on the wrong vertebra.
+    """
+    import json as _json
+    if isinstance(dataset_json, dict):
+        labels, src = dataset_json.get("labels", {}), "dataset.json"
+    else:
+        with open(dataset_json) as fh:
+            labels = _json.load(fh).get("labels", {})
+        src = str(dataset_json)
+    expected = {
+        "L1": L1_LABEL, "L2": L2_LABEL, "L3": L3_LABEL, "L4": L4_LABEL,
+        "L5": L5_LABEL, "L6": L6_LABEL, "sacrum": SACRUM_LABEL,
+        "left_hip": LEFT_HIP_LABEL, "right_hip": RIGHT_HIP_LABEL,
+    }
+    bad = {}
+    for name, got in expected.items():
+        want = labels.get(name)
+        if want is None:
+            continue                      # this scheme legitimately lacks the class
+        if isinstance(want, (list, tuple)):
+            continue                      # region-based key; not a single id
+        if int(want) != int(got):
+            bad[name] = (int(got), int(want))
+    scheme = _os.environ.get("SPINESURG_LABEL_SCHEME", "<unset>")
+    if bad:
+        detail = ", ".join(f"{k}: module={a} dataset={b}" for k, (a, b) in sorted(bad.items()))
+        msg = ("lstv_biased_dataloader ids disagree with %s under "
+               "SPINESURG_LABEL_SCHEME=%r -> %s. Patch biasing would target the wrong "
+               "class and fail silently." % (src, scheme, detail))
+        if strict:
+            raise RuntimeError(msg)
+        print("WARNING: " + msg, flush=True)
+    else:
+        print("label scheme verified against %s: SPINESURG_LABEL_SCHEME=%r, "
+              "L6_LABEL=%d SACRUM_LABEL=%d L5_LABEL=%d"
+              % (src, scheme, L6_LABEL, SACRUM_LABEL, L5_LABEL), flush=True)
+    return bad
+
 # ── Pure detection functions ───────────────────────────────────────────
 
 def _has_voxels(class_locations: ClassLocations, key: int) -> bool:
@@ -504,6 +547,7 @@ class LSTVBiasedDataLoader3D(LSTVBiasMixin, nnUNetDataLoader3D):
 
 
 __all__ = [
+    "verify_label_scheme",
     "L6_LABEL",
     "L4_LABEL",
     "L5_LABEL",
